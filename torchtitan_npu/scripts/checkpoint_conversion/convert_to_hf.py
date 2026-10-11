@@ -137,7 +137,9 @@ def _load_ema_state_dict(model_state_dict, trainable_fqns, input_dir, read_threa
 def _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir):
     hf_state_dict = sd_adapter.to_hf(state_dict)
     if target_dtype != torch.float32:
-        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
+        # The adapter stores hash routing indices as float32 in HF format.
+        # Rounding those indices changes the selected expert after reload.
+        hf_state_dict = {k: v if k.endswith(".tid2eid") else v.to(target_dtype) for k, v in hf_state_dict.items()}
 
     storage_writer = HuggingFaceStorageWriter(
         path=output_dir,
