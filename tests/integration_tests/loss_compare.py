@@ -115,7 +115,7 @@ def assert_losses_equal(
                     f"missing_in_test={sorted(baseline_steps - test_steps)}, "
                     f"extra_in_test={sorted(test_steps - baseline_steps)}",
                 )
-            if imported_losses:
+            if imported_losses is not None:
                 imported_steps = set(imported_losses.keys())
                 self.assertEqual(
                     baseline_steps,
@@ -132,7 +132,7 @@ def assert_losses_equal(
                         test_losses[step],
                         f"Loss mismatch at step {step}: baseline={baseline_losses[step]!r}, test={test_losses[step]!r}",
                     )
-                if imported_losses:
+                if imported_losses is not None:
                     self.assertEqual(
                         baseline_losses[step],
                         imported_losses[step],
