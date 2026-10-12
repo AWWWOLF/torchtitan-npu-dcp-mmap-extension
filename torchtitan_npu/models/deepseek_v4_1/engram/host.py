@@ -172,7 +172,8 @@ class HostEngramTable(EngramTable):
             replica_axes = (edp_mesh_dims.replicate,)
             if self._efsdp_size == 1:
                 replica_axes += (edp_mesh_dims.shard,)
-            axes = tuple(axis for axis in replica_axes if axis)
+            # Dense FSDP may fold (dp_shard, cp) into a tuple of shard axes.
+            axes = tuple(name for axis in replica_axes if axis for name in ((axis,) if isinstance(axis, str) else axis))
             if not axes:
                 return
             replica_mesh = edp_mesh[axes]

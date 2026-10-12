@@ -55,6 +55,10 @@ def clip_grad_norm_with_host_sparse_tables(
     # silently keep the dense-only coefficient.
     parameters = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
     dense_norm = clipper(parameters, max_norm, norm_type, *args, **kwargs)
+    # A nonfinite norm would make the correction below 0/0 or NaN and
+    # contaminate otherwise finite gradients before the optimizer update.
+    if not torch.isfinite(dense_norm):
+        raise RuntimeError("Host Engram gradient clipping: nonfinite dense gradient norm; optimizer update aborted.")
 
     # Every replica of a shard has to take part, including one whose tokens
     # happened to touch no row it owns, so this runs before the tables with a
@@ -89,6 +93,8 @@ def clip_grad_norm_with_host_sparse_tables(
 
     dense_norm_f32 = dense_norm.detach().float()
     total_norm = torch.sqrt(dense_norm_f32.pow(2) + sparse_sq)
+    if not torch.isfinite(total_norm):
+        raise RuntimeError("Host Engram gradient clipping: nonfinite combined gradient norm; optimizer update aborted.")
     dense_coef = torch.clamp(max_norm / (dense_norm_f32 + 1e-6), max=1.0)
     total_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
 

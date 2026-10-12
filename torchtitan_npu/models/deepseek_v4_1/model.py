@@ -188,6 +188,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         topk_scores: torch.Tensor | None = None,
         candidates: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        engram_token_history: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -207,7 +208,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         every text-only forward, and both consumers already read that as "no modality".
         """
         if self.engram is not None:
-            x = self.engram(x, input_ids, positions, image_mask=image_mask)
+            x = self.engram(x, input_ids, positions, image_mask=image_mask, token_history=engram_token_history)
         residual = x
         x, attn_pre, post, comb = self.hc_attn_pre(x, pre_mix)
         x, cmp_k, idx_k, topk_indices, topk_scores, candidates = self.attention(
@@ -486,6 +487,10 @@ class DeepSeekV41Model(Decoder):
         cfg = config
         self.hc_mult = cfg.hc_mult
         self.compress_ratios = tuple(cfg.compress_ratios)
+        self.engram_history_size = max(
+            (max(layer.engram.table.ngram_orders) - 1 for layer in cfg.layers if layer.engram is not None),
+            default=0,
+        )
 
     @staticmethod
     def _frame(axis_cu_seqlens: torch.Tensor, axis_lengths: torch.Tensor, ratio: int) -> KernelFrame:
@@ -622,6 +627,10 @@ class DeepSeekV41Model(Decoder):
             cp_size, cp_rank = cp_mesh.size(), cp_mesh.get_local_rank()
             slab = positions.numel() // cp_size
             lo = cp_rank * slab
+            if self.engram_history_size:
+                # Inputs are still global here: retain only the left halo, not a
+                # second copy of the full sequence. Hashing masks document resets.
+                extra_kwargs["engram_token_history"] = inputs[:, max(0, lo - self.engram_history_size) : lo].clone()
             inputs = inputs[:, lo : lo + slab]
             labels = labels[:, lo : lo + slab]
             positions = positions[:, lo : lo + slab]
@@ -672,6 +681,7 @@ class DeepSeekV41Model(Decoder):
         *,
         input_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        engram_token_history: torch.Tensor | None = None,
     ):
         """V4.1 forward with Single-Pass mHC.
 
@@ -712,6 +722,7 @@ class DeepSeekV41Model(Decoder):
                 topk_scores=topk_scores,
                 candidates=candidates,
                 image_mask=image_mask,
+                engram_token_history=engram_token_history,
             )
 
         # The stack has no learned output head: it collapses with the last block's

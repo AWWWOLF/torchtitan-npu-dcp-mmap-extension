@@ -140,3 +140,38 @@ def test_trainer_clip_owns_only_its_tables(monkeypatch):
     assert other.clip_grad_norm([dense], 1.0).item() == pytest.approx(3.0)
     assert dense.grad.item() == pytest.approx(1.0, rel=1e-5)
     assert dist_utils.clip_grad_norm_ is dense_clip
+
+
+@pytest.mark.parametrize("overflow_source", ["dense", "sparse"])
+def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_source):
+    from torchtitan.distributed import utils as dist_utils
+
+    from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
+
+    table = HostEngramTable(_host_table_config())
+    values = torch.zeros(1, _DIM)
+    values[0, 0] = 3e32 if overflow_source == "sparse" else 4.0
+    table.accumulate_sparse_gradient(torch.tensor([0]), values)
+    model = torch.nn.Module()
+    model.add_module("table", table)
+    dense = torch.nn.Parameter(torch.ones(2))
+    model.register_parameter("dense", dense)
+    dense.grad = torch.tensor([3e32 if overflow_source == "dense" else 3.0, 1.0])
+    optimizer = object.__new__(host_mod.HostSparseOptimizersContainer)
+    optimizer.model_parts = [model]
+    trainer = object.__new__(DeepSeekV41Trainer)
+    trainer.optimizers = optimizer
+
+    def dense_clip(parameters, max_norm, norm_type=2.0, **kwargs):
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, foreach=False)
+
+    monkeypatch.setattr(dist_utils, "clip_grad_norm_", dense_clip)
+
+    with pytest.raises(RuntimeError, match="nonfinite .* gradient norm; optimizer update aborted"):
+        trainer.clip_grad_norm(model.parameters(), 1.0)
+
+    # Clipping may have scaled dense gradients, but must not introduce NaNs
+    # or modify parameters/the pending sparse gradient before raising.
+    assert torch.isfinite(dense.grad).all()
+    torch.testing.assert_close(dense, torch.ones(2), rtol=0, atol=0)
+    torch.testing.assert_close(table.pending_sparse_grad().values(), values, rtol=0, atol=0)

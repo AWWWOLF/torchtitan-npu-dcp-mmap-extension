@@ -287,3 +287,70 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
     )
     adapter = DeepSeekV41StateDictAdapter(trainer.model_spec.model, None)
     assert adapter.to_hf({}) == {}
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_cp_history_preserves_packed_engram_training(cp_size):
+    torch.manual_seed(42)
+    # Build the real registry model on meta; only its metadata producer is used.
+    config = model_registry("deepseek_v4_1_debugmodel").model
+    with torch.device("meta"):
+        model = config.build()
+    model.compress_ratios = (1, 2)
+    engram = _build_engram()
+    # Keep this boundary test away from the signed-sqrt gate's zero cusp.
+    with torch.no_grad():
+        engram.table.weight.abs_().add_(0.01)
+        engram.gate.wkv.abs_().add_(0.01)
+    reference = copy.deepcopy(engram)
+    tokens = torch.arange(24).view(1, -1) % 32
+    positions = torch.cat((torch.arange(8), torch.arange(16))).view(1, -1)
+    hidden = (torch.rand(1, 24, 4, 8) + 0.5).requires_grad_()
+    expected_hidden = hidden.detach().clone().requires_grad_()
+    expected = reference(expected_hidden, tokens, positions)
+    expected.sum().backward()
+    outputs = []
+    slab = tokens.shape[1] // cp_size
+
+    class Mesh:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def size(self):
+            return cp_size
+
+        def get_local_rank(self):
+            return self.rank
+
+    for rank in range(cp_size):
+        local_tokens, _, extra = model.build_attention_masks(
+            tokens, tokens, {"positions": positions}, cp_mesh=Mesh(rank)
+        )
+        lo = rank * slab
+        history = extra["engram_token_history"]
+        # Compare row IDs to an independently computed per-document hash.
+        oracle = torch.cat([
+            _numpy_hash_reference(engram.table, tokens[:, :8]),
+            _numpy_hash_reference(engram.table, tokens[:, 8:]),
+        ], dim=1)
+        torch.testing.assert_close(
+            engram.table.hash(local_tokens, extra["positions"], token_history=history),
+            oracle[:, lo:lo + slab], rtol=0, atol=0,
+        )
+        output = engram(
+            hidden[:, lo:lo + slab], local_tokens, extra["positions"], token_history=history
+        )
+        outputs.append(output)
+        output.sum().backward()
+    torch.testing.assert_close(torch.cat(outputs, dim=1), expected)
+    torch.testing.assert_close(hidden.grad, expected_hidden.grad)
+    torch.testing.assert_close(
+        engram.table.pending_sparse_grad().to_dense(), reference.table.pending_sparse_grad().to_dense()
+    )
+    for param, ref_param in zip(engram.gate.parameters(), reference.gate.parameters()):
+        torch.testing.assert_close(param.grad, ref_param.grad)
+    for module in (engram, reference):
+        optimizer = torch.optim.SparseAdam([module.table.weight], lr=0.01)
+        module.table.prepare_sparse_optimizer_step()
+        optimizer.step()
+    torch.testing.assert_close(engram.table.weight, reference.table.weight)

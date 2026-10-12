@@ -85,17 +85,19 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
             "input_ids_BL": token_src,
             "positions_BL": token_src,
             "image_mask": token_src,
+            "token_history": token_src,
         },
         in_dst_shardings={
             "hidden_states_BLMD": hidden,
             "input_ids_BL": token_dst,
             "positions_BL": token_dst,
             "image_mask": token_dst,
+            "token_history": token_src,
         },
         out_src_shardings=hidden,
         out_dst_shardings=hidden,
         local_map=LocalMapConfig(
-            in_grad_placements=(hidden, None, None, None),
+            in_grad_placements=(hidden, None, None, None, None),
         ),
     )
 

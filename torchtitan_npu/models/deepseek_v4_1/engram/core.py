@@ -198,12 +198,20 @@ class EngramTable(Module):
         token_ids_BL: torch.Tensor,
         positions_BL: torch.Tensor | None,
         distance: int,
+        token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if distance == 0:
             return token_ids_BL
         compressed_pad_id = _local_tensor(self.compressed_pad_id)
         shifted = compressed_pad_id.expand_as(token_ids_BL).clone()
-        shifted[:, distance:] = token_ids_BL[:, :-distance]
+        if token_history is None:
+            shifted[:, distance:] = token_ids_BL[:, :-distance]
+        else:
+            source = torch.cat((token_history, token_ids_BL), dim=1)
+            width = token_history.shape[1]
+            start = max(0, distance - width)
+            if distance < source.shape[1]:
+                shifted[:, start:] = source[:, max(0, width - distance) : source.shape[1] - distance]
         if positions_BL is not None:
             shifted = torch.where(
                 positions_BL >= distance,
@@ -218,6 +226,7 @@ class EngramTable(Module):
         positions_BL: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
+        token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return global row IDs with shape ``(B, L, orders * heads)``."""
         if input_ids_BL.ndim != 2:
@@ -230,8 +239,17 @@ class EngramTable(Module):
 
         token_id_map = _local_tensor(self.token_id_map)
         compressed_ids_BL = token_id_map[input_ids_BL.long()]
+        if token_history is not None:
+            if token_history.ndim != 2 or token_history.shape[0] != input_ids_BL.shape[0]:
+                raise ValueError("Engram token history must be 2-D with the same batch size as input_ids.")
+            if positions_BL is None:
+                raise ValueError("Engram token history requires document-relative positions.")
+            if image_mask is not None:
+                raise ValueError("Engram context parallelism currently supports text-only inputs.")
+            token_history = token_id_map[token_history.long()]
         shifts = [
-            self._shift_tokens(compressed_ids_BL, positions_BL, distance) for distance in range(max(self.ngram_orders))
+            self._shift_tokens(compressed_ids_BL, positions_BL, distance, token_history)
+            for distance in range(max(self.ngram_orders))
         ]
         if image_mask is not None:
             if image_mask.shape != input_ids_BL.shape or image_mask.dtype != torch.bool:
@@ -270,11 +288,13 @@ class EngramTable(Module):
         positions_BL: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
+        token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         row_ids_BLH = self.hash(
             input_ids_BL,
             positions_BL,
             image_mask=image_mask,
+            token_history=token_history,
         )
         B, L, H = row_ids_BLH.shape
         rows = self._distributed_lookup(row_ids_BLH.reshape(-1))
@@ -350,6 +370,7 @@ class Engram(Module):
         positions_BL: torch.Tensor | None = None,
         *,
         image_mask: torch.Tensor | None = None,
+        token_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Host offload deliberately keeps the authoritative table and its
         # SparseAdam state in FP32.  Keep that storage/optimizer contract while
@@ -360,6 +381,7 @@ class Engram(Module):
             input_ids_BL,
             positions_BL,
             image_mask=image_mask,
+            token_history=token_history,
         ).to(dtype=hidden_states_BLMD.dtype)
         residual = self.gate(hidden_states_BLMD, memory_BLE)
         if image_mask is not None:
