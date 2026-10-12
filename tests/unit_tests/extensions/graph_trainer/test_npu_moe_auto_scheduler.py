@@ -1,7 +1,10 @@
 """Tests for MoE auto-overlap cost collection and greedy scheduling."""
 
+import gc
 import operator
+import weakref
 from itertools import pairwise
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -612,6 +615,36 @@ def test_count_protocol_advances_to_dispatch_before_ready_filler():
     assert order[refs[0]["count"]] < order[refs[1]["count"]]
     assert order[refs[1]["count"]] < order[refs[0]["data"]]
     assert order[refs[0]["data"]] < order[refs["filler"]]
+
+
+def test_count_d2h_protocol_releases_ancestor_map_without_cyclic_gc():
+    gm, _ = _build_count_and_data_a2a_graph()
+    nodes = tuple(node for node in gm.graph.nodes if "chunk_id" in node.meta)
+
+    class AncestorMap(dict):
+        """Allow a weak reference to observe map lifetime."""
+
+    ancestors = AncestorMap()
+    for node in gm.graph.nodes:
+        dependencies = set()
+        for dependency in node.all_input_nodes:
+            dependencies.update(ancestors[dependency])
+            dependencies.add(dependency)
+        ancestors[node] = dependencies
+    map_ref = weakref.ref(ancestors)
+    scheduler = SimpleNamespace(original_order={node: index for index, node in enumerate(gm.graph.nodes)})
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        NpuMoeAutoOverlapScheduler._apply_token_count_d2h_protocol(scheduler, nodes, (), ancestors)
+        del ancestors
+        # No gc.collect(): training disables GC, and each region's map must
+        # be released immediately instead of surviving until periodic GC.
+        assert map_ref() is None
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 def test_greedy_scheduler_preserves_collective_order_before_wait():

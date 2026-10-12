@@ -759,27 +759,48 @@ def _align_costs(
     import torch.distributed as dist
 
     semantic_keys = _cross_rank_semantic_keys(gm, profile_node_ids)
-    local_by_key = {
-        semantic_keys[stable_id]: float(cost) for stable_id, cost in local.items() if stable_id in semantic_keys
-    }
-    if not dist.is_available() or not dist.is_initialized():
-        gathered = [local_by_key]
-    else:
-        gathered: list[dict[tuple[Any, ...], float] | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, local_by_key)
+    # Keep global semantic numbering unchanged, but gather only one MoE layer
+    # at a time. Forward/backward and both chunks share the same region FQN.
+    # Untagged nodes form a separate batch for callers outside chunked MoE.
+    batches: dict[str, list[int]] = defaultdict(list)
+    for node in gm.graph.nodes:
+        stable_id = node_id(node)
+        if stable_id is not None and stable_id in semantic_keys:
+            batches[str(node.meta.get("chunked_region_fqn") or "")].append(stable_id)
+    distributed = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if distributed else 1
+    batch_names = sorted(batches)
+    if distributed:
+        # Agree on a union, not local graph order: a rank missing a layer must
+        # still participate with an empty dictionary to preserve fallback.
+        manifests: list[list[str] | None] = [None] * world_size
+        dist.all_gather_object(manifests, batch_names)
+        if any(manifest is None for manifest in manifests):
+            raise RuntimeError("NPU auto-overlap failed to gather profile layer manifest")
+        batch_names = sorted({name for manifest in manifests if manifest is not None for name in manifest})
+        del manifests
+    aligned: dict[int, float] = {}
+    for batch_name in batch_names:
+        batch_ids = batches.get(batch_name, ())
+        local_by_key = {
+            semantic_keys[stable_id]: float(local[stable_id]) for stable_id in batch_ids if stable_id in local
+        }
+        gathered: list[dict[tuple[Any, ...], float] | None] = [None] * world_size
+        if distributed:
+            dist.all_gather_object(gathered, local_by_key)
+        else:
+            gathered[0] = local_by_key
         if any(item is None for item in gathered):
             raise RuntimeError("NPU auto-overlap failed to gather profile costs")
-    concrete_costs = cast("list[dict[tuple[Any, ...], float]]", gathered)
-
-    aligned: dict[int, float] = {}
-    for stable_id, semantic_key in semantic_keys.items():
-        values = [float(item[semantic_key]) for item in concrete_costs if semantic_key in item]
-        # Incomplete measurements must fall back identically on every rank.
-        if len(values) != len(concrete_costs):
-            continue
-        ordered = sorted(values)
-        # Use the best performance as the aligned cost.
-        aligned[stable_id] = ordered[0]
+        concrete_costs = cast("list[dict[tuple[Any, ...], float]]", gathered)
+        for stable_id in batch_ids:
+            semantic_key = semantic_keys[stable_id]
+            values = [float(item[semantic_key]) for item in concrete_costs if semantic_key in item]
+            # Incomplete measurements must fall back identically on every rank.
+            if len(values) == world_size:
+                aligned[stable_id] = min(values)
+        # Release all remote layer dictionaries before the next gather.
+        del concrete_costs, gathered, local_by_key
     return aligned
 
 

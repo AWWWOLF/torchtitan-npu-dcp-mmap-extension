@@ -711,8 +711,16 @@ class NpuMoeAutoOverlapScheduler:
             closed_ancestors[node] = expanded
             return expanded
 
-        for node in nodes:
-            projected_ancestors[node] = close_ancestors(node)
+        try:
+            for node in nodes:
+                projected_ancestors[node] = close_ancestors(node)
+        finally:
+            # The recursive closure captures itself and the full projected
+            # ancestor map. TorchTitan disables automatic cyclic GC, so leaving
+            # this cell populated retains one full map per region and round.
+            # Empty it even on failure; the map can then die by refcount when
+            # regional scheduling finishes.
+            del close_ancestors
 
     def _select_next_launch(
         self,

@@ -409,7 +409,7 @@ def test_align_costs_uses_rank_minimum(monkeypatch, collective):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
 
     def gather(output, local):
-        output[:] = gathered
+        output[:] = [local] * 4 if isinstance(local, list) else gathered
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     for local_value in [9.0, 3.0, 7.0, 5.0]:
@@ -426,6 +426,52 @@ def test_align_costs_without_distributed_keeps_local_cost(monkeypatch):
     local = {node_id(work): 0.25}
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     assert _align_costs(gm, local) == local
+
+
+def test_align_costs_batches_layers_with_shared_rank_order(monkeypatch):
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    nodes = []
+    # Deliberately reverse layer order; include both phases and chunks.
+    for layer, backward, chunk in [(1, False, 0), (0, False, 0), (0, True, 1)]:
+        node = graph.call_function(torch.ops.aten.neg.default, (x,))
+        node.meta.update(
+            chunked_region_fqn=f"layers.{layer}.moe",
+            chunked_region_is_backward=backward,
+            chunk_id=chunk,
+        )
+        nodes.append(node)
+    graph.output(tuple(nodes))
+    gm = torch.fx.GraphModule({}, graph)
+    assign_stable_node_tags(gm)
+    keys = _cross_rank_semantic_keys(gm, None)
+    ids = [node_id(node) for node in nodes]
+    local = dict.fromkeys(ids, 9.0)
+    calls = []
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def gather(output, payload):
+        calls.append(payload.copy())
+        if isinstance(payload, list):
+            # The peer has an extra layer absent from this rank.
+            output[:] = [payload, ["layers.2.moe", "layers.0.moe", "layers.1.moe"]]
+        elif len(calls) == 2:
+            assert set(payload) == {keys[ids[1]], keys[ids[2]]}
+            # Missing backward measurement must retain fallback.
+            output[:] = [payload, {keys[ids[1]]: 3.0}]
+        elif len(calls) == 3:
+            assert set(payload) == {keys[ids[0]]}
+            output[:] = [payload, {keys[ids[0]]: 5.0}]
+        else:
+            assert payload == {}  # Participate even without local nodes.
+            output[:] = [payload, {("peer_only",): 1.0}]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    assert _align_costs(gm, local) == {ids[1]: 3.0, ids[0]: 5.0}
+    assert len(calls) == 4
+    assert calls[0] == ["layers.0.moe", "layers.1.moe"]
 
 
 def test_collective_count_manifest_groups_fx_launches_by_type():
