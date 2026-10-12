@@ -336,6 +336,9 @@ class _HookOwner:
 
     compress_ratios = _RATIOS
     engram_history_size = 0
+    # The model's mask post-process seam: a stand-in bypasses ``__init__``, so it
+    # states the pre-extension answer -- none, the masks pass through untouched.
+    _metadata_extension = None
     # The hook is a method, so a stand-in presents the pieces it reaches for: the frame builders,
     # taken from the model itself, and the sharded half.  ``_frame`` is a staticmethod there, so it
     # is grafted as one -- a plain assignment would make it an instance method here.

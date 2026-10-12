@@ -16,6 +16,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+# The quantized sparse attention (torchao_npu's QuantV41SparseAttention) keeps
+# its own per-layer metadata operators and does not read the asc records, so this
+# entry pins the fused override list WITHOUT sparse_attn.asc_metadata: the
+# precompute would be dead work on top of the quantized core.  Re-add it when the
+# quantized core reads the records.  Mirrors the non-tilelang fused branch of
+# deepseek_v4_1_flash_8p_cpt_4k_a5.sh -- keep the two lists in sync.
+export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_partial \
+                       torchtitan_npu.override.common.swiglu_group.asc \
+                       torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
+                       torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
+                       torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc}"
+
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
     --extension.quantization.recipe all_block_fp8

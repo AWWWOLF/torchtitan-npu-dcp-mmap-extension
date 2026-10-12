@@ -24,6 +24,7 @@ from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseInnerAttention2
@@ -706,6 +707,17 @@ def _make_v41_config(
         layers=layers,
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
+        # The stack's static attention geometry, handed to the backend metadata
+        # post-process (identity by default).  Filled here because the model
+        # dir is the only place that knows it; the override factory that swaps
+        # the extension class only sees the node below.
+        metadata_extension=MetadataExtension.Config(
+            window_size=window_size,
+            num_heads=n_heads,
+            head_dim=head_dim,
+            index_topk=index_topk,
+            compress_ratios=compress_ratios,
+        ),
         n_layers=n_layers,
         kv_source_layers=kv_source_layers,
         index_source_layers=index_source_layers,

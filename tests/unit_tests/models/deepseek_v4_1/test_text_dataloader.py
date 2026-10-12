@@ -161,6 +161,9 @@ def test_hook_builds_metadata_and_forwards_nothing_extra():
         compress_ratios = (2,)
         _frame = staticmethod(DeepSeekV41Model._frame)
         _row_metadata = DeepSeekV41Model._row_metadata
+        # The model's mask post-process seam: a stand-in bypasses ``__init__``, so it
+        # states the pre-extension answer -- none, the masks pass through untouched.
+        _metadata_extension = None
         build_attention_masks = DeepSeekV41Model.build_attention_masks
         get_attention_masks = DeepSeekV41Model.get_attention_masks
 
@@ -196,6 +199,9 @@ def test_the_metadata_carries_no_validity_marks():
         compress_ratios = (2,)
         _frame = staticmethod(DeepSeekV41Model._frame)
         _row_metadata = DeepSeekV41Model._row_metadata
+        # The model's mask post-process seam: a stand-in bypasses ``__init__``, so it
+        # states the pre-extension answer -- none, the masks pass through untouched.
+        _metadata_extension = None
         build_attention_masks = DeepSeekV41Model.build_attention_masks
         get_attention_masks = DeepSeekV41Model.get_attention_masks
 

@@ -10,38 +10,12 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
-
-
-def _metadata(bounds: list[int], *, compress_ratios: tuple[int, ...] = (1, 2)):
-    """Build the metadata for one packed row of these document boundaries, via the model.
-
-    The test states the boundaries it wants to exercise; the positions that produce them
-    are rebuilt here, so the metadata comes from the model's own builder rather than being
-    hand-rolled.  One ``arange`` per document, concatenated, is what a packed loader emits.
-    """
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
-
-    class _ModelOwner:
-        """A stand-in for the model, as ``get_attention_masks`` sees it.
-
-        The hook is a method, so it reaches for the frame builders on ``self``; they are taken from
-        the model class rather than restated here, so a change to the frame algebra cannot leave the
-        two disagreeing.
-        """
-
-        _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_metadata = DeepSeekV41Model._row_metadata
-
-    owner = _ModelOwner()
-    owner.compress_ratios = compress_ratios
-    return DeepSeekV41Model.get_attention_masks(owner, positions)
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("bounds", [[0, 8], [0, 4, 8]], ids=["single-doc", "two-docs"])
-def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
+def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio, bounds):
     """The kernel gets the selection as the selector made it: document-local, in TND layout.
 
     Nothing about the *values* is translated -- the fused selector and this port share one
@@ -50,7 +24,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
     a TND kernel wants ``[T, N2, K]``.
     """
     length = bounds[-1]
-    metadata = _metadata(bounds)
+    metadata = v41_metadata(bounds)
     assert torch.equal(metadata.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
     cu_cmp = metadata.frame_for(ratio).cu_seqlens
 
@@ -97,7 +71,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
 
 
 @pytest.mark.parametrize("with_shared", [False, True], ids=["window", "shared-kv"])
-def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypatch, with_shared):
+def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypatch, v41_metadata, with_shared):
     q = torch.ones(4, 2, 4, requires_grad=True)
     original = torch.ones(4, 1, 4, requires_grad=True)
     shared = torch.ones(2, 1, 4, requires_grad=True) if with_shared else None
@@ -151,7 +125,7 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
         shared,
         indices,
         sink,
-        _metadata([0, 4]),  # attention_masks: the frames the kernels grid
+        v41_metadata([0, 4]),  # attention_masks: the frames the kernels grid
         0.5,
         2 if with_shared else 0,
         2,

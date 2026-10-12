@@ -11,8 +11,10 @@ on the Decoder — including its own context-parallel handling).  The
 ``MetadataExtension`` owns the remaining backend-specific metadata.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from typing import Any, cast
 
+from torch.utils._pytree import GetAttrKey, KeyEntry, register_pytree_node
 from torchtitan.config.configurable import Configurable
 
 
@@ -41,6 +43,11 @@ class MetadataExtension(Configurable):
         index_topk: int | None = None
         """Static sparse-attention geometry consumed by vendor metadata
         extensions when the selected path requires it."""
+        compress_ratios: tuple[int, ...] = ()
+        """The stack's per-layer compression ratios (model-config constant).
+        Vendor extensions that precompute per-ratio kernel metadata fill it
+        for exactly these, window-only layers (ratio 0) included; empty means
+        the ratios are read off the metadata's own frames instead."""
         li_kernel_config: LightningIndexerKernelConfig = field(
             default_factory=LightningIndexerKernelConfig,
         )
@@ -77,3 +84,40 @@ class LightningIndexerMetadata(Configurable):
 
     def __call__(self, metadata):
         return metadata
+
+
+def register_pytree_node_for_dataclass(cls: type) -> None:
+    """Register a kw-only dataclass as a pytree node (idempotent).
+
+    The graph_trainer's ``minimal_fx_tracer`` requires every ``attention_masks``
+    leaf to be a tensor/primitive; an unregistered dataclass is rejected as a
+    single non-primitive leaf.  Shared by the DSV4 and V4.1 metadata stacks.
+    """
+    from torch.utils._pytree import SUPPORTED_NODES
+
+    if cls in SUPPORTED_NODES:
+        return
+    field_names = [f.name for f in fields(cls)]
+
+    def flatten(obj):
+        return [getattr(obj, name) for name in field_names], None
+
+    def flatten_with_keys(obj):
+        # ``GetAttrKey`` is structurally assignable to the ``KeyEntry`` protocol
+        # at runtime, but pyrefly treats list as invariant, so cast the list.
+        keys = cast(
+            "list[tuple[KeyEntry, Any]]",
+            [(GetAttrKey(name), getattr(obj, name)) for name in field_names],
+        )
+        return keys, None
+
+    def unflatten(values, context):
+        return cls(**dict(zip(field_names, values, strict=True)))
+
+    register_pytree_node(
+        cls,
+        flatten,
+        unflatten,
+        flatten_with_keys_fn=flatten_with_keys,
+        serialized_type_name=f"{cls.__module__}.{cls.__name__}",
+    )

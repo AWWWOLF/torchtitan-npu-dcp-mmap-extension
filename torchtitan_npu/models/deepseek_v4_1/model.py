@@ -40,12 +40,15 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.tools.logging import logger
+
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
 from .context_parallel import ExchangeMetadata, cp_plan, document_bounds
 from .engram import Engram  # noqa: TC001
@@ -310,6 +313,13 @@ class DeepSeekV41Model(Decoder):
         candidate_source_layer: int = 20
         candidate_topk_blocks: int = 2048
         candidate_block_size: int = 8
+        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
+        """Backend post-process of the built masks, run once per microbatch in
+        :meth:`build_attention_masks`.  The default is the identity; the fused
+        recipes swap it via the ``metadata_extension`` override to precompute
+        their kernel metadata, which is why the model dir fills its geometry
+        (heads, head dim, window, index top-k, ratios) here rather than the
+        override factory, which only sees this node."""
 
         def update_from_config(self, *, config, **kwargs):
             parallelism = config.parallelism
@@ -491,6 +501,24 @@ class DeepSeekV41Model(Decoder):
             (max(layer.engram.table.ngram_orders) - 1 for layer in cfg.layers if layer.engram is not None),
             default=0,
         )
+        # The per-microbatch metadata post-process (identity by default).  Built
+        # here rather than at each call so a swapped extension keeps whatever
+        # state it wants across batches; the model dir's geometry lives on the
+        # config, which ``Module`` does not keep.
+        self._metadata_extension = cfg.metadata_extension.build()
+        # The precompute only pays off when a fused core reads the records: a
+        # swapped extension over a reference (or quantized) attention stack is
+        # dead work, so the pairing is flagged here, once, while the config
+        # tree still exists -- a compile-time fact on the config classes, like
+        # every other cross-node check the model makes.
+        if type(cfg.metadata_extension) is not MetadataExtension.Config and not any(
+            getattr(type(layer.attention.inner_attention), "reads_asc_metadata", False) for layer in cfg.layers
+        ):
+            logger.warning(
+                "metadata_extension is overridden but no layer runs an attention core that "
+                "reads the precomputed records: enable sparse_attn.asc alongside asc_metadata "
+                "or drop the metadata override -- the per-microbatch precompute is dead work."
+            )
 
     @staticmethod
     def _frame(axis_cu_seqlens: torch.Tensor, axis_lengths: torch.Tensor, ratio: int) -> KernelFrame:
@@ -650,6 +678,12 @@ class DeepSeekV41Model(Decoder):
                     "The dataloader's document alignment must be a multiple of every "
                     "ratio in the stack's compress_ratios."
                 )
+        # The backend post-process runs once per microbatch, on whichever masks
+        # the forward built (sharded or not): the default is the identity, and
+        # the fused recipes swap it to precompute their kernel metadata at this
+        # eager boundary instead of per layer inside the compiled region.
+        if self._metadata_extension is not None:
+            attention_masks = self._metadata_extension(attention_masks)
         extra_kwargs["attention_masks"] = attention_masks
         return inputs, labels, extra_kwargs
 

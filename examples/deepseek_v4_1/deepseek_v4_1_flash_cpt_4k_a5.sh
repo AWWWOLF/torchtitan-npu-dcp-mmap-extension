@@ -33,12 +33,14 @@ if [[ "${USE_GOLDEN:-0}" != "1" ]]; then
                               torchtitan_npu.override.deepseek_v4_1.tilelang.tilelang_hc_pre \
                               torchtitan_npu.override.common.swiglu_group.asc \
                               torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
+                              torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc_metadata \
                               torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
                               torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc}"
     else
         export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_partial \
                                                torchtitan_npu.override.common.swiglu_group.asc \
                                                torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
+                                               torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc_metadata \
                                                torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc \
                                                torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
                                                torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn}"

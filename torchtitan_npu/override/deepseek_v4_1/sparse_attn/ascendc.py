@@ -4,11 +4,18 @@
 # LICENSE file in the root directory of this source tree.
 """V4.1 SMLA attention and SMLAG-backed indexer distillation."""
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import ClassVar, cast
 
 import torch
 
+from torchtitan_npu.models.common.metadata_extension import (
+    MetadataExtension,
+    register_pytree_node_for_dataclass,
+)
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
+from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
 
 
@@ -62,6 +69,116 @@ def _kernel_geometry(topk_indices, cmp_k):
     )
 
 
+# ---------------------------------------------------------------------------
+# Precomputed SMLA metadata (the per-forward lookup table)
+# ---------------------------------------------------------------------------
+#
+# ``sparse_flash_mla_metadata`` and ``sparse_flash_mla_grad_metadata`` are
+# AI_CPU operators whose outputs depend only on the frames of one forward and
+# the layer's static geometry (heads, head dim, window, ratio, top-k) -- never
+# on the operands.  A 40-layer stack runs at most three distinct geometries
+# (one per compress ratio), so ``AscV41MetadataExtension`` computes one record
+# per distinct ``(compress_ratio, cmp_topk)`` when the model builds its masks
+# -- an eager boundary, once per microbatch -- and ``_SparseMLA`` looks its
+# record up instead of re-running the operators per layer, in the forward, in
+# the full-AC recompute and in the backward alike.
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class AscV41BlockMetadata:
+    """The metadata operator outputs one SMLA geometry needs, with the
+    geometry itself as the lookup's guard.
+
+    The tensors are shared by every consumer of one forward -- each layer, the
+    full-AC recompute and the backward alike -- which is sound only while both
+    kernels keep taking ``metadata`` as a read-only input: it is the AI_CPU
+    operator's own output, consulted for the grid, never an output buffer of
+    the NPU kernels.  The reuse test pins this side of the premise (nothing
+    here writes them either); the operator side is validated by the end-to-end
+    A5 runs this change was measured on.
+    """
+
+    smla_metadata: torch.Tensor
+    """``sparse_flash_mla_metadata`` output (opaque, layer-invariant)."""
+
+    smla_grad_metadata: torch.Tensor
+    """``sparse_flash_mla_grad_metadata`` output (opaque, layer-invariant)."""
+
+    num_heads: int
+    head_dim: int
+    window_size: int
+
+    def matches(self, q: torch.Tensor, window_size: int) -> bool:
+        """Whether this record was built for the calling layer's geometry.
+
+        ``q`` is the packed ``[T, N, Dh]`` row the kernel takes, so the
+        operator's ``(num_heads, head_dim)`` arguments are its trailing
+        shapes.
+        """
+        return q.shape[1] == self.num_heads and q.shape[2] == self.head_dim and window_size == self.window_size
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class AscV41Metadata(DeepSeekV41Metadata):
+    """The model-built metadata carrying the precomputed SMLA records.
+
+    The key is ``(compress_ratio, cmp_topk)`` -- the two per-layer inputs the
+    metadata operators vary on.  Everything else they read comes from the
+    shared frames, so it belongs to the record's guard rather than the key.
+    Layers whose key is absent (a geometry the extension did not precompute)
+    fall back to computing their metadata inline, which keeps every existing
+    caller of the fused core correct.
+    """
+
+    asc: Mapping[tuple[int, int], AscV41BlockMetadata] = field(default_factory=dict)
+
+
+# The registration is asymmetric on purpose, and reserved: DSV4 registers its
+# whole masks object because the graph_trainer's ``minimal_fx_tracer`` requires
+# ``attention_masks`` to flatten into tensor/primitive leaves, while V4.1 has
+# no tracer path today.  The parent ``DeepSeekV41Metadata`` therefore stays an
+# opaque pytree leaf -- the golden path's flattening behavior is untouched --
+# and only the Asc subclass is registered, mirroring DSV4's seam so the fused
+# metadata is pytree-transparent from day one when such a path arrives.  Until
+# then, a ``tree_map`` over the masks descends only under ``asc_metadata``.
+register_pytree_node_for_dataclass(AscV41BlockMetadata)
+register_pytree_node_for_dataclass(AscV41Metadata)
+
+
+def _asc_v41_record(
+    attention_masks,
+    ratio,
+    topk_indices,
+    q,
+    window_size,
+) -> AscV41BlockMetadata | None:
+    """The precomputed record for this layer's geometry, or ``None``.
+
+    ``attention_masks`` is whatever the model attached: the Asc subclass when
+    the metadata override is active, the plain contract otherwise -- unit
+    tests hand-build the plain one.  A key miss is a geometry the extension
+    did not precompute and falls back to the inline call; a hit whose
+    heads/head-dim/window disagree with the calling layer is a config
+    disagreement between the extension and the attention configs, and fails
+    loudly rather than silently misreading a wrong-geometry record.
+    """
+    asc = getattr(attention_masks, "asc", None)
+    if not asc:
+        return None
+    record = asc.get((ratio, 0 if topk_indices is None else topk_indices.shape[-1]))
+    if record is None:
+        return None
+    if not record.matches(q, window_size):
+        raise ValueError(
+            f"the precomputed SMLA metadata for this layer was built for "
+            f"({record.num_heads} heads, head_dim {record.head_dim}, window "
+            f"{record.window_size}) but the layer runs ({q.shape[1]}, {q.shape[2]}, "
+            f"{window_size}): the metadata extension's geometry and the attention "
+            "configs disagree"
+        )
+    return record
+
+
 class _SparseMLA(torch.autograd.Function):
     """SMLAG with its teacher by-product, in the TND layout of one packed row.
 
@@ -91,15 +208,21 @@ class _SparseMLA(torch.autograd.Function):
     ):
         options = _kernel_options(attention_masks, ratio, window_size)
         geometry = _kernel_geometry(topk_indices, cmp_k)
-        smla_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
-            q.shape[1],
-            1,
-            q.shape[2],
-            ori_topk_length=None,
-            cmp_topk_length=None,
-            **options,
-            **geometry,
-        )
+        record = _asc_v41_record(attention_masks, ratio, topk_indices, q, window_size)
+        if record is None:
+            smla_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
+                q.shape[1],
+                1,
+                q.shape[2],
+                ori_topk_length=None,
+                cmp_topk_length=None,
+                **options,
+                **geometry,
+            )
+        else:
+            # The precomputed record is read instead of re-running the AI_CPU
+            # operator per layer; its geometry was verified on the lookup.
+            smla_metadata = record.smla_metadata
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
             ori_kv=swa_k,
@@ -146,13 +269,19 @@ class _SparseMLA(torch.autograd.Function):
         # for being an input.  Nothing is ever read off it -- the teacher comes back from
         # SMLAG below, in the carrier's own layout.
         options = _kernel_options(ctx.attention_masks, ctx.ratio, ctx.window_size)
-        smla_grad_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_grad_metadata(
-            q.shape[1],
-            1,
-            q.shape[2],
-            **options,
-            **_kernel_geometry(topk_indices, cmp_k),
-        )
+        record = _asc_v41_record(ctx.attention_masks, ctx.ratio, topk_indices, q, ctx.window_size)
+        if record is None:
+            smla_grad_metadata = torch.ops.cann_ops_transformer.sparse_flash_mla_grad_metadata(
+                q.shape[1],
+                1,
+                q.shape[2],
+                **options,
+                **_kernel_geometry(topk_indices, cmp_k),
+            )
+        else:
+            # The gradient metadata is keyed the same way as the forward's and
+            # rides the same record, so the backward skips its AI_CPU call too.
+            smla_grad_metadata = record.smla_grad_metadata
         dq, dswa_k, dcmp_k, dsinks, _, cmp_softmax_l1_norm = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
@@ -205,7 +334,9 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
 
     @dataclass(kw_only=True, slots=True)
     class Config(CompressedSparseInnerAttention2.Config):
-        pass
+        # The model's construction-time pairing check reads this marker: the
+        # precomputed records only pay off when this core consumes them.
+        reads_asc_metadata: ClassVar[bool] = True
 
     def forward(
         self,
@@ -256,3 +387,111 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
             wants_teacher,
         )
         return output.reshape_as(q)
+
+
+class AscV41MetadataExtension(MetadataExtension):
+    """Fills the precomputed SMLA metadata records onto the model-built masks.
+
+    One record per distinct ``(compress_ratio, cmp_topk)`` the stack runs --
+    the only per-layer inputs the metadata operators vary on.  The geometry
+    (heads, head dim, window, index top-k) and the stack's ratios are supplied
+    by the model dir on the config; the frames come from the metadata being
+    wrapped, so a record and the inline call the layer would otherwise make
+    read the same tensors by construction.  Ratios the frames carry but the
+    config does not list are covered too, so a sharded forward (whose frames
+    the model builds itself) is precomputed the same way.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MetadataExtension.Config):
+        # The geometry is required here, unlike the backend-agnostic base: the
+        # precompute cannot be guarded without it.  ``derive`` copies the model
+        # dir's filled values in (the subclass exists so it can), and a config
+        # that reaches ``derive`` unfilled fails here, at construction, rather
+        # than at the first batch.
+        num_heads: int  # pyrefly: ignore [bad-override]
+        head_dim: int  # pyrefly: ignore [bad-override]
+        index_topk: int  # pyrefly: ignore [bad-override]
+        window_size: int  # pyrefly: ignore [bad-override]
+
+        def __post_init__(self) -> None:
+            # ``derive`` from an unfilled base copies its defaults straight in
+            # (None geometry, window 0); a window of 0 would silently build
+            # records with ``ori_win_left = -1``.  Both fail here, at config time.
+            missing = [
+                name for name in ("num_heads", "head_dim", "index_topk", "window_size") if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"AscV41MetadataExtension.Config is missing the model geometry: {missing}. "
+                    "The model dir fills it in _make_v41_config; a hand-built config must state it."
+                )
+            if self.window_size <= 0:
+                raise ValueError(
+                    f"window_size must be positive, got {self.window_size}: a window of 0 "
+                    "would build records with a negative ori_win_left."
+                )
+
+    def __call__(self, metadata: DeepSeekV41Metadata) -> AscV41Metadata:
+        if not isinstance(metadata, DeepSeekV41Metadata):
+            raise TypeError(f"AscV41MetadataExtension requires DeepSeekV41Metadata, got {type(metadata).__name__}")
+        cfg = cast("AscV41MetadataExtension.Config", self.config)
+        ratios = sorted(set(cfg.compress_ratios) | set(metadata.cmp_k))
+        if not ratios:
+            return self._copy(metadata, {})
+        asc: dict[tuple[int, int], AscV41BlockMetadata] = {}
+        for ratio in ratios:
+            options = _kernel_options(metadata, ratio, cfg.window_size)
+            has_cmp = ratio > 0
+            # The forward's ``cmp_topk`` is the selection's last shape, which
+            # the stack fixes at ``index_topk``; keying the record by the same
+            # local makes a disagreement between the two a lookup miss (and an
+            # inline recompute) rather than a silent reuse, and makes the key
+            # and the operator's argument one value by construction.
+            cmp_topk = cfg.index_topk if has_cmp else 0
+            geometry = dict(
+                ori_topk=0,
+                cmp_topk=cmp_topk,
+                has_ori_kv=True,
+                has_cmp_kv=has_cmp,
+            )
+            key = (ratio, cmp_topk)
+            asc[key] = AscV41BlockMetadata(
+                smla_metadata=torch.ops.cann_ops_transformer.sparse_flash_mla_metadata(
+                    cfg.num_heads,
+                    1,
+                    cfg.head_dim,
+                    ori_topk_length=None,
+                    cmp_topk_length=None,
+                    **options,
+                    **geometry,
+                ),
+                smla_grad_metadata=torch.ops.cann_ops_transformer.sparse_flash_mla_grad_metadata(
+                    cfg.num_heads,
+                    1,
+                    cfg.head_dim,
+                    **options,
+                    **geometry,
+                ),
+                num_heads=cfg.num_heads,
+                head_dim=cfg.head_dim,
+                window_size=cfg.window_size,
+            )
+        return self._copy(metadata, asc)
+
+    @staticmethod
+    def _copy(metadata: DeepSeekV41Metadata, asc: dict[tuple[int, int], AscV41BlockMetadata]) -> AscV41Metadata:
+        """Rebuild the wrapped metadata as the Asc subclass.
+
+        ``dataclasses.replace`` keeps the instance's own class, so the fields
+        are spelled out instead: the extension owns the exact subclass the
+        fused core's lookup reads.
+        """
+        return AscV41Metadata(
+            q=metadata.q,
+            swa_k=metadata.swa_k,
+            cmp_k=metadata.cmp_k,
+            positions_q=metadata.positions_q,
+            exchange=metadata.exchange,
+            asc=asc,
+        )

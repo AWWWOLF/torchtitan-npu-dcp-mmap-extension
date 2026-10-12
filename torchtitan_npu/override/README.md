@@ -427,6 +427,7 @@ runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | SMLA 前后向；`topk_scores` 作为教师边 |
+| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscV41MetadataExtension.Config` | 在 mask 构建边界预计算 SMLA 元数据，**须与 `sparse_attn.asc` 同开才有收益**（单独启用仅白做预计算，模型构造期会对无消费者的组合告警）；`sparse_attn.asc` 逐层查表复用（miss 回退 inline）；QAT 入口不启用——torchao_npu 的量化注意力未消费记录 |
 | `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |

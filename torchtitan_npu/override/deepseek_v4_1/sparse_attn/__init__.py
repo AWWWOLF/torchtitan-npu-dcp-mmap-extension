@@ -9,9 +9,30 @@ The LightningIndexer half lives in its own package, :mod:`...deepseek_v4_1.light
 so the two can be selected independently.
 """
 
+from typing import TYPE_CHECKING
+
 from torchtitan.config import derive, override
 
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
+
+if TYPE_CHECKING:
+    # Annotation-only: the runtime import stays lazy in the factory below so
+    # the golden path does not require cann_ops_transformer.
+    from .ascendc import AscV41MetadataExtension
+
+
+@override(
+    target=MetadataExtension.Config,
+    description="Precompute the AscendC SMLA metadata operators onto the model-built V4.1 masks",
+)
+def asc_metadata(
+    cfg: MetadataExtension.Config,
+) -> "AscV41MetadataExtension.Config":
+    # Imported lazily so the golden path does not require cann_ops_transformer.
+    from .ascendc import AscV41MetadataExtension
+
+    return derive(cfg, AscV41MetadataExtension.Config)
 
 
 @override(
