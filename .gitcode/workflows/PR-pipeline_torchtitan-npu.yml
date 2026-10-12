@@ -75,7 +75,7 @@ stages:
     - type: auto
     fail-fast: true
   stage3:
-    name: UT
+    name: UT_PreSmoke
     jobs:
       JOB_UT_Test:
         name: UT_Test
@@ -84,12 +84,6 @@ stages:
           ut_type: 'torchtitan-npu'
           ut_package: 'ut_cov_torchtitan-npu.tar.gz'
           image_version: ${{ jobs.JOB_image.outputs.UT_Test }}
-    pre:
-    - type: auto
-    fail-fast: true
-  stage4:
-    name: PreSmoke
-    jobs:
       PreSmoke_A3_part1:
         name: PreSmoke_A3_part1
         steps:
@@ -177,7 +171,7 @@ stages:
           # revise-img returns, so this pipeline exercises the image itself.
           image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu24.04_arm:cann_920_0929
     pre:
-      - type: auto
+    - type: auto
     fail-fast: true
 post:
   jobs:
