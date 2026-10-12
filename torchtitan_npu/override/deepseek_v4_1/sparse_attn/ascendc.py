@@ -5,7 +5,6 @@
 """V4.1 SMLA attention and SMLAG-backed indexer distillation."""
 
 from dataclasses import dataclass
-from typing import ClassVar
 
 import torch
 
@@ -23,10 +22,10 @@ def _kernel_options(attention_masks, ratio, window_size):
     # Only ratio 0 has no compressed axis, and the kernels spell that ``None``.  Every
     # other ratio has one -- at ratio 1 it is the row itself and its frame carries no
     # residual, which is exactly what the kernel wants there.
-    compressed = attention_masks.kernel.frame_for(ratio) if ratio > 0 else None
+    compressed = attention_masks.frame_for(ratio) if ratio > 0 else None
     return dict(
-        cu_seqlens_q=attention_masks.kernel.q.cu_seqlens,
-        cu_seqlens_ori_kv=attention_masks.kernel.swa_k.cu_seqlens,
+        cu_seqlens_q=attention_masks.q.cu_seqlens,
+        cu_seqlens_ori_kv=attention_masks.swa_k.cu_seqlens,
         cu_seqlens_cmp_kv=None if compressed is None else compressed.cu_seqlens,
         # The per-sequence lengths actually addressed -- how an operator is told to read a prefix
         # of its operand.  Under context parallelism they carry the whole query movement:
@@ -35,8 +34,8 @@ def _kernel_options(attention_masks, ratio, window_size):
         # this rank's chunk offset inside the document.  At ``cp_size = 1`` each of them equals the
         # corresponding boundary difference, so passing them is a no-op there rather than a second
         # code path.
-        seqused_q=attention_masks.kernel.q.seqused,
-        seqused_ori_kv=attention_masks.kernel.swa_k.seqused,
+        seqused_q=attention_masks.q.seqused,
+        seqused_ori_kv=attention_masks.swa_k.seqused,
         seqused_cmp_kv=None if compressed is None else compressed.seqused,
         cmp_residual_kv=None if compressed is None else compressed.residual,
         cmp_ratio=max(ratio, 1),
@@ -206,7 +205,7 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
 
     @dataclass(kw_only=True, slots=True)
     class Config(CompressedSparseInnerAttention2.Config):
-        provides_indexer_teacher: ClassVar[bool] = True
+        pass
 
     def forward(
         self,

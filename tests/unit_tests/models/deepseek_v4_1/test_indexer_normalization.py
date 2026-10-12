@@ -12,18 +12,28 @@ from torchtitan_npu.models.deepseek_v4_1 import config_registry
 from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
 
 
+class _FusedStandIn(Selector):
+    """A stand-in for a fused port: the trainer discovers those by class, not by a flag.
+
+    The real ports subclass :class:`Selector` (and the reference selector is the only module
+    whose exact class is ``Selector``), which is what ``TrainerEx`` keys the step denominator on.
+    """
+
+
 def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monkeypatch):
     config = Selector.Config(
         mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4
     )
-    selector, reference = Selector(config), Selector(config)
-    selector.consumes_indexer_teacher = True
+    selector, reference = _FusedStandIn(config), Selector(config)
 
     def initialize(self, config):
         self.model_parts = [torch.nn.ModuleList([selector, reference])]
 
     monkeypatch.setattr(GradientClippingTrainer, "__init__", initialize)
-    trainer = config_registry.DeepSeekV41Trainer(None)
+    job = SimpleNamespace(
+        override=SimpleNamespace(imports=["torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"])
+    )
+    trainer = config_registry.DeepSeekV41Trainer(job)
     trainer.device = torch.device("cpu")
     mesh = object()
     trainer.parallel_dims = SimpleNamespace(dp_enabled=True, get_mesh=lambda name: mesh)

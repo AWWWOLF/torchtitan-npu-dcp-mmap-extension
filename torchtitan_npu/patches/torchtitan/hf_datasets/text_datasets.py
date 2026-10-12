@@ -15,11 +15,10 @@
 """Per-document pooling alignment for the pinned text data path.
 
 Models with a compressed KV pool each group of ``R`` consecutive tokens into one
-main-KV entry, and the indexer addresses that entry axis as ``doc_ids[:, j * R]``.  A
-document whose token count is not a multiple of ``R`` therefore gets a partial
+main-KV entry, and the indexer addresses that entry axis as the row's boundaries over
+``R``.  A document whose token count is not a multiple of ``R`` therefore gets a partial
 trailing group that the *next* document's tokens complete: the pooled value mixes two
-documents, and the entry stays selectable by the first document's queries because its
-document is read off its first token.
+documents, and the boundaries no longer say which document the group belongs to.
 
 Padding every packed document segment up to a multiple of the model's alignment keeps
 each group inside one document.  The pad stays inside its segment -- positions keep

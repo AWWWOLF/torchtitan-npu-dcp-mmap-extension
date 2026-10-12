@@ -208,26 +208,23 @@ def test_candidate_pool_reaches_only_its_window_indexers(monkeypatch) -> None:
     assert all(mask is pool for mask in observed_masks[pool_source + 1 :])
 
 
-def test_metadata_document_ids_restart_per_packed_document(monkeypatch) -> None:
-    """The only varlen metadata is a document id per token, derived from the positions."""
+def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -> None:
+    """The only varlen metadata is the row's packed frames, derived from the positions."""
     model, _ = _tiny_debug_model(monkeypatch)
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]], dtype=torch.long)
 
     metadata = model.get_attention_masks(positions)
 
-    # torch.cumsum promotes the int32 input, so the document ids come back int64.
-    torch.testing.assert_close(
-        metadata.ref.doc_ids_BL,
-        torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, 2, 2]], dtype=torch.int64),
-        rtol=0,
-        atol=0,
-    )
-
-    # The indexer's selection masks are precomputed once per forward, one per pooling
-    # ratio, so no layer rebuilds them.
-    assert set(metadata.ref.selection_masks) == {ratio for ratio in model.compress_ratios if ratio > 0}
-    for ratio, (visible, _, _) in metadata.ref.selection_masks.items():
-        assert visible.shape == (positions.size(1), positions.size(1) // ratio)
+    # Three documents: the query and sliding-window frames are the row's own boundaries, and
+    # a compressed stream's are that row's over its ratio, whole groups per document.
+    assert metadata.q.cu_seqlens.tolist() == [0, 4, 8, 10]
+    assert metadata.swa_k.cu_seqlens.tolist() == [0, 4, 8, 10]
+    ratios = sorted({ratio for ratio in model.compress_ratios if ratio > 0})
+    assert ratios == [1, 2]
+    for ratio in ratios:
+        frame = metadata.frame_for(ratio)
+        assert frame.cu_seqlens.tolist() == [bound // ratio for bound in (0, 4, 8, 10)]
+        assert frame.seqused.tolist() == [4 // ratio, 4 // ratio, 2 // ratio]
 
 
 def test_weightless_compressor_passes_the_container_through(monkeypatch) -> None:

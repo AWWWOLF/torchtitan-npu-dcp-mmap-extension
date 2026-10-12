@@ -48,15 +48,15 @@ def _kernel_options(attention_masks, ratio, window_size):
     convention two call sites have to keep in step.
     """
     # Only ratio 0 has no compressed axis, and the kernels spell that ``None``.  Every
-    # other ratio has one -- at ratio 1 it is the row itself and its frame carries a zero
-    # residual tensor, which is exactly what the kernel wants there.
-    compressed = attention_masks.kernel.frame_for(ratio) if ratio > 0 else None
+    # other ratio has one -- at ratio 1 it is the row itself and its frame carries no
+    # residual, which is exactly what the kernel wants there.
+    compressed = attention_masks.frame_for(ratio) if ratio > 0 else None
     return dict(
-        cu_seqlens_q=attention_masks.kernel.q.cu_seqlens,
-        cu_seqlens_ori_kv=attention_masks.kernel.swa_k.cu_seqlens,
+        cu_seqlens_q=attention_masks.q.cu_seqlens,
+        cu_seqlens_ori_kv=attention_masks.swa_k.cu_seqlens,
         cu_seqlens_cmp_kv=None if compressed is None else compressed.cu_seqlens,
-        seqused_q=attention_masks.kernel.q.seqused,
-        seqused_ori_kv=attention_masks.kernel.swa_k.seqused,
+        seqused_q=attention_masks.q.seqused,
+        seqused_ori_kv=attention_masks.swa_k.seqused,
         seqused_cmp_kv=None if compressed is None else compressed.seqused,
         cmp_residual_kv=None if compressed is None else compressed.residual,
         cmp_ratio=max(ratio, 1),

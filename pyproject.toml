@@ -7,7 +7,7 @@ name = "torchtitan-npu"
 version = "0.1.0"
 description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
-dependencies = ["torchtitan", "torch-npu", "attn-gym==0.0.9", "torchvision"]
+dependencies = ["torchtitan", "torch-npu", "attn-gym==0.0.16", "torchvision"]
 
 [project.optional-dependencies]
 multimodal = [

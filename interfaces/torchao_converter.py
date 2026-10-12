@@ -155,10 +155,6 @@ def _get_npu_quantized_module_cls(parent_cls: type[Module]) -> type[Module]:
 
     NpuQuantizedModule.__name__ = f"NpuQuantized{parent_cls.__name__}"
     NpuQuantizedModule.__qualname__ = f"NpuQuantized{parent_cls.__name__}"
-    if issubclass(parent_cls, V41Selector):
-        NpuQuantizedModule.Config.consumes_indexer_teacher = True
-    if issubclass(parent_cls, CompressedSparseInnerAttention2):
-        NpuQuantizedModule.Config.provides_indexer_teacher = True
     _npu_quantized_module_cache[parent_cls] = NpuQuantizedModule
     return NpuQuantizedModule
 

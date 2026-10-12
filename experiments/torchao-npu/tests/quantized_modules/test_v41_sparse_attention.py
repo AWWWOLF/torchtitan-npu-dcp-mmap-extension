@@ -22,7 +22,7 @@ def _metadata(*, tokens=4, compressed_tokens=2):
         residual=torch.zeros(1, dtype=torch.int32),
         seqused=torch.tensor([compressed_tokens], dtype=torch.int32),
     )
-    kernel = SimpleNamespace(
+    return SimpleNamespace(
         q=SimpleNamespace(
             cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
             seqused=torch.tensor([tokens], dtype=torch.int32),
@@ -33,7 +33,6 @@ def _metadata(*, tokens=4, compressed_tokens=2):
         ),
         frame_for=lambda ratio: compressed,
     )
-    return SimpleNamespace(kernel=kernel)
 
 
 def _fake_mla_apply(captured):
@@ -80,14 +79,14 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
     scores = torch.empty((4, 1, 2), device=device, dtype=torch.float32, requires_grad=True) if with_shared else None
     sinks = torch.ones((2,), device=device, dtype=torch.float32, requires_grad=True)
     attention_masks = _metadata(tokens=4, compressed_tokens=cmp_tokens)
-    attention_masks.kernel.q.seqused = torch.tensor([2], dtype=torch.int32)
-    attention_masks.kernel.swa_k.seqused = torch.tensor([3], dtype=torch.int32)
-    attention_masks.kernel.frame_for(ratio).seqused = torch.tensor([min(cmp_tokens, 1)], dtype=torch.int32)
-    expected_residual = attention_masks.kernel.frame_for(ratio).residual if ratio > 0 else None
+    attention_masks.q.seqused = torch.tensor([2], dtype=torch.int32)
+    attention_masks.swa_k.seqused = torch.tensor([3], dtype=torch.int32)
+    attention_masks.frame_for(ratio).seqused = torch.tensor([min(cmp_tokens, 1)], dtype=torch.int32)
+    expected_residual = attention_masks.frame_for(ratio).residual if ratio > 0 else None
     expected_lengths = {
-        "seqused_q": attention_masks.kernel.q.seqused,
-        "seqused_ori_kv": attention_masks.kernel.swa_k.seqused,
-        "seqused_cmp_kv": attention_masks.kernel.frame_for(ratio).seqused if ratio > 0 else None,
+        "seqused_q": attention_masks.q.seqused,
+        "seqused_ori_kv": attention_masks.swa_k.seqused,
+        "seqused_cmp_kv": attention_masks.frame_for(ratio).seqused if ratio > 0 else None,
     }
     forward_metadata = torch.tensor([7], device=device, dtype=torch.int32)
     grad_metadata = torch.tensor([9], device=device, dtype=torch.int32)

@@ -6,7 +6,6 @@
 """The BF16 LightningIndexer selection fused with its SLIKG backward edge."""
 
 from dataclasses import dataclass
-from typing import ClassVar
 
 import torch
 
@@ -23,9 +22,9 @@ def _kernel_options(attention_masks, ratio):
     option-for-option; reading one source is what makes that structural rather than a
     convention two call sites have to keep in step.
     """
-    compressed = attention_masks.kernel.frame_for(ratio)
+    compressed = attention_masks.frame_for(ratio)
     return dict(
-        cu_seqlens_q=attention_masks.kernel.q.cu_seqlens,
+        cu_seqlens_q=attention_masks.q.cu_seqlens,
         cu_seqlens_k=compressed.cu_seqlens,
         # The per-sequence lengths actually addressed -- how an operator is told to read a prefix
         # of its operand.  Under context parallelism they carry the whole query movement:
@@ -34,7 +33,7 @@ def _kernel_options(attention_masks, ratio):
         # operator this selector can pick takes the pair -- the BF16 indexer and SLIKG -- and at
         # ``cp_size = 1`` each equals the corresponding boundary difference, so passing them is a
         # no-op there rather than a second code path.
-        seqused_q=attention_masks.kernel.q.seqused,
+        seqused_q=attention_masks.q.seqused,
         seqused_k=compressed.seqused,
         cmp_residual_k=compressed.residual,
         layout_q=_LAYOUT,
@@ -191,16 +190,18 @@ class AscSelector(Selector):
     It emits the kernel's own document-local ``topk_indices``.  The fused attention
     consumes that same coordinate system, so neither side translates: the selection
     crosses the model boundary exactly as the kernels selected it, and only ``-1`` marks an
-    unused slot.
+    unused slot.  The reference selector emits that numbering too, so it is the model's
+    contract rather than this pair's.
 
-    ``consumes_indexer_teacher`` is what pairs this node with the port that emits the
-    teacher (``sparse_attn.asc``); see
-    :func:`~torchtitan_npu.models.deepseek_v4_1.attention._check_indexer_teacher_pair`.
+    It is the consumer half of the teacher pair: ``sparse_attn.asc`` emits the teacher on
+    ``topk_scores``' gradient and this backward is what reads it, so the two overrides are
+    requested together or not at all -- see
+    :func:`torchtitan_npu.models.deepseek_v4_1.model._check_indexer_teacher_pair`.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Selector.Config):
-        consumes_indexer_teacher: ClassVar[bool] = True
+        pass
 
     def forward(
         self,

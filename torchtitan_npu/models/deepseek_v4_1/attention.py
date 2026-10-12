@@ -11,18 +11,18 @@ Shape legend for this file:
     N = number of compressed KV entries, K = ``index_topk``.
 
 Each query attends to two sources at once, combined into a single masked softmax by
-Attention Gym's ``selected_attention``: its own sliding window over the layer's KV
+Attention Gym's ``gather_attn``: its own sliding window over the layer's KV
 ``[B, L, Dk]``, and the ``K`` compressed entries selected by the indexer out of the
 shared compressed KV ``[B, N, Dk]``.  A learned per-head sink logit takes part in the
 softmax denominator without contributing a value, so a row with no reachable entry
 still produces zeros instead of NaN.
 
-Packed documents are isolated by ``doc_ids``, the metadata's only per-token field: the
-operator applies it to the sliding-window branch, and the indexer uses it to keep its
-top-``K`` inside the query's own document (the operator's contract leaves the sparse
-branch to the caller).  ``doc_ids`` is not an attention input: the indexer derives its
-entry-axis isolation from it while building the precomputed selection masks.  ``positions``
-is a per-forward argument, not metadata, and only drives RoPE.
+Packed documents reach the operator as the row's packed offsets, read off the metadata's
+frames: ``cu_seqlens`` keeps a query's sliding window inside its own document and
+``cu_seqlens_k`` numbers the sparse pool per document.  The selection is already in that
+numbering -- the indexer emits it document-local, which is also what the fused kernels
+read -- so nothing is translated here.  ``positions`` is a per-forward argument, not
+metadata, and only drives RoPE.
 
 The indexer's teacher belongs to a port, not to this core.  It is the operator's per-head
 log-sum-exp of the full softmax (window, selected compressed entries and sink), turned
@@ -36,10 +36,9 @@ inner-attention forward.
 """
 
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import torch
-from attn_gym.sparse.selected_attention import selected_attention
+from attn_gym.sparse import gather_attn
 from torch import nn
 from torchtitan.models.common.attention import BaseAttention
 from torchtitan.models.common.linear import Linear
@@ -54,75 +53,25 @@ from .context_parallel import QueryExchange
 from .indexer import HierarchicalIndexer
 
 
-def _check_indexer_teacher_pair(
-    attn_cfg: "CompressedSparseInnerAttention2.Config", indexer_cfg: HierarchicalIndexer.Config
-) -> None:
-    """The fused indexer teacher is a pair: one port emits it, one consumes it.
-
-    ``topk_scores`` is carried only between the two kernel backwards.  The emitting
-    port writes the raw teacher on ``topk_scores``' gradient; the consuming selector
-    is the only thing that ever reads that edge.  Fusing one side alone therefore
-    breaks the objective -- silently, since neither half raises on its own -- so the
-    mismatch is rejected here instead of being discovered from a flat training curve.
-
-    Neither half is a usable fallback, and this check is the only thing that keeps
-    them from being reached:
-
-    - Selector without the fused core: ``topk_scores``' gradient is ``None``, so SLIKG
-      returns zero gradient and the indexer never updates.
-    - Fused core without the fused selector: the reference selector does pick the
-      teacher up off that edge, but it applies attention-level marginals to summed
-      per-head indexer logits.  The two sides are not the same quantity, so the
-      resulting training signal is wrong rather than merely different.  That path is
-      deliberately left unfixed -- it is unreachable while this check is in place.
-
-    Both halves are compile-time facts on the config classes, so this runs on the
-    configs rather than on the built modules: ``Module`` does not retain its config.
-    A ratio-0 layer is skipped: it has no second KV stream, so neither half has an
-    edge to offer or consume.
-    """
-    if attn_cfg.compress_ratio == 0:
-        return
-    fused_core = getattr(type(attn_cfg), "provides_indexer_teacher", False)
-    fused_selector = getattr(type(indexer_cfg.selector), "consumes_indexer_teacher", False)
-    if fused_core == fused_selector:
-        return
-    if fused_core:
-        active, missing = "sparse_attn.asc", "lightning_indexer.asc"
-        consequence = "the reference selector would take the teacher onto summed per-head logits"
-    else:
-        active, missing = "lightning_indexer.asc", "sparse_attn.asc"
-        consequence = "topk_scores would carry no teacher"
-    raise ValueError(
-        f"A fused V4.1 attention core and a fused selector must be enabled together: {active} is "
-        f"active without {missing}, so {consequence} and the indexer cannot be trained correctly. "
-        "Enable both or neither. See torchtitan_npu/override/README.md#deepseek-v41."
-    )
-
-
 class CompressedSparseInnerAttention2(Module):
     """CSA2's sparse core: sliding window plus the selected compressed entries.
 
-    The whole core is Attention Gym's ``selected_attention`` in one call: ``q`` carries
+    The whole core is Attention Gym's ``gather_attn`` in one call: ``q`` carries
     ``H`` heads while both KV sources carry a single shared head, and ``topk_indices``
-    index the compressed KV with ``-1`` for unused slots.  ``compress_ratio`` carries
-    the layer's verified ratio (0 window-only, 1 a full-resolution second KV stream,
-    2 the compressed shared KV): a fused port needs it to translate the metadata's
-    document boundaries into its kernel layout, so it is never guessed from shapes.
+    index the compressed KV -- inside each document's own entries -- with ``-1`` for unused
+    slots.  ``compress_ratio`` carries the layer's verified ratio (0 window-only, 1 a
+    full-resolution second KV stream, 2 the compressed shared KV): it is the grid the
+    sparse pool is addressed on -- a fused port also needs it to translate the metadata's
+    document boundaries into its kernel layout -- so it is never guessed from shapes.
 
     A port that can produce the indexer's teacher replaces this forward wholesale and
-    emits it on ``topk_scores``' gradient; this core has no kernel to make one.  Such a
-    port's :class:`Config` sets ``provides_indexer_teacher``, which is what
-    :func:`_check_indexer_teacher_pair` pairs against the selector's
-    ``consumes_indexer_teacher``.
+    emits it on ``topk_scores``' gradient; this core has no kernel to make one.  Which port
+    is in place is read off the requested overrides, one stage earlier, by
+    :func:`torchtitan_npu.models.deepseek_v4_1.model._check_indexer_teacher_pair`.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        # Declared on the config, not the module: the pair check runs on the config
-        # tree before anything is built, and ``Module`` does not keep its config.
-        provides_indexer_teacher: ClassVar[bool] = False
-
         window_size: int
         softmax_scale: float
         # The layer's compression ratio, carried explicitly for the fused ports.
@@ -149,10 +98,12 @@ class CompressedSparseInnerAttention2(Module):
             q: Queries of shape ``[B, L, H, Dk]``.
             swa_k: Sliding-window KV of shape ``[B, L, Dk]``, shared across heads.
             attn_sink: Per-head sink logits of shape ``[H]``.
-            attention_masks: The forward's varlen metadata; the operator reads its
-                document ids for the sliding-window branch.
+            attention_masks: The forward's varlen metadata; the operator reads the row's
+                document boundaries for the sliding-window branch.
             cmp_k: Shared compressed KV of shape ``[B, N, Dk]``.
-            topk_indices: Selected compressed entries ``[B, L, K]``, ``-1`` for unused.
+            topk_indices: Selected compressed entries ``[B, L, K]``, ``-1`` for unused
+                slots.  The indexer emits them document-local, which is the numbering the
+                operator reads, so they are passed through untouched.
             topk_scores: Accepted for the forward contract and unused here; it exists so
                 a port that produces the indexer's teacher has somewhere to carry it.
 
@@ -169,28 +120,40 @@ class CompressedSparseInnerAttention2(Module):
 
         batch, num_tokens, _, head_dim = q.size()
         local_kv_B1LD = swa_k.reshape(batch, 1, num_tokens, head_dim)
+        cu_seqlens = attention_masks.q.cu_seqlens
         if cmp_k is not None:
             # ``forward`` pairs the two inputs, so ``topk_indices`` is present here.
             assert topk_indices is not None
             sparse_kv_B1ND = cmp_k.reshape(batch, 1, cmp_k.size(1), head_dim)
+            # The compressed axis' own frame is the pool's grid, exactly as the fused port
+            # grids it, so both cores address one set of boundaries.
+            compressed = attention_masks.frame_for(self.compress_ratio)
+            assert compressed is not None, (
+                "Only a layer that pools has a compressed axis, so a core with a compressed "
+                f"KV must have a positive ratio (got {self.compress_ratio})."
+            )
+            cu_seqlens_k = compressed.cu_seqlens
             kv_indices_BLK = topk_indices
         else:
             # Window-only layer: the sparse pool is empty and every query keeps the
-            # window plus the sink.
+            # window plus the sink.  The two offsets travel together, so the row's own
+            # boundaries are passed here and never read: there is no pool to address.
             sparse_kv_B1ND = q.new_zeros(batch, 1, 0, head_dim)
             kv_indices_BLK = torch.empty(batch, num_tokens, 0, dtype=torch.long, device=q.device)
+            cu_seqlens_k = cu_seqlens
 
-        result = selected_attention(
+        result = gather_attn(
             q.transpose(1, 2),
             local_kv_B1LD,
             sparse_kv_B1ND,
             kv_indices_BLK,
             attention_sink=attn_sink,
-            doc_ids=attention_masks.ref.doc_ids_BL,
             sliding_window_size=self.window_size,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
             scale=self.softmax_scale,
             # TODO: run the fused kernels once they validate this path; ``impl`` is the
-            # pinned attn-gym 0.0.9 argument, ``"reference"`` its eager PyTorch path.
+            # pinned attn-gym 0.0.16 argument, ``"reference"`` its eager PyTorch path.
             impl="reference",
         )
         assert isinstance(result, torch.Tensor)
@@ -250,7 +213,6 @@ class Attention(BaseAttention):
         self.indexer = cfg.indexer.build()
         self.inner_attention = cfg.inner_attention.build()
         self.query_exchange = cfg.query_exchange.build()
-        _check_indexer_teacher_pair(cfg.inner_attention, cfg.indexer)
 
     def forward(
         self,

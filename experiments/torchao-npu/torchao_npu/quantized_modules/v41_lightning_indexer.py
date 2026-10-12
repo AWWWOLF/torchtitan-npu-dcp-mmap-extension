@@ -26,11 +26,11 @@ _MX_BLOCK_SIZE = 32
 
 
 def _kernel_options(attention_masks, ratio: int) -> dict[str, object]:
-    compressed = attention_masks.kernel.frame_for(ratio)
+    compressed = attention_masks.frame_for(ratio)
     return {
-        "cu_seqlens_q": attention_masks.kernel.q.cu_seqlens,
+        "cu_seqlens_q": attention_masks.q.cu_seqlens,
         "cu_seqlens_k": compressed.cu_seqlens,
-        "seqused_q": attention_masks.kernel.q.seqused,
+        "seqused_q": attention_masks.q.seqused,
         "seqused_k": compressed.seqused,
         "cmp_residual_k": compressed.residual,
         "layout_q": _LAYOUT,

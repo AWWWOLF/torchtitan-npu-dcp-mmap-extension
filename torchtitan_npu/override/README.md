@@ -449,10 +449,10 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 #### indexer 只在两个 override 同开时学习
 
 `sparse_attn.asc` 与 `lightning_indexer.asc` 各自替换独立的配置节点，但**必须同时启用**：
-模型构造时会检查这一对，只开其中一个直接报 `ValueError`，不会进入训练。检查在
-`Attention.__init__` 中按配置类的
-`provides_indexer_teacher` / `consumes_indexer_teacher` 标记配对，只对
-`compress_ratio > 0` 的层生效（纯窗口层没有压缩条目，两侧都没有这条边）。
+配置阶段（`update_from_config`）会检查这一对，只开其中一个直接报 `ValueError`，不会进入
+训练。检查按本次运行**请求的 override 列表**判定——该阶段在 `apply_overrides` 之前，能看到的
+就是请求本身；两个名字写在 `torchtitan_npu/models/deepseek_v4_1/model.py` 的
+`_FUSED_ATTENTION_OVERRIDES` 中，改名需要同步。
 
 原因是 indexer 的训练目标只存在于两个 kernel 反向之间：
 

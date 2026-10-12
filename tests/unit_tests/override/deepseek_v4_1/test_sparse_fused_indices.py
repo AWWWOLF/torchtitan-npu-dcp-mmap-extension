@@ -28,14 +28,11 @@ def _metadata(bounds: list[int], *, compress_ratios: tuple[int, ...] = (1, 2)):
 
         The hook is a method, so it reaches for the frame builders on ``self``; they are taken from
         the model class rather than restated here, so a change to the frame algebra cannot leave the
-        two disagreeing.  ``needs_reference`` is stated because a stand-in has no config to read it
-        from, and True is the conservative answer: the reference half is built.
+        two disagreeing.
         """
 
         _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
+        _row_metadata = DeepSeekV41Model._row_metadata
 
     owner = _ModelOwner()
     owner.compress_ratios = compress_ratios
@@ -54,8 +51,8 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
     """
     length = bounds[-1]
     metadata = _metadata(bounds)
-    assert torch.equal(metadata.kernel.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
-    cu_cmp = metadata.kernel.frame_for(ratio).cu_seqlens
+    assert torch.equal(metadata.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
+    cu_cmp = metadata.frame_for(ratio).cu_seqlens
 
     # Document-local indices, -1 for unused slots, interleaved: another document's first
     # entry, the first/last own entry, an unused slot and an exclusive-end index -- the

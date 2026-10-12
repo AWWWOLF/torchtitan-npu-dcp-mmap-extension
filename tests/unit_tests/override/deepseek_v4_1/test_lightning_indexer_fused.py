@@ -19,6 +19,7 @@ gradient, so its parameters stay frozen; that is why nothing here checks an "eag
 indexer gradient" -- with the distillation loss removed there is no longer a path to one.
 """
 
+import dataclasses
 import importlib
 from itertools import pairwise
 
@@ -57,14 +58,11 @@ def _metadata(bounds: list[int], *, compress_ratios: tuple[int, ...] = (1, 2)):
 
         The hook is a method, so it reaches for the frame builders on ``self``; they are taken from
         the model class rather than restated here, so a change to the frame algebra cannot leave the
-        two disagreeing.  ``needs_reference`` is stated because a stand-in has no config to read it
-        from, and True is the conservative answer: the reference half is built.
+        two disagreeing.
         """
 
         _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
+        _row_metadata = DeepSeekV41Model._row_metadata
 
     owner = _ModelOwner()
     owner.compress_ratios = compress_ratios
@@ -283,8 +281,8 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     fi, fs, _ = fused_indexer.forward(idx_q, idx_k, weights, metadata, candidates_BL1C=None)
 
     # int32, the dtype the kernels speak -- the LI op emits it and SMLAG/SLIKG take it,
-    # so it is never widened.  The eager selector's int64 is a ``torch.topk`` artefact and
-    # the reference casts it down too (``.int()``).
+    # so it is never widened.  The reference selector's int64 is a ``torch.topk`` artefact,
+    # and ``gather_attn`` takes either dtype, so nothing is cast on that side.
     assert fi.dtype == torch.int32
     # The fused carrier is a fabricated FP32 buffer of the selection's shape.  Its
     # *contents* are meaningless by construction -- the teacher rides its gradient, not
@@ -292,17 +290,12 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     assert fs.dtype == torch.float32
     assert es.dtype == fs.dtype == torch.float32
     assert fs.shape == fi.shape
-    # Same reachable selection per row.
-    #
-    # The two selectors speak different coordinate systems: the eager one numbers the
-    # whole packed pool, the fused one numbers each document's own entries because that
-    # is what the kernel grids.  The comparison is exact once the fused indices are
-    # shifted by their document's start.
-    starts = metadata.kernel.frame_for(eager_indexer.compress_ratio).cu_seqlens.to(torch.long)
-    docs = metadata.ref.doc_ids_BL.reshape(-1)
+    # Same reachable selection per row.  Both selectors number each query's own document's
+    # entries -- the fused one because that is what the kernel grids, the eager one because
+    # that is what ``gather_attn`` reads -- so the comparison is direct.
     for t in range(l):
         eager_row = {int(j) for j in ei[0, t].tolist() if j >= 0}
-        fused_row = {int(starts[docs[t]]) + int(j) for j in fi[0, t].tolist() if j >= 0}
+        fused_row = {int(j) for j in fi[0, t].tolist() if j >= 0}
         assert fused_row == eager_row, t
 
     # A pool smaller than index_topk: the fused kernel keeps its own K and reports the
@@ -317,11 +310,9 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     assert fi2.shape[-1] == fused_indexer.index_topk == 32
     assert ei2.shape[-1] == 16  # the eager selector clamps to the pool
     assert fs2.dtype == torch.float32
-    # Same cross-frame shift as above: the fused selection is document-local.
-    starts2 = small_metadata.kernel.frame_for(eager_indexer.compress_ratio).cu_seqlens.to(torch.long)
-    docs2 = small_metadata.ref.doc_ids_BL.reshape(-1)
+    # Same document-local numbering as above.
     for t in range(32):
-        fused_t = {int(starts2[docs2[t]]) + int(j) for j in fi2[0, t].tolist() if j >= 0}
+        fused_t = {int(j) for j in fi2[0, t].tolist() if j >= 0}
         eager_t = {int(j) for j in ei2[0, t].tolist() if j >= 0}
         assert fused_t == eager_t, t
 
@@ -675,13 +666,12 @@ def test_full_model_smla_trains_the_indexer_through_the_teacher_edge(monkeypatch
         assert torch.isfinite(parameter.grad).all(), name
 
 
-def test_a_half_fused_teacher_pair_is_rejected(monkeypatch):
-    """One fused side without the other is refused at build time.
+def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
+    """With both ports derived, the built model carries the kernels rather than the reference.
 
-    Both halves are compile-time facts on the two configs, so a half-fused stack is a
-    configuration error rather than something to discover from a flat training curve.
+    The half-fused cases are rejected one stage earlier, on the override request -- see
+    ``test_a_half_fused_teacher_pair_is_rejected_through_override_imports``.
     """
-    from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
     from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
@@ -699,23 +689,6 @@ def test_a_half_fused_teacher_pair_is_rejected(monkeypatch):
                 layer.attention.inner_attention = derive(layer.attention.inner_attention, AscV41SparseAttention.Config)
         return cfg
 
-    assert not CompressedSparseInnerAttention2.Config.provides_indexer_teacher
-
-    # Selector only: topk_scores would carry no teacher at all.
-    with (
-        pytest.raises(ValueError, match=r"lightning_indexer.asc is active without sparse_attn.asc"),
-        torch.random.fork_rng(devices=[]),
-    ):
-        build_cpu_model(config(fused_selector=True, fused_core=False))
-
-    # Core only: the teacher edge would have no consumer.
-    with (
-        pytest.raises(ValueError, match=r"sparse_attn.asc is active without lightning_indexer.asc"),
-        torch.random.fork_rng(devices=[]),
-    ):
-        build_cpu_model(config(fused_selector=False, fused_core=True))
-
-    # Both together: the pair is complete, so the model builds.
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config(fused_selector=True, fused_core=True))
     assert isinstance(model.layers["2"].attention.inner_attention, AscV41SparseAttention)
@@ -730,20 +703,33 @@ def test_a_half_fused_teacher_pair_is_rejected(monkeypatch):
     ],
     ids=["selector-only", "core-only"],
 )
-def test_a_half_fused_teacher_pair_is_rejected_through_override_imports(monkeypatch, imports):
-    """The rejection fires on the real ``override.imports`` wiring, not just on hand-built configs."""
-    from torchtitan.config.override import OverrideConfig, apply_overrides
+def test_a_half_fused_teacher_pair_is_rejected_through_override_imports(imports):
+    """The rejection fires on the override request, which is the stage that can see it."""
+    from torchtitan.config.override import OverrideConfig
 
-    monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
-    config = registry.model_registry("deepseek_v4_1_debugmodel").model
-    apply_overrides(OverrideConfig(imports=imports), config)
+    recipes = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
+    job = recipes.deepseek_v4_1_debugmodel_text()
+    job.override = OverrideConfig(imports=imports)
+    with pytest.raises(ValueError, match="must be enabled together"):
+        job.model_spec.model.update_from_config(config=job)
 
-    with (
-        pytest.raises(ValueError, match="must be enabled together"),
-        torch.random.fork_rng(devices=[]),
-    ):
-        build_cpu_model(config)
+
+def test_both_ports_requested_pass_the_pair_gate():
+    """Both requested is the shipped configuration, so the same stage lets it through."""
+    from torchtitan.config.override import OverrideConfig
+
+    recipes = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
+    job = recipes.deepseek_v4_1_debugmodel_text()
+    # The sequence length is part of a CP-capable config: torchtitan's rope budget is checked
+    # inside update_from_config, alongside the gate this test is about.
+    job.training = dataclasses.replace(job.training, seq_len=512)
+    job.override = OverrideConfig(
+        imports=[
+            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+            "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+        ]
+    )
+    job.model_spec.model.update_from_config(config=job)
 
 
 def test_the_teacher_sources_are_the_index_source_layers():

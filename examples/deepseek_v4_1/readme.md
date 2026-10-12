@@ -1,6 +1,6 @@
 ### V4.1 独立训练基线与融合栈
 
-V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v4_1` 持有，不依赖 V4 模型或其专属 override。模型默认算子是 Attention Gym 的 eager `selected_attention`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂；模型目录不含 indexer 训练目标，eager 路径也没有：它只在 A5 的两个融合 override 同开时由两者的反向传递，见下文。
+V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v4_1` 持有，不依赖 V4 模型或其专属 override。模型默认算子是 Attention Gym 的 eager `gather_attn`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂；模型目录不含 indexer 训练目标，eager 路径也没有：它只在 A5 的两个融合 override 同开时由两者的反向传递，见下文。
 
 当前支持 **FSDP + EP、TP1 / CP1 / PP1、eager 执行与 torch.compile**，保留 FullAC 与图文输入。A3 脚本组织公共实验参数与融合列表，A5 调用 A3 并追加 CPU 亲和性、partial 文本 RoPE、两项 SwiGLUGroup、sparse attention 与 mHC Sinkhorn；两种入口均通过 `USE_GOLDEN=1` 选择 reference。A3 默认融合包含 RMSNorm、文本（`asc_complex`）与视觉 RoPE、MoE token dispatcher 和 mHC post；A5 将文本 RoPE 换为 `asc_partial` 并追加 routed/shared SwiGLUGroup、sparse 与 Sinkhorn。routed experts 的 grouped GEMM 是 reference 与融合共用的公共路径，不再作为独立融合开关。已接入量化入口及 Host Engram；不支持 MTP、DSpark、GraphTrainer；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
 

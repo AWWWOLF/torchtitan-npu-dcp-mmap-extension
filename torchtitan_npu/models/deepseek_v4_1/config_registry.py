@@ -77,11 +77,14 @@ class DeepSeekV41Trainer(GradientClippingTrainer, TrainerEx):
 
     def __init__(self, config):
         super().__init__(config)
+        # The step denominator is for the selectors that consume the fused teacher.  A port
+        # subclasses :class:`Selector`, so the reference selector -- the only module whose
+        # exact class is ``Selector`` -- is the one that does not.
         self._indexer_selectors = [
             module
             for part in self.model_parts
             for module in part.modules()
-            if isinstance(module, Selector) and module.consumes_indexer_teacher
+            if isinstance(module, Selector) and type(module) is not Selector
         ]
 
     def train_step(self, data_iterator):

@@ -8,7 +8,7 @@ torchvision==0.29.0.dev20260814
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
 torch_npu==2.14.0.dev20260918
 torchtitan==0.3.0
-attn-gym==0.0.9
+attn-gym==0.0.16
 pybind11==3.0.4
 numpy
 PyYAML

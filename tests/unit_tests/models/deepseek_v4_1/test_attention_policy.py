@@ -14,14 +14,28 @@ from torchtitan_npu.models.deepseek_v4_1 import (
     model_registry,
 )
 from torchtitan_npu.models.deepseek_v4_1.attention import Attention
-from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, REINDEX, REUSE, _selection_mask
+from torchtitan_npu.models.deepseek_v4_1.indexer import (
+    FULL,
+    REINDEX,
+    REUSE,
+    _selection_mask,
+    _student_logits,
+)
 
 
 def test_index_selection_mask_is_document_isolated_and_causal() -> None:
     """Entry j is visible to query t of the same document iff group j is complete at t."""
-    # Two documents of four tokens each; entry j covers tokens [2j, 2j + 2).
-    doc_ids_L = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
-    visible, newest, newest_valid = _selection_mask(doc_ids_L, 2)
+    # Two documents of four tokens each; entry j covers tokens [2j, 2j + 2) of its own
+    # document, so the whole-row pool holds two entries per document.
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 2, 4], dtype=torch.int32)
+    visible, newest, newest_valid, pool_start = _selection_mask(
+        cu_seqlens,
+        cu_seqlens_k,
+        num_tokens=8,
+        num_cmp=4,
+        compress_ratio=2,
+    )
 
     expected_visible = torch.tensor(
         [
@@ -49,6 +63,59 @@ def test_index_selection_mask_is_document_isolated_and_causal() -> None:
         rtol=0,
         atol=0,
     )
+    # The reach is an interval of the whole-row pool, so the selection is numbered from the
+    # query's own document: the second document's entries are 2 and 3 there, 0 and 1 here.
+    torch.testing.assert_close(
+        pool_start.squeeze(-1),
+        torch.tensor([0, 0, 0, 0, 2, 2, 2, 2], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_student_logits_rescore_a_document_local_selection() -> None:
+    """The rescore reads a selection in the numbering the selection op emitted.
+
+    Two documents of four tokens, two entries each at ratio 2: document 1's local ids 0/1 name
+    pool entries 2/3, and ``-1`` is the value softmax drops.
+    """
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 2, 4], dtype=torch.int32)
+    num_tokens, heads, dim, topk = 8, 2, 3, 2
+    torch.manual_seed(0)
+    idx_q = torch.randn(1, num_tokens, heads, dim, dtype=torch.float64)
+    idx_k = torch.randn(1, cu_seqlens_k[-1].item(), dim, dtype=torch.float64)
+    weights = torch.randn(1, num_tokens, heads, dtype=torch.float64)
+
+    # Per row, ``(local id, the pool entry it names)``: padding in both slots and documents.
+    picks = [
+        [(0, 0), (-1, -1)],
+        [(1, 1), (0, 0)],
+        [(1, 1), (1, 1)],
+        [(0, 0), (1, 1)],
+        [(0, 2), (-1, -1)],
+        [(1, 3), (0, 2)],
+        [(1, 3), (1, 3)],
+        [(0, 2), (1, 3)],
+    ]
+    local_BLK = torch.tensor([[[local for local, _ in row] for row in picks]])
+
+    scores_BLK = _student_logits(idx_q, idx_k, weights, local_BLK, cu_seqlens, cu_seqlens_k)
+
+    expected_BLK = torch.full((1, num_tokens, topk), -torch.inf, dtype=torch.float64)
+    for token, row in enumerate(picks):
+        for slot, (local, entry) in enumerate(row):
+            if local < 0:
+                continue
+            dot = torch.einsum("hd,d->h", idx_q[0, token], idx_k[0, entry])
+            expected_BLK[0, token, slot] = (dot.relu() * weights[0, token]).sum()
+
+    torch.testing.assert_close(scores_BLK, expected_BLK, rtol=1e-12, atol=1e-12)
+    # Marking agrees with the indices slot for slot: ``-1`` is the only un-scored slot.
+    assert torch.equal(torch.isfinite(scores_BLK), local_BLK >= 0)
+    # Row 4 is document 1's first token: reading its local 0 row-wide would score entry 0.
+    row_wide = (torch.einsum("hd,d->h", idx_q[0, 4], idx_k[0, 0]).relu() * weights[0, 4]).sum()
+    assert not torch.isclose(scores_BLK[0, 4, 0], row_wide)
 
 
 def test_v41_config_uses_specialized_attention_with_explicit_ownership() -> None:

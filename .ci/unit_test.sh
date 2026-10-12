@@ -62,7 +62,7 @@ pip install --no-deps -e .
 # the image pins a *different* torch/torch_npu build than requirements.txt does, so
 # re-running the whole file would upgrade the CANN stack mid-job (it broke the
 # fused-op smoke tests once).  New pure-Python runtime wheels go here by name.
-pip install --no-deps attn-gym==0.0.9
+pip install --no-deps attn-gym==0.0.16
 
 pip install --no-deps torchvision==0.30.0.dev20260918 \
     --extra-index-url https://download.pytorch.org/whl/nightly/cpu

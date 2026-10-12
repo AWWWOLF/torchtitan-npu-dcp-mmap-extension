@@ -410,7 +410,6 @@ def test_v41_teacher_pair_survives_independent_quantization_switches(
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
     from torchtitan_npu.models.deepseek_v4_1 import model_registry
-    from torchtitan_npu.models.deepseek_v4_1.attention import _check_indexer_teacher_pair
 
     converted = converter_module.apply_quantization_converter(
         model_registry("deepseek_v4_1_debugmodel"),
@@ -441,13 +440,9 @@ def test_v41_teacher_pair_survives_independent_quantization_switches(
         assert isinstance(selector_quant, QuantV41LightningIndexerConfig) is li_enabled
         assert isinstance(attention_quant, QuantV41SparseAttentionConfig) is sparse_enabled
         if inner_attention.compress_ratio > 0:
-            _check_indexer_teacher_pair(inner_attention, layer.attention.indexer)
-            assert type(selector).consumes_indexer_teacher
-            assert type(inner_attention).provides_indexer_teacher
             # The trainer discovers instances, not configs, to assign the step denominator.
             selector_module = selector.build()
             assert isinstance(selector_module, converter_module.V41Selector)
-            assert selector_module.consumes_indexer_teacher
             assert selector_module.num_global_queries is None
 
 

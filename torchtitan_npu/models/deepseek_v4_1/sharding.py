@@ -113,7 +113,7 @@ def dense_token_ids_sequence_parallel_placement():
 
 
 def set_inner_attention_sharding(inner_cfg) -> None:
-    """Placement for Attention Gym's ``selected_attention`` call.
+    """Placement for Attention Gym's ``gather_attn`` call.
 
     Under context parallelism the KV streams are the **whole row** -- gathered declaratively at
     this boundary, the V4 compressed-container pattern -- while ``q``, ``topk_indices`` and the

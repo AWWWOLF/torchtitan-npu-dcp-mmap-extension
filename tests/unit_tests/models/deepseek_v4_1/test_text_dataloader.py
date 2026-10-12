@@ -147,7 +147,7 @@ def test_dp_shards_partition_the_aligned_stream(tokenizer):
 
 
 def test_hook_builds_metadata_and_forwards_nothing_extra():
-    """The model-owned mask hook turns packed positions into doc ids and boundaries.
+    """The model-owned mask hook turns packed positions into the packed frames.
 
     The hook consumes ``positions`` and attaches the metadata; it must not leave behind a
     batch key the forward does not accept, which is how the metadata stays the hook's
@@ -156,14 +156,11 @@ def test_hook_builds_metadata_and_forwards_nothing_extra():
 
     class _HookOwner:
         # The hook dispatches to the model's own metadata builder, so attach the real construction
-        # methods, the frame builders it reaches for on ``self``, and the ratio table its
-        # selection-mask precompute reads.  ``needs_reference`` is stated because a stand-in has no
-        # config to read it from, and True is the conservative answer.
+        # methods, the frame builders it reaches for on ``self``, and the ratio table the frames
+        # are built per.
         compress_ratios = (2,)
         _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
+        _row_metadata = DeepSeekV41Model._row_metadata
         build_attention_masks = DeepSeekV41Model.build_attention_masks
         get_attention_masks = DeepSeekV41Model.get_attention_masks
 
@@ -174,23 +171,17 @@ def test_hook_builds_metadata_and_forwards_nothing_extra():
     _, _, extra = _HookOwner().build_attention_masks(tokens, tokens, extra)
 
     metadata = extra["attention_masks"]
-    elapsed = torch.cumsum((positions == 0).to(torch.int32), dim=-1) - 1
-    torch.testing.assert_close(metadata.ref.doc_ids_BL, elapsed, rtol=0, atol=0)
     # The ragged cumulative form of the two document starts plus the row total.
     expected_cu = torch.tensor([0, 4, 10], dtype=torch.int32)
-    torch.testing.assert_close(metadata.kernel.q.cu_seqlens, expected_cu, rtol=0, atol=0)
-    assert metadata.ref.selection_masks.keys() == {2}
-    # Two documents of four and six tokens: entry j covers tokens [2j, 2j + 2) and is
-    # visible to a query only when the group is complete (j < (t + 1) // 2) and belongs
-    # to the query's own document -- an entry's document is the one its *first* token is
-    # in, which the loader's alignment invariant keeps a whole number of groups.
-    visible, _, _ = metadata.ref.selection_masks[2]
-    assert visible.shape == (10, 5)
-    assert visible[1, 0]  # query 1 sees entry 0: complete, same document
-    assert not visible[0, 0]  # query 0 does not: entry 0 is not complete yet
-    assert visible[4, 1] is not None and not visible[4, 1]  # entry 1 is document 0's
-    assert visible[9, 4]  # entry 4 covers tokens 8-9, document 1's only group
-    assert not visible[9, 1]  # ... and document 0's entries stay invisible to it
+    torch.testing.assert_close(metadata.q.cu_seqlens, expected_cu, rtol=0, atol=0)
+    # Two documents of four and six tokens: the pool holds whole groups of two, so its
+    # boundaries are the row's over the ratio and every document contributes 2 (resp. 3)
+    # entries.
+    expected_cu_k = torch.tensor([0, 2, 5], dtype=torch.int32)
+    torch.testing.assert_close(metadata.cmp_k[2].cu_seqlens, expected_cu_k, rtol=0, atol=0)
+    torch.testing.assert_close(
+        metadata.cmp_k[2].seqused, torch.tensor([2, 3], dtype=torch.int32), rtol=0, atol=0
+    )
 
 
 def test_the_metadata_carries_no_validity_marks():
@@ -204,9 +195,7 @@ def test_the_metadata_carries_no_validity_marks():
         # As above: the hook is a method, so the builders it calls on ``self`` come with it.
         compress_ratios = (2,)
         _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
+        _row_metadata = DeepSeekV41Model._row_metadata
         build_attention_masks = DeepSeekV41Model.build_attention_masks
         get_attention_masks = DeepSeekV41Model.get_attention_masks
 

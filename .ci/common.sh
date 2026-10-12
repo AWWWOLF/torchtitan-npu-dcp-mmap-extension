@@ -74,7 +74,7 @@ git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 # The image predates wheels added to requirements.txt; install only the missing
 # wheels, never the whole file, whose torch/torch_npu pins differ from the image
 # build.
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.9
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.16
 # The CI image supplies torch 2.15.0.dev; the matching torchvision nightly
 # is installed with --no-deps (resolving its torch pin would fight the image).
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/nightly/cpu "torchvision==0.30.0.dev20260918"

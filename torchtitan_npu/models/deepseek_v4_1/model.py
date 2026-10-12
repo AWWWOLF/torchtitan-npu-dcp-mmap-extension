@@ -29,10 +29,11 @@ successor needs.  The stack has no learned output head: the model collapses the
 branches with the last block's coefficients and feeds the result straight to the output
 norm.
 
-Packed documents are described by :class:`DeepSeekV41Metadata`: the only per-token varlen
-metadata is a document id per token, which both Attention Gym's operator (window branch)
-and the indexer (entry-axis isolation) derive their masks from, and the indexer's
-selection masks are precomputed from it once per forward.
+Packed documents are described by :class:`DeepSeekV41Metadata`: one frame per addressed
+tensor, whose packed boundaries are the only varlen metadata there is.  Both consumers read
+those frames and nothing else -- the torch-native core and selector address the row with
+them, and the fused ports grid the same ones -- so a document never needs a second
+description.
 """
 
 from __future__ import annotations
@@ -48,12 +49,10 @@ from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
 from .context_parallel import ExchangeMetadata, cp_plan, document_bounds
 from .engram import Engram  # noqa: TC001
-from .indexer import IndexerMode, indexer_selection_masks
+from .indexer import IndexerMode
 from .mhc import HcPost, HcPre
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     from torchtitan.models.common.moe import MoE
 
     from .attention import Attention
@@ -64,11 +63,12 @@ def compression_alignment(compress_ratios: tuple[int, ...]) -> int:
     """The ``A`` a packed document length must be a multiple of, ``1`` when none.
 
     Every layer with ``compress_ratio > 0`` pools each group of ``R`` consecutive
-    tokens into one main-KV entry, and the indexer addresses that entry axis as
-    ``doc_ids[:, j * R]``.  A document whose token count is not a multiple of ``R``
-    therefore gets a partial trailing group that the *next* document's tokens
-    complete: the pooled value mixes two documents, and the entry stays selectable by
-    the first document's queries because its document is read off its first token.
+    tokens into one main-KV entry, and the indexer addresses that entry axis as the row's
+    boundaries over ``R``.  A document whose token count is not a multiple of ``R``
+    therefore gets a partial trailing group that the *next* document's tokens complete:
+    the pooled value mixes two documents, and the boundaries no longer say which document
+    the group belongs to.  Keeping whole groups inside one document is what the alignment
+    below is for.
 
     Taking the least common multiple of every ratio the stack pools with gives the
     alignment that keeps a whole group of each ratio inside one document; that is what
@@ -83,15 +83,16 @@ def compression_alignment(compress_ratios: tuple[int, ...]) -> int:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class KernelFrame:
-    """One tensor's coordinate frame: the boundaries the kernel needs to address it.
+    """One tensor's coordinate frame: the boundaries needed to address it.
 
     The tensors of a forward -- the query row and the two KV streams -- do **not** share a
-    frame in general, so each carries its own and the kernel reads the frame of the tensor
+    frame in general, so each carries its own and every consumer reads the frame of the tensor
     it is addressing rather than assuming one of them.
 
-    ``cu_seqlens`` are the ragged document boundaries (``int32``, ``n_documents + 1``), the
-    form both kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix this
-    frame's consumer needs, ``residual`` the trailing partial group of a compressed axis
+    ``cu_seqlens`` are the ragged document boundaries (``int32``, ``n_documents + 1``): the
+    packed offsets Attention Gym's ``gather_attn`` takes as ``cu_seqlens``/``cu_seqlens_k``,
+    and the form the kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix
+    this frame's consumer needs, ``residual`` the trailing partial group of a compressed axis
     (``None`` where the axis is not compressed, which the kernels reject a value for).
 
     **Context parallel.**  With one packed row per rank and no sharding, every frame is the
@@ -106,19 +107,33 @@ class KernelFrame:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class KernelMetadata:
-    """The kernel half of the metadata: the frames the fused ports address tensors in.
+class DeepSeekV41Metadata:
+    """Per-forward varlen metadata, built by :meth:`V41Model.get_attention_masks`.
+
+    One geometry, read by both paths: one frame per addressed tensor -- the row's boundaries
+    and each compressed stream's -- which the torch-native core and selector read exactly as
+    the fused ports grid them.
 
     ``q`` and ``swa_k`` run at full resolution, so one frame each serves the whole forward.
     The compressed streams do not: every ratio>0 layer pools at *its own* ratio, so there is
-    one frame per ratio the stack uses, precomputed here and looked up by each layer -- the
-    same shape as ``ref.selection_masks``.  The kernel never derives a boundary of its own,
-    which is what keeps the metadata call and the main call gridding the same axes.
+    one frame per ratio the stack uses, looked up with :meth:`frame_for` rather than derived
+    by each consumer.  At CP=1 every frame is the row itself; under context parallelism the
+    query frame becomes this rank's chunks while the KV frames stay the gathered row, a
+    difference the fused ports read through ``seqused``.  The torch-native core and selector
+    are an unsharded path: a context-parallel run uses the fused ports.
     """
 
     q: KernelFrame
     swa_k: KernelFrame
     cmp_k: dict[int, KernelFrame]
+    positions_q: torch.Tensor
+    """The **query** frame's own positions.  The positions carried beside the input describe the
+    keys -- under CP the queries are a permuted copy of the rows that carry them -- so every
+    consumer that rotates a query reads them here, at every degree, without a fallback."""
+
+    exchange: ExchangeMetadata | None = None
+    """Under context parallelism the query side's movement: the query frame is this rank's
+    chunks, and its ``positions_q`` carries the positions those chunks rotate at."""
 
     def frame_for(self, ratio: int) -> KernelFrame | None:
         """The frame of the compressed stream a layer at this ``ratio`` addresses.
@@ -130,65 +145,6 @@ class KernelMetadata:
         if ratio <= 0:
             return None
         return self.cmp_k[ratio]
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class ReferenceMetadata:
-    """The reference half: what the torch-native path reads, in the global row frame.
-
-    ``doc_ids_BL`` is a non-decreasing document index per token, built from the positions
-    resetting to 0 at every packed segment start.  The same tensor serves both consumers,
-    which is why they agree by construction: ``selected_attention`` applies
-    ``doc_ids[q] == doc_ids[k]`` to its sliding-window branch, and the indexer applies the
-    same equality one axis over, entry ``j`` covering tokens
-    ``[j * compress_ratio, (j + 1) * compress_ratio)``.
-
-    ``selection_masks`` precomputes the indexer's document-isolation and
-    causal-completeness views for this forward, keyed by ``compress_ratio``.  That rule
-    depends only on ``doc_ids`` and the ratio, so every indexer looks its own up instead of
-    rebuilding it.  The views carry no batch axis (``[L, N]`` and ``[L, 1]``) because the
-    row is the batch: the model asserts ``local_batch_size == 1`` in
-    ``update_from_config``.
-    """
-
-    doc_ids_BL: torch.Tensor  # noqa: N815
-    selection_masks: Mapping[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class DeepSeekV41Metadata:
-    """Per-forward varlen metadata, built by :meth:`V41Model.get_attention_masks`.
-
-    Two halves, because the reference path and the fused kernels do not read the same
-    thing and must not be confused for one another:
-
-    - ``ref`` is the torch-native view, in the **global** row frame, and is all
-      ``CompressedSparseInnerAttention2`` and the selection masks need;
-    - ``kernel`` is the fused ports' view, one frame per addressed tensor.  At CP=1 the
-      frames coincide with the row, so the distinction is invisible here -- it exists so CP
-      can shard the query side without touching ``ref``.
-    """
-
-    kernel: KernelMetadata
-    positions_q: torch.Tensor
-    """The **query** frame's own positions.  The positions carried beside the input describe the
-    keys -- under CP the queries are a permuted copy of the rows that carry them -- so every
-    consumer that rotates a query reads them here, at every degree, without a fallback."""
-
-    ref: ReferenceMetadata | None = None
-    exchange: ExchangeMetadata | None = None
-    """Under context parallelism the query side's movement: the query frame is this rank's
-    chunks, and its ``positions_q`` carries the positions those chunks rotate at.  The
-    reference half does not exist then -- no per-token view of a rank's slab describes the
-    rows it computes on -- so the two are mutually exclusive by construction."""
-
-    def __post_init__(self) -> None:
-        if self.ref is not None and self.exchange is not None:
-            raise ValueError(
-                "the reference half and the context-parallel exchange cannot describe one "
-                "forward: the first reads the row a rank computes on, the second says those "
-                "rows are not the slab it holds"
-            )
 
 
 class DeepSeekV41TransformerBlock(TransformerBlock):
@@ -273,6 +229,59 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         return x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates
 
 
+# The two ports that, together, make V4.1's fused attention: the core emits the indexer's
+# teacher on ``topk_scores``' gradient and the selector consumes it.  Both gates below read
+# the override list a run requests -- the config stage runs before ``apply_overrides``
+# installs them, so the request is what this stage has.
+_FUSED_ATTENTION_OVERRIDES = (
+    "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+)
+
+
+def _requested_fused_attention(override) -> tuple[bool, bool]:
+    """``(fused core, fused selector)``, as the run's overrides request them."""
+    requested = set(override.imports or ())
+    core, selector = _FUSED_ATTENTION_OVERRIDES
+    return core in requested, selector in requested
+
+
+def _check_indexer_teacher_pair(fused_core: bool, fused_selector: bool) -> None:
+    """The fused indexer teacher is a pair: one port emits it, one consumes it.
+
+    ``topk_scores`` is carried only between the two kernel backwards.  The emitting port
+    writes the raw teacher on ``topk_scores``' gradient; the consuming selector is the only
+    thing that ever reads that edge.  Fusing one side alone therefore breaks the objective --
+    silently, since neither half raises on its own -- so the mismatch is rejected here instead
+    of being discovered from a flat training curve.
+
+    Neither half is a usable fallback:
+
+    - Selector without the fused core: ``topk_scores``' gradient is ``None``, so SLIKG
+      returns zero gradient and the indexer never updates.
+    - Fused core without the fused selector: the reference selector does pick the teacher up
+      off that edge, but it applies attention-level marginals to summed per-head indexer
+      logits.  The two sides are not the same quantity, so the resulting training signal is
+      wrong rather than merely different.
+
+    The check reads the *requested* overrides rather than the attention they install, because
+    the request is what this stage has -- and renaming a port means renaming it here too.
+    """
+    if fused_core == fused_selector:
+        return
+    if fused_core:
+        active, missing = "sparse_attn.asc", "lightning_indexer.asc"
+        consequence = "the reference selector would take the teacher onto summed per-head logits"
+    else:
+        active, missing = "lightning_indexer.asc", "sparse_attn.asc"
+        consequence = "topk_scores would carry no teacher"
+    raise ValueError(
+        f"A fused V4.1 attention core and a fused selector must be enabled together: {active} is "
+        f"active without {missing}, so {consequence} and the indexer cannot be trained correctly. "
+        "Enable both or neither. See torchtitan_npu/override/README.md#deepseek-v41."
+    )
+
+
 class DeepSeekV41Model(Decoder):
     """DeepSeek-V4.1 text backbone: CSA2 policy over the packed varlen contract.
 
@@ -288,10 +297,8 @@ class DeepSeekV41Model(Decoder):
         # the CP layout is being built for, and the multimodal config overrides this to
         # ``False`` until the vision path has a CP story.
         #
-        # The flag lives on the config because that is the only thing
-        # ``update_from_config`` has -- it runs before any module exists -- and
-        # :meth:`_check_context_parallel` is its only reader.  Declaring it on the model
-        # class as well would be a second copy nobody reads.
+        # The flag lives on the config because the gate that reads it runs on the config
+        # tree, before any module exists.
         accepts_context_parallel: ClassVar[bool] = True
 
         n_layers: int
@@ -321,8 +328,10 @@ class DeepSeekV41Model(Decoder):
                 raise NotImplementedError(f"DeepSeek V4.1 does not support pipeline parallelism; got PP={pp}")
             # compile (aot_eager / inductor) is supported: the cross-layer
             # state is threaded explicitly and the sparse core is the
-            # traceable selected_attention reference implementation.
-            self._check_context_parallel(parallelism.context_parallel_degree)
+            # traceable gather_attn reference implementation.
+            fused_core, fused_selector = _requested_fused_attention(config.override)
+            _check_indexer_teacher_pair(fused_core, fused_selector)
+            self._check_context_parallel(parallelism.context_parallel_degree, fused_core, fused_selector)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
             if len(self.compress_ratios) != self.n_layers:
@@ -371,18 +380,39 @@ class DeepSeekV41Model(Decoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
 
-        def _check_context_parallel(self, context_parallel_degree: int) -> None:
+        def _check_context_parallel(self, context_parallel_degree: int, fused_core: bool, fused_selector: bool) -> None:
             """Reject a CP degree this stack cannot run.
 
-            The text stack can be sharded once the CP layout lands; the multimodal stack
-            cannot, so its config overrides :attr:`accepts_context_parallel`.  Reading the
-            class attribute rather than branching on the config class keeps the gate one
-            line and lets the text stack accept CP without touching this method.
+            Context parallelism requires the fused attention: the sharded frames describe this
+            rank's query chunks while the KV frames stay the gathered row, and the fused core
+            and selector are the consumers that read that difference (``seqused``).  A
+            torch-native core or selector grids the row instead -- silently, since every shape
+            still fits -- so a run that does not ask for both ports is rejected.
+
+            The multimodal stack cannot be sharded at all, so its config overrides
+            :attr:`accepts_context_parallel`; reading the class attribute rather than branching
+            on the config class keeps that half one line and lets the text stack reach the rest.
             """
-            if context_parallel_degree != 1 and not type(self).accepts_context_parallel:
+            if context_parallel_degree == 1:
+                return
+            if not type(self).accepts_context_parallel:
                 raise NotImplementedError(
                     "DeepSeek V4.1 rejects context parallelism on the multimodal stack; "
                     f"got CP={context_parallel_degree}"
+                )
+            missing = [
+                name
+                for name, requested in zip(_FUSED_ATTENTION_OVERRIDES, (fused_core, fused_selector), strict=True)
+                if not requested
+            ]
+            if missing:
+                raise ValueError(
+                    "DeepSeek V4.1 runs context parallelism on the fused stack only: this run "
+                    f"does not request {', '.join(missing)}. Request both "
+                    "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc and "
+                    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc, or run with "
+                    f"context_parallel_degree=1 (got CP={context_parallel_degree}). See "
+                    "torchtitan_npu/override/README.md#deepseek-v41."
                 )
 
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
@@ -456,18 +486,6 @@ class DeepSeekV41Model(Decoder):
         cfg = config
         self.hc_mult = cfg.hc_mult
         self.compress_ratios = tuple(cfg.compress_ratios)
-        # Whether any layer keeps the torch-native sparse core or scorer, which are the only two
-        # readers of the metadata's reference half.  Both are replaced wholesale by their
-        # ``@override`` ports, and whether a port is in use is a *compile-time fact on the config
-        # classes* -- the same pair ``_check_indexer_teacher_pair`` reads, which guarantees the
-        # two agree -- so the answer is taken here, once, while the config tree still exists
-        # (``Module`` does not keep its config).  Any layer that is not fully fused counts:
-        # a ratio-0 layer is skipped by the pair check, so its halves are unconstrained.
-        self.needs_reference = any(
-            not getattr(type(layer.attention.inner_attention), "provides_indexer_teacher", False)
-            or not getattr(type(layer.attention.indexer.selector), "consumes_indexer_teacher", False)
-            for layer in cfg.layers
-        )
 
     @staticmethod
     def _frame(axis_cu_seqlens: torch.Tensor, axis_lengths: torch.Tensor, ratio: int) -> KernelFrame:
@@ -475,7 +493,7 @@ class DeepSeekV41Model(Decoder):
 
         One frame per axis, and every axis is described the same way -- where its segments
         start, and how much of each segment it addresses -- so the ratio algebra lives here
-        while the two builders below differ only in where the two arrays come from.
+        while the builders that call it differ only in where the two arrays come from.
         """
         if ratio == 1:
             # The uncompressed case: the frame is the tensor's own boundaries, and the kernels
@@ -494,61 +512,43 @@ class DeepSeekV41Model(Decoder):
     ) -> DeepSeekV41Metadata:
         """Build the **unsharded** forward's metadata: every frame is the row itself.
 
-        This is the context-parallel-agnostic half.  ``selected_attention`` consumes the document
-        ids for the window branch, and the indexer derives its entry-axis
-        ``doc_ids[::compress_ratio]`` rule from them -- a rule that depends only on the ratio, so
-        it is evaluated here once per ratio rather than inside each indexer.  Those are the
-        ``ref`` half, and they exist exactly when the forward is unsharded, because no per-token
-        view of a rank's slab describes the rows it computes on.
+        One grid, built once per forward and read by both paths: the torch-native core bounds
+        its sliding window with the query frame's boundaries and addresses the pool with the
+        compressed frame's, and the indexer derives its entry-axis reach from the same two --
+        the frames the fused ports grid.  Building it must never depend on which of the two
+        paths is enabled, which is what keeps a reference run and a fused run comparing the
+        same axes.
 
-        A sharded forward takes the two halves apart: it builds :meth:`_row_frames` alone -- the
-        whole row's grid, from which :meth:`_sharded_attention_masks` cuts this rank's frames --
-        because the reference half is the expensive one (the indexer's selection masks are
-        ``[tokens, entries]``) and nothing sharded ever reads it.  A *fused* stack skips it at
-        every degree for the same reason: ``self.needs_reference`` says whether any torch-native
-        core or scorer is in the stack at all.
+        A sharded forward builds :meth:`_row_metadata` alone and cuts this rank's frames from
+        it (:meth:`_sharded_attention_masks`), because the whole row is what the fused ports
+        gather at their own boundary.
         """
         if positions is None:
             raise ValueError("DeepSeek V4.1 requires positions to build its attention metadata")
-        return DeepSeekV41Metadata(
-            kernel=self._row_frames(positions),
-            positions_q=positions,
-            ref=self._reference(positions) if self.needs_reference else None,
-        )
+        return self._row_metadata(positions)
 
-    def _row_frames(self, positions: torch.Tensor) -> KernelMetadata:
-        """The whole row's frames: one per addressed tensor, each of them the row.
+    def _row_metadata(self, positions: torch.Tensor) -> DeepSeekV41Metadata:
+        """The whole row's metadata: one frame per addressed tensor, each of them the row.
 
-        Called at every degree -- the sharded forward cuts its frames from this grid rather than
-        deriving it a second time -- so it stays free of anything only an unsharded forward reads.
+        Called at every degree -- the sharded forward cuts this rank's frames from this grid
+        rather than deriving it a second time -- so it stays free of anything only an unsharded
+        forward reads.
         """
         cu_seqlens = document_bounds(positions)
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        return KernelMetadata(
+        return DeepSeekV41Metadata(
             q=self._frame(cu_seqlens, lengths, 1),
             swa_k=self._frame(cu_seqlens, lengths, 1),
             cmp_k={
                 ratio: self._frame(cu_seqlens, lengths, ratio)
                 for ratio in sorted({r for r in self.compress_ratios if r > 0})
             },
-        )
-
-    def _reference(self, positions: torch.Tensor) -> ReferenceMetadata:
-        """The reference half: document ids, and the indexer's selection masks per ratio.
-
-        The masks are one ``[tokens, entries]`` view per pooling ratio, which is why a sharded
-        forward does not build them: it has no per-token view of the rows it computes on, and at
-        a long sequence the tensors are large enough that building them to drop them is not free.
-        """
-        doc_ids_BL = torch.cumsum((positions == 0).to(torch.int32), dim=-1) - 1
-        return ReferenceMetadata(
-            doc_ids_BL=doc_ids_BL,
-            selection_masks=indexer_selection_masks(doc_ids_BL.reshape(-1), self.compress_ratios),
+            positions_q=positions,
         )
 
     def _sharded_attention_masks(
         self,
-        frames: KernelMetadata,
+        metadata: DeepSeekV41Metadata,
         positions: torch.Tensor,
         *,
         cp_size: int,
@@ -562,13 +562,12 @@ class DeepSeekV41Model(Decoder):
         far these queries reach into each document.  That is what keeps the kernels' end-aligned
         window and causal limit anchored at this rank's chunk rather than at the row's end.
 
-        ``frames`` is :meth:`_row_frames` of the same row -- the whole row's grid -- and it is
+        ``metadata`` is :meth:`_row_metadata` of the same row -- the whole row's grid -- and it is
         where the boundaries come from: its query frame already carries them, so nothing is
-        derived twice.  There is no reference half here by construction, and ``positions`` is the
-        slab, whose own positions are not the query frame's.
+        derived twice.  ``positions`` is the slab, whose own positions are not the query frame's.
         """
-        bounds = frames.q.cu_seqlens
-        lengths = frames.q.seqused
+        bounds = metadata.q.cu_seqlens
+        lengths = metadata.q.seqused
         # The launcher's contract, checked once per forward and per document: every document is a
         # whole multiple of ``cp_size * lcm(ratios > 1)``.  Both halves are load-bearing -- the
         # first makes every prefix a whole number of chunks, the second makes every compressed
@@ -594,15 +593,12 @@ class DeepSeekV41Model(Decoder):
             )
         reach = ((cp_rank + 1) * chunk).to(torch.int32)
         exchange = cp_plan(bounds, cp_size, cp_rank, positions.numel())
-        kernel = KernelMetadata(
+        return DeepSeekV41Metadata(
             q=self._frame((bounds // cp_size).to(torch.int32), chunk, 1),
             swa_k=self._frame(bounds, reach, 1),
             cmp_k={
                 ratio: self._frame(bounds, reach, ratio) for ratio in sorted({r for r in self.compress_ratios if r > 0})
             },
-        )
-        return DeepSeekV41Metadata(
-            kernel=kernel,
             positions_q=exchange.positions_q.reshape(positions.shape),
             exchange=exchange,
         )
@@ -620,9 +616,9 @@ class DeepSeekV41Model(Decoder):
             attention_masks = self.get_attention_masks(positions)
         else:
             # The whole row's grid is read here, before the slice, because it is the last point
-            # at which the row exists -- and it is *all* that is built: the reference half is the
-            # expensive one and a sharded forward never reads it.
-            frames = self._row_frames(positions)
+            # at which the row exists -- and it is *all* that is built: a sharded forward has no
+            # use for a description of the row itself.
+            row = self._row_metadata(positions)
             cp_size, cp_rank = cp_mesh.size(), cp_mesh.get_local_rank()
             slab = positions.numel() // cp_size
             lo = cp_rank * slab
@@ -630,13 +626,13 @@ class DeepSeekV41Model(Decoder):
             labels = labels[:, lo : lo + slab]
             positions = positions[:, lo : lo + slab]
             extra_kwargs["positions"] = positions
-            attention_masks = self._sharded_attention_masks(frames, positions, cp_size=cp_size, cp_rank=cp_rank)
+            attention_masks = self._sharded_attention_masks(row, positions, cp_size=cp_size, cp_rank=cp_rank)
         # Every document must be a whole number of pooling groups, so the compressed axes
         # have no partial trailing group and ``cmp_residual_kv`` is zero throughout.  A
         # non-zero value here means the loader's document alignment and the stack's
         # ``compress_ratios`` disagree -- the kernels would then grid an axis the pooling
         # did not produce -- so it is checked rather than passed on.
-        for ratio, frame in attention_masks.kernel.cmp_k.items():
+        for ratio, frame in attention_masks.cmp_k.items():
             residual = frame.residual
             if residual is not None and bool(residual.any()):
                 raise ValueError(

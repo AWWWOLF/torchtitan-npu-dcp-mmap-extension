@@ -21,14 +21,13 @@ def _metadata(tokens=4, compressed_tokens=2):
         residual=torch.zeros(1, dtype=torch.int32),
         seqused=torch.tensor([compressed_tokens], dtype=torch.int32),
     )
-    kernel = SimpleNamespace(
+    return SimpleNamespace(
         q=SimpleNamespace(
             cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
             seqused=torch.tensor([tokens], dtype=torch.int32),
         ),
         frame_for=lambda ratio: compressed,
     )
-    return SimpleNamespace(kernel=kernel)
 
 
 def _selector(*, mode="full", candidate_topk_blocks=3):
@@ -68,8 +67,8 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     selector = _selector()
     selector.num_global_queries = None if query_count is None else torch.tensor(query_count)
     masks = _metadata()
-    masks.kernel.q.seqused = torch.tensor([2], dtype=torch.int32)
-    masks.kernel.frame_for(2).seqused = torch.tensor([1], dtype=torch.int32)
+    masks.q.seqused = torch.tensor([2], dtype=torch.int32)
+    masks.frame_for(2).seqused = torch.tensor([1], dtype=torch.int32)
     unsorted = torch.tensor([3, -1, 1, 2], dtype=torch.int32).repeat(4, 1).unsqueeze(1)
     candidate_blocks = torch.tensor(
         [[[0, 1, -1]], [[0, -1, -1]], [[1, 0, -1]], [[1, -1, -1]]],

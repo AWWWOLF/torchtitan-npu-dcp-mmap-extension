@@ -61,7 +61,7 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
     data-dependent MoE routing, a graph break around the dispatcher
     communication.  Once apply_compile grows fullgraph/dynamic parameters
     this collapses back to a plain call.  The regional-inductor helper is
-    intentionally not used: V4.1's sparse core is the selected_attention
+    intentionally not used: V4.1's sparse core is the gather_attn
     reference implementation (no FlexAttention), for which it is the
     identity.  The shared per-block code object plus role-level graphs keep
     the recompile count within the stock recompile_limit.

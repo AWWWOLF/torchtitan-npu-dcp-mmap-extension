@@ -8,9 +8,8 @@
 The layout is one packed row's coordinate change, so every property worth pinning is
 checkable without a device and without a process group: which rows a rank ends up holding,
 that the movement is a permutation of the slab, that the receive side's closed form agrees
-with the row-by-row derivation, that the frames say the queries are the chunks while the KV
-streams stay the row, and that the metadata pairs the reference half with the unsharded
-forward only.
+with the row-by-row derivation, and that the frames say the queries are the chunks while the
+KV streams stay the row.
 
 The collectives are emulated in process, from the plan's own tables -- the same tables the
 forward hands to ``all_to_all_single`` -- because a plan is what this file is about; the
@@ -248,60 +247,6 @@ def _emulate(tensors: list[torch.Tensor], plans: list[ExchangeMetadata], *, inve
     return outs
 
 
-def test_the_metadata_refuses_two_descriptions_of_one_forward():
-    """``ref`` and the exchange cannot both describe a forward; neither alone is fine.
-
-    The reference half reads the row a rank computes on, the exchange says those rows are not the
-    slab it holds -- so a forward that carried both would be self-contradictory.  Neither alone
-    is legal: a sharded forward has the exchange, and a **fused** unsharded one has no use for
-    either (its two readers are replaced by their override ports), which is exactly how a long
-    sequence stays affordable at ``cp = 1``.
-    """
-    masks = _HookOwner().masks(_positions(8, 16))
-    assert masks.ref is not None or masks.exchange is not None
-    DeepSeekV41Metadata(kernel=masks.kernel, positions_q=masks.positions_q, ref=None)
-    with pytest.raises(ValueError, match="cannot describe one forward"):
-        DeepSeekV41Metadata(
-            kernel=masks.kernel, positions_q=masks.positions_q, ref=masks.ref, exchange=object()
-        )
-
-
-def test_a_fused_stack_builds_no_reference_half():
-    """The override's switch decides whether the ``[tokens, entries]`` masks are built at all.
-
-    ``asc`` and ``asc_indexer`` replace the only two readers of the reference half, so a fused
-    stack never allocates it -- which is what makes a long sequence affordable at ``cp = 1`` too,
-    not only under CP.  The stand-in models that stack by answering the switch with False.
-    """
-    owner = _HookOwner()
-    owner.needs_reference = False
-    masks = owner.masks(_positions(8, 16))
-    assert masks.ref is None and masks.exchange is None
-    assert masks.kernel.q.cu_seqlens.tolist() == [0, 8, 24]
-    torch.testing.assert_close(masks.positions_q, _positions(8, 16))
-
-
-def test_the_sharded_path_never_builds_the_reference_half():
-    """A sharded forward reads the row's grid and nothing else, at any sequence length.
-
-    The reference half is the expensive one -- one ``[tokens, entries]`` selection mask per
-    pooling ratio -- and no sharded consumer ever reads it, so the hook must not build it.  The
-    hook is driven through the real methods on a stand-in owner, with the reference builder
-    replaced by one that fails the test if it is called.
-    """
-    def _refuse(positions):
-        raise AssertionError("a sharded forward must not build the reference half")
-
-    owner = _HookOwner()
-    owner._reference = staticmethod(_refuse)
-    owner.needs_reference = True
-    tokens = torch.zeros_like(_positions(8, 16))
-    _, _, extra = owner.build_attention_masks(
-        tokens, tokens, {"positions": _positions(8, 16)}, cp_mesh=_Mesh(2, 1)
-    )
-    assert extra["attention_masks"].ref is None
-
-
 def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_row():
     """The three frames under CP: chunk queries, row KV streams, and the reach in ``seqused``.
 
@@ -314,13 +259,12 @@ def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_ro
         chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
         for rank in range(cp_size):
             masks = _HookOwner().masks(_positions(*[e - s for s, e in zip(cu[:-1], cu[1:])]), cp_size, rank)
-            kernel = masks.kernel
-            assert masks.ref is None and masks.exchange is not None
-            assert kernel.q.cu_seqlens.tolist() == (torch.tensor(cu) // cp_size).tolist()
-            assert kernel.q.seqused.tolist() == chunk.tolist()
-            assert kernel.swa_k.cu_seqlens.tolist() == list(cu)
-            assert kernel.swa_k.seqused.tolist() == ((rank + 1) * chunk).tolist()
-            for ratio, frame in kernel.cmp_k.items():
+            assert masks.exchange is not None
+            assert masks.q.cu_seqlens.tolist() == (torch.tensor(cu) // cp_size).tolist()
+            assert masks.q.seqused.tolist() == chunk.tolist()
+            assert masks.swa_k.cu_seqlens.tolist() == list(cu)
+            assert masks.swa_k.seqused.tolist() == ((rank + 1) * chunk).tolist()
+            for ratio, frame in masks.cmp_k.items():
                 assert frame.cu_seqlens.tolist() == (torch.tensor(cu) // ratio).tolist()
                 assert frame.seqused.tolist() == (((rank + 1) * chunk) // ratio).tolist()
                 if ratio == 1:
@@ -332,22 +276,23 @@ def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_ro
 
 
 def test_the_unsharded_forward_is_unchanged():
-    """CP=1 keeps every frame the row, and keeps the reference half.
+    """CP=1 keeps every frame the row, for every stack.
 
     The grid's arithmetic degenerates on its own at ``cp_size == 1`` -- one chunk per document
-    *is* the document -- so the unsharded path is the same derivation rather than a branch.
+    *is* the document -- so the unsharded path is the same derivation rather than a branch, and
+    the metadata it builds is the one geometry both the torch-native and the fused paths read.
     """
     masks = _HookOwner().masks(_positions(8, 16), 1, 0)
-    assert masks.ref is not None and masks.exchange is None
+    assert masks.exchange is None
     torch.testing.assert_close(masks.positions_q, _positions(8, 16))
-    assert masks.kernel.q.cu_seqlens.tolist() == [0, 8, 24]
-    assert masks.kernel.q.seqused.tolist() == [8, 16]
-    assert masks.kernel.swa_k.cu_seqlens.tolist() == [0, 8, 24]
-    assert masks.kernel.swa_k.seqused.tolist() == [8, 16]
-    assert sorted(masks.kernel.cmp_k) == [1, 2]
-    assert masks.kernel.cmp_k[1].seqused.tolist() == [8, 16]
-    assert masks.kernel.cmp_k[2].seqused.tolist() == [4, 8]
-    assert masks.kernel.cmp_k[2].cu_seqlens.tolist() == [0, 4, 12]
+    assert masks.q.cu_seqlens.tolist() == [0, 8, 24]
+    assert masks.q.seqused.tolist() == [8, 16]
+    assert masks.swa_k.cu_seqlens.tolist() == [0, 8, 24]
+    assert masks.swa_k.seqused.tolist() == [8, 16]
+    assert sorted(masks.cmp_k) == [1, 2]
+    assert masks.cmp_k[1].seqused.tolist() == [8, 16]
+    assert masks.cmp_k[2].seqused.tolist() == [4, 8]
+    assert masks.cmp_k[2].cu_seqlens.tolist() == [0, 4, 12]
 
 
 def test_the_hook_attaches_the_plan_and_slices_the_inputs():
@@ -370,7 +315,7 @@ def test_the_hook_attaches_the_plan_and_slices_the_inputs():
             torch.testing.assert_close(extra["positions"], row[..., cp_rank * slab : (cp_rank + 1) * slab])
             assert inputs.shape[-1] == slab
             masks = extra["attention_masks"]
-            assert masks.exchange is not None and masks.ref is None
+            assert masks.exchange is not None
             plan = masks.exchange
             assert list(plan.send_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
             assert sum(plan.recv_split) == slab
@@ -383,23 +328,18 @@ def test_the_model_takes_a_context_parallel_degree():
 
 
 class _HookOwner:
-    """The model's metadata half, without the rest of the model.
+    """The model's metadata builders, without the rest of the model.
 
     ``_frame`` and the hook have to stay staticmethods/methods when they are grafted on, or
     ``self`` becomes their first argument.
     """
 
     compress_ratios = _RATIOS
-    # The real model takes this from the override flags on the config tree; a stand-in has no
-    # config, so it states the answer: True is a reference stack (the half is built), False a
-    # fully fused one (nothing reads it).
-    needs_reference = True
     # The hook is a method, so a stand-in presents the pieces it reaches for: the frame builders,
     # taken from the model itself, and the sharded half.  ``_frame`` is a staticmethod there, so it
     # is grafted as one -- a plain assignment would make it an instance method here.
     get_attention_masks = DeepSeekV41Model.get_attention_masks
-    _row_frames = DeepSeekV41Model._row_frames
-    _reference = DeepSeekV41Model._reference
+    _row_metadata = DeepSeekV41Model._row_metadata
     _sharded_attention_masks = DeepSeekV41Model._sharded_attention_masks
     build_attention_masks = DeepSeekV41Model.build_attention_masks
     _frame = staticmethod(DeepSeekV41Model._frame)
@@ -411,7 +351,7 @@ class _HookOwner:
         slab = positions.numel() // cp_size
         lo = cp_rank * slab
         return self._sharded_attention_masks(
-            self._row_frames(positions),
+            self._row_metadata(positions),
             positions[..., lo : lo + slab],
             cp_size=cp_size,
             cp_rank=cp_rank,

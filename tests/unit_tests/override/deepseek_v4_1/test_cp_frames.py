@@ -27,20 +27,18 @@ _WINDOW = 128
 
 
 class _Model:
-    """The model's metadata half, with the reference half switched off.
+    """The model's metadata builders, without the rest of the model.
 
-    The ports are handed the metadata, not the model, so grafting the two builders is enough; the
+    The ports are handed the metadata, not the model, so grafting the builders is enough; the
     boundaries the tests want are rebuilt as positions, exactly as the hook would see them.
     """
 
     compress_ratios = (0, 2, 1)
-    needs_reference = False
     # The hook is a method, so a stand-in presents the pieces it reaches for; they are taken from
     # the model itself, and ``_frame`` as a staticmethod -- a plain assignment would make it an
     # instance method here.
     get_attention_masks = DeepSeekV41Model.get_attention_masks
-    _row_frames = DeepSeekV41Model._row_frames
-    _reference = DeepSeekV41Model._reference
+    _row_metadata = DeepSeekV41Model._row_metadata
     _sharded_attention_masks = DeepSeekV41Model._sharded_attention_masks
     _frame = staticmethod(DeepSeekV41Model._frame)
 
@@ -53,7 +51,7 @@ def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0):
     slab = positions.numel() // cp_size
     lo = cp_rank * slab
     return owner._sharded_attention_masks(
-        owner._row_frames(positions),
+        owner._row_metadata(positions),
         positions[:, lo : lo + slab],
         cp_size=cp_size,
         cp_rank=cp_rank,

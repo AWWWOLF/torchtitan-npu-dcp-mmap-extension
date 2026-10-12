@@ -10,15 +10,16 @@ V4.1 has two models, not one model with an optional tower: the text stack
 multimodal stack (:class:`DeepSeekV41MultimodalModel`) subclasses it with the tower, the
 markers, the router's vision bias and the context-parallel rejection.  These tests pin
 that partition, because the whole point of the split is that each half's parameter set
-and routing behaviour is readable from its class.
+and routing behaviour is readable from its class -- including what each half rejects under
+context parallelism.
 """
 
-import contextlib
 import dataclasses
 import importlib
 
 import pytest
 import torch.nn as nn
+from torchtitan.config.override import OverrideConfig, apply_overrides
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1.model import (
@@ -61,24 +62,43 @@ def test_only_the_multimodal_half_carries_vision_parameters(registry):
 
 
 def _with_cp(trainer, degree: int):
-    trainer.training = dataclasses.replace(trainer.training, global_batch_size=8)
+    # The sequence length is part of a CP config: torchtitan's rope budget is checked
+    # against it inside ``update_from_config``, before the attention the gate is about.
+    trainer.training = dataclasses.replace(trainer.training, global_batch_size=8, seq_len=512)
     trainer.parallelism = dataclasses.replace(trainer.parallelism, context_parallel_degree=degree)
     return trainer
 
 
-def test_multimodal_rejects_context_parallel_and_text_accepts_it(registry, recipes):
+def test_multimodal_rejects_context_parallel(registry, recipes):
     """CP is the text half's; the vision half keeps rejecting it until it has a story."""
     multimodal = _with_cp(recipes.deepseek_v4_1_debugmodel_multimodal(), 2)
     with pytest.raises(NotImplementedError, match="multimodal stack"):
         multimodal.model_spec.model.update_from_config(config=multimodal)
 
-    # The text half gets past the gate: whatever else CP needs is step 3's, and the gate
-    # itself must not be it.
+
+def test_context_parallel_runs_on_the_fused_stack_only(recipes):
+    """CP hands the torch-native attention a chunk frame where it expects the row.
+
+    The sharded metadata describes this rank's query chunks, which only the fused ports read
+    (through ``seqused``); a torch-native core or selector would grid it as if it were the row,
+    silently, since every shape still fits.  The gate reads the overrides the run *requests*
+    (the config stage runs before ``apply_overrides``), and the same stack then really builds,
+    which is where the ports are checked against each other.
+    """
     text = _with_cp(recipes.deepseek_v4_1_debugmodel_text(), 2)
-    with contextlib.suppress(ValueError):
-        # Downstream of the gate and part of the CP work itself (the sharding policy has
-        # no CP placement yet); the gate is what this test is about.
-        text.model_spec.model.update_from_config(config=text)
+    model_config = text.model_spec.model
+    with pytest.raises(ValueError, match="fused stack only"):
+        model_config.update_from_config(config=text)
+
+    text.override = OverrideConfig(
+        imports=[
+            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+            "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+        ]
+    )
+    model_config.update_from_config(config=text)
+    apply_overrides(text.override, text)
+    model_config.build()
 
 
 def test_text_recipe_builds_the_text_stack_and_loader(recipes):
