@@ -129,9 +129,13 @@ def pypto_li(cfg: LightningIndexer.Config):
 @override(
     target=CompressedSparseInnerAttention.Config,
     exact=True,
-    description=("DSV4 sparse attention golden reference (eager per-document, dsv4-infer-npu bitwise)"),
+    description=("DSV4 sparse attention golden reference"),
 )
 def golden(
     cfg: CompressedSparseInnerAttention.Config,
+    indexer_loss_coeff: float = 1.0,
 ) -> GoldenCompressedSparseInnerAttention.Config:
-    return derive(cfg, GoldenCompressedSparseInnerAttention.Config)
+    result = derive(cfg, GoldenCompressedSparseInnerAttention.Config, indexer_loss_coeff=indexer_loss_coeff)
+    if result.sharding_config is not None:
+        result.sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(tp=spmd.R)
+    return result

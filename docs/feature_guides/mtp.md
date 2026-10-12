@@ -201,4 +201,4 @@ DeepSeek-V4 默认 recipe 使用 `mtp_scale=0.3`。
 
 ### 3.3 关闭 MTP
 
-关闭 MTP 时需要让模型构造保持 `num_mtp_layers=0`，并使用普通 loss。此时 `config.mtp_layers` 为空列表，运行时 `model.mtp_layers is None`；模型不创建 MTP 参数，训练只计算主 NTP loss。
+关闭 MTP 时需要让模型构造保持 `num_mtp_layers=0`，并使用普通 loss。此时 `config.mtp_layers` 为空列表，运行时 `model.mtp_layers is None`；模型不创建 MTP 参数，训练只计算主 MTP loss。

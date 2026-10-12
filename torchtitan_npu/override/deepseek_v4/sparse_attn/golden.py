@@ -11,6 +11,10 @@ An eager per-document implementation over the packed stream, matching the
 attention with a per-head sink, per-document indexer top-k).  It anchors the
 two-layer numeric scheme: this golden is compared bitwise against patched
 transformers, and the fused AscendC kernels are checked within tolerance of it.
+
+Training on ratio-4 layers distills the selected compressed attention mass
+into the indexer with a detached-teacher weighted KL objective. Its gradient
+is injected into the attention output without changing the forward values.
 """
 
 import itertools
@@ -24,6 +28,10 @@ from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAtt
 from torchtitan_npu.models.deepseek_v4.metadata import CompressedVarlenMetadata
 from torchtitan_npu.models.deepseek_v4.reference import (
     ReferenceCompressedVarlenMetadata,
+)
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
+    _AuxLossInjection,
+    _should_run_forward,
 )
 
 # Bound the ``[B, M, topk, D]`` gather used by sparse attention.
@@ -125,6 +133,52 @@ def _sequence_ranges(cu_seqlens: torch.Tensor) -> list[tuple[int, int]]:
     return list(itertools.pairwise(bounds))
 
 
+def _indexer_kl_loss_sum(
+    query: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    idx_w: torch.Tensor,
+    indices: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Weighted KL over selected compressed entries, with a detached teacher.
+
+    Teacher mass sums the main attention probabilities across heads, including
+    window KV and the sink in the denominator. The student uses unscaled
+    indexer logits. Summing rows here lets the caller normalize once across
+    the entire packed query stream, including rows with no compressed keys.
+    """
+    if compressed_kv.shape[0] == 0 or indices.shape[-1] == 0:
+        return (idx_q.float().sum() + idx_k.float().sum() + idx_w.float().sum()) * 0
+
+    chunk = _ATTN_CHUNK if _ATTN_CHUNK > 0 else query.shape[0]
+    losses = []
+    for start in range(0, query.shape[0], chunk):
+        end = start + chunk
+        selected = indices[start:end]
+        valid = selected >= 0
+        safe = selected.clamp_min(0).long()
+        with torch.no_grad():
+            keys = compressed_kv[safe].float()
+            logits = torch.matmul(query[start:end].float(), keys.transpose(-2, -1)) * softmax_scale
+            mass = torch.exp(logits - softmax_lse[start:end].float().unsqueeze(-1))
+            mass = mass.masked_fill(~valid.unsqueeze(1), 0).sum(dim=1)
+            total_mass = mass.sum(dim=-1, keepdim=True)
+            teacher_log = (mass / total_mass.clamp_min(1e-10)).clamp_min(1e-10).log()
+
+        keys = idx_k[safe].float()
+        scores = torch.matmul(idx_q[start:end].float(), keys.transpose(-2, -1))
+        scores = (scores.relu() * idx_w[start:end].float().unsqueeze(-1)).sum(dim=1)
+        # A finite sentinel keeps all-padding rows well-defined; their teacher
+        # mass is zero, so they contribute exactly zero loss and gradients.
+        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        log_student = F.log_softmax(scores, dim=-1)
+        losses.append((mass * (teacher_log - log_student)).sum())
+    return torch.stack(losses).sum()
+
+
 def _packed_block_docs(plan, total_blocks: int, device) -> torch.Tensor:
     """Document id of every packed block (0-based, int64)."""
     if total_blocks == 0:
@@ -160,7 +214,18 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(CompressedSparseInnerAttention.Config):
-        pass
+        indexer_loss_coeff: float = 1.0
+        """Scale the indexer auxiliary gradient; zero disables indexer training."""
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.indexer_loss_coeff = config.indexer_loss_coeff
+        self.register_buffer("_indexer_loss_acc", torch.zeros((), dtype=torch.float32), persistent=False)
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        self._indexer_loss_acc = torch.zeros(
+            (), dtype=torch.float32, device=buffer_device or self._indexer_loss_acc.device
+        )
 
     def _packed_compressed_indices(
         self,
@@ -284,6 +349,17 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             compressed_indices = None
 
         outputs = []
+        indexer_losses = []
+        train_indexer = (
+            self.compress_ratio == 4 and self.training and torch.is_grad_enabled() and self.indexer_loss_coeff != 0
+        )
+        index_query = index_keys = index_weights = None
+        if train_indexer:
+            if idx_q is None or idx_k is None or idx_w is None:
+                raise ValueError("ratio-4 golden auxiliary loss requires all LI projection tensors.")
+            index_query = idx_q.flatten(0, 1)
+            index_keys = idx_k.flatten(0, 1)
+            index_weights = idx_w.flatten(0, 1)
         compressed = None if self.compress_ratio <= 1 else metadata.plans.get(self.compress_ratio)
         block_ranges = (
             None
@@ -296,6 +372,8 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             length = q_end - q_start
             document_query = query[q_start:q_end].unsqueeze(0)
             document_kv = original_kv[q_start:q_end]
+            document_compressed = None
+            c_start = c_end = 0
             indices = _window_topk_idxs(self.window_size, 1, length, query.device)
             if compressed is not None:
                 c_start, c_end = block_ranges[  # pyrefly: ignore [unsupported-operation]
@@ -318,9 +396,30 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 attn_sink,  # pyrefly: ignore [bad-argument-type]
                 indices,
                 self.softmax_scale,
-                return_lse=False,
+                return_lse=train_indexer,
             )
+            if train_indexer:
+                assert document_compressed is not None and compressed_indices is not None
+                assert index_query is not None and index_keys is not None and index_weights is not None
+                result, lse = result
+                indexer_losses.append(
+                    _indexer_kl_loss_sum(
+                        query[q_start:q_end],
+                        document_compressed,
+                        index_query[q_start:q_end],
+                        index_keys[c_start:c_end],
+                        index_weights[q_start:q_end],
+                        compressed_indices[q_start:q_end, : c_end - c_start],
+                        lse.squeeze(0),
+                        self.softmax_scale,
+                    )
+                )
             outputs.append(result.squeeze(0))  # pyrefly: ignore [missing-attribute]
 
         output = torch.cat(outputs, dim=0).to(query.dtype)
+        if train_indexer:
+            indexer_loss = torch.stack(indexer_losses).sum() * (self.softmax_scale / query.shape[0])
+            if _should_run_forward():
+                self._indexer_loss_acc.add_(indexer_loss.detach())
+            output = _AuxLossInjection.apply(output, indexer_loss * self.indexer_loss_coeff)
         return output.reshape(metadata.batch_size, metadata.seq_len, *output.shape[1:])
