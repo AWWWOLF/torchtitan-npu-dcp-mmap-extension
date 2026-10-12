@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-EXPECTED_TORCHVISION = "0.29.0.dev20260814+cpu"
+EXPECTED_TORCHVISION = "0.29.0+cpu"
 
 
 def test_multimodal_dependency_and_package_discovery_are_explicit():
@@ -84,7 +84,7 @@ import importlib.util
 import sys
 import torchvision
 from pathlib import Path
-assert torchvision.__version__ in ('0.29.0.dev20260814+cpu', '0.30.0.dev20260918+cpu')
+assert torchvision.__version__ in ('0.29.0+cpu', '0.30.0.dev20260918+cpu')
 assert torchvision.__file__ is not None and Path(torchvision.__file__).is_file()
 from torchtitan_npu.models.qwen3_5.config_registry import qwen35_debugmodel
 qwen35_debugmodel()

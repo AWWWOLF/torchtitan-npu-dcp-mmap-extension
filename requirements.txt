@@ -2,9 +2,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
---extra-index-url https://download.pytorch.org/whl/nightly/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.14.0
-torchvision==0.29.0.dev20260814
+torchvision==0.29.0
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
 torch_npu==2.14.0.dev20260918
 torchtitan==0.3.0

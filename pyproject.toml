@@ -14,7 +14,7 @@ multimodal = [
     "av",
     "einops",
     "pillow",
-    "torchvision==0.29.0.dev20260814+cpu",
+    "torchvision==0.29.0+cpu",
 ]
 torchft = [
     "torchft==0.2.0",
