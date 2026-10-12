@@ -1241,6 +1241,81 @@ def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
     assert model.table.weight.grad is None
 
 
+@pytest.mark.parametrize("saved_steps", [0, 3], ids=["before-first-step", "after-training"])
+def test_host_sparse_swap_checkpoint_resumes_exactly(monkeypatch, tmp_path, saved_steps):
+    from torchtitan.components.optimizer import ParamGroupConfig
+
+    from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
+    from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
+
+    _patch_fake_swap_runtime(monkeypatch)
+
+    def build():
+        model = torch.nn.Module()
+        model.dense = torch.nn.Parameter(torch.arange(4.0) / 7)
+        model.table = HostEngramTable.Config(
+            vocab_size=16,
+            layer_id=0,
+            ngram_orders=(2,),
+            num_heads=1,
+            head_vocab_sizes=(11,),
+            embedding_dim=4,
+            num_embeddings=12,
+            require_token_id_map=False,
+            pin_memory=False,
+        ).build()
+        with torch.no_grad():
+            model.table.weight.copy_(torch.arange(48).reshape(12, 4) / 16)
+        root = _Root.Config(
+            optimizer=HostSparseOptimizersContainer.Config(
+                implementation="for-loop",
+                param_groups=[
+                    ParamGroupConfig(
+                        pattern=r"table\.weight$", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05}
+                    ),
+                    ParamGroupConfig(pattern=r".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.01}),
+                ],
+            )
+        )
+        apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.common.optimizer.swap_optimizer"]), root)
+        container = root.optimizer.build(model_parts=[model])
+        assert isinstance(container, product_swap.HostSparseOptimizerStateSwapContainer)
+        return model, container
+
+    def step(model, container):
+        container.zero_grad()
+        loss = model.table._distributed_lookup(torch.tensor([0, 7, 7, 11])).square().sum() + model.dense.square().sum()
+        loss.backward()
+        container.step()
+        container.zero_grad()
+
+    source, source_optimizer = build()
+    for _ in range(saved_steps):
+        step(source, source_optimizer)
+    native = next(opt for opt in source_optimizer.optimizers if isinstance(opt, torch.optim.SparseAdam))
+    expected_state = deepcopy(native.state.get(source.table.weight, {}))
+    dcp.save({"model": source, "optimizer": source_optimizer}, checkpoint_id=tmp_path)
+
+    target, target_optimizer = build()
+    with torch.no_grad():
+        for parameter in target.parameters():
+            parameter.fill_(-9)
+    dcp.load({"model": target, "optimizer": target_optimizer}, checkpoint_id=tmp_path)
+
+    for expected, actual in zip(source.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    restored = next(opt for opt in target_optimizer.optimizers if isinstance(opt, torch.optim.SparseAdam))
+    restored_state = restored.state[target.table.weight]
+    assert restored_state["step"] == saved_steps
+    for name in ("exp_avg", "exp_avg_sq"):
+        expected = expected_state[name] if saved_steps else torch.zeros_like(target.table.weight)
+        torch.testing.assert_close(restored_state[name], expected, rtol=0, atol=0)
+    step(source, source_optimizer)
+    step(target, target_optimizer)
+    for expected, actual in zip(source.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -> None:
     """Engram schemas keep the sparse lifecycle under the NPU-state default.
 

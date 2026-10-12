@@ -9,6 +9,7 @@
 import math
 from collections import deque
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from types import MethodType
@@ -867,6 +868,9 @@ class OptimizerStateSwapContainer(OptimizersContainer):
         optimizer: torch.optim.Optimizer,
         flat_state: dict[str, Any],
     ) -> None:
+        if not _uses_novaswap(optimizer):
+            # Host-resident optimizers keep their ordinary checkpoint tensors.
+            return
         locations = getattr(optimizer, "_torchtitan_npu_checkpoint_locations")  # noqa: B009
         for parameter, fqn, state_name, tensor in _swapped_state_tensors(optimizer):
             key = f"state.{fqn}.{state_name}"
@@ -924,9 +928,22 @@ class OptimizerStateSwapContainer(OptimizersContainer):
             if names is not None:
                 group["param_names"] = names
 
+    @contextmanager
+    def _unswapped_checkpoint_optimizers(self) -> Iterator[None]:
+        optimizers = self.optimizers
+        # Let the original container (including HostSparse) handle only its states.
+        self.optimizers = [optimizer for optimizer in optimizers if not _uses_novaswap(optimizer)]
+        try:
+            yield
+        finally:
+            self.optimizers = optimizers
+
     def state_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {}
+        with self._unswapped_checkpoint_optimizers():
+            result = super().state_dict() if self.optimizers else {}
         for optimizer in self.optimizers:
+            if not _uses_novaswap(optimizer):
+                continue
             _ensure_all_optim_state(optimizer)
             flat_state = get_flat_optim_state_dict(optimizer)
             self._replace_swapped_states_with_checkpoint_views(optimizer, flat_state)
@@ -934,8 +951,12 @@ class OptimizerStateSwapContainer(OptimizersContainer):
         return result
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        with self._unswapped_checkpoint_optimizers():
+            if self.optimizers:
+                super().load_state_dict(state_dict)
         for optimizer in self.optimizers:
-            self._load_optimizer_state(optimizer, state_dict)
+            if _uses_novaswap(optimizer):
+                self._load_optimizer_state(optimizer, state_dict)
 
     def _load_optimizer_state(self, optimizer: torch.optim.Optimizer, state_dict: dict[str, Any]) -> None:
         _ensure_all_optim_state(optimizer)
@@ -953,6 +974,10 @@ class OptimizerStateSwapContainer(OptimizersContainer):
         swap = getattr(optimizer, "_torchtitan_npu_swap_adapter", None)
         if isinstance(swap, _NovaSwapAdamW):
             swap.refresh_bucket_groups()
+
+
+def _uses_novaswap(optimizer: torch.optim.Optimizer) -> bool:
+    return getattr(optimizer, "_torchtitan_npu_checkpoint_locations", None) is not None
 
 
 def _ensure_all_optim_state(optimizer: torch.optim.Optimizer) -> None:
