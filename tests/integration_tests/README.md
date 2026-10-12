@@ -33,7 +33,7 @@ torchtitan 迁移而来。
 DeepSeek-V4.1 的常规训练验证使用 [A3/A5 示例入口](../../examples/deepseek_v4_1/readme.md)。Engram HF 验证使用下述独立 suite，不在默认 `models` 或 CI smoke 中执行。
 
 两个 DeepSeek-V3.2 case 同样设置 `check_loss=True`，使用 RoPE workaround、Ascend DSA
-metadata/attention override，并分别对 1-rank 和 EP2/FSDP2 的 100-step loss 做精确比较。
+metadata/attention override，并分别对 1-rank 和 EP2/FSDP2 的 30-step loss 做精确比较。
 
 `dsv4_checkpoint_resume_ep2_fsdp2` 覆盖 AdamW NovaSwap 的 checkpoint 保存、恢复和精度对齐，已注册到
 独立的 `deepseek_v4_checkpoint` suite，不在默认 `models` suite 中执行。它使用两卡 EP2 + FSDP2、Golden recipe、`swap_optimizer` override 和
@@ -114,6 +114,10 @@ runner 迁移自 torchtitan 的 GPUPool 机制：默认将用例并发打包到�
 （`[parallel] pool: window/utilization/busy histogram/allocations`）与
 用例重叠（`[parallel] overlap: sequential vs window、节省时长、并发度直方图`），
 统计窗口均为首次分配到最后一次释放，可直接用于核验 CI canary 的打包与重叠效果。
+用例的墙钟耗时由 runner 在结束时以 `[timing] per-case wall time` 块输出（串行执行同样
+输出）：逐用例给出 `ngpu` 与耗时，并汇总全部用例耗时之和；失败、超时或提前退出的用例
+同样计入（耗时按 `finally` 记录），因此 CI 日志里的最后一块即可回答「每个 case 花了多久」，
+不需要再手工对照各用例 `start`/`end` 头部时间戳。
 各用例的输出被整体缓存，结束后以带 `[case 名]` 前缀的连续块输出，避免多用例
 日志交错。如需强制串行执行，传入 `--no-parallel`。用例可通过
 `OverrideDefinitions.timeout` 设置超时；超时后 runner 会向子进程所在进程组先发

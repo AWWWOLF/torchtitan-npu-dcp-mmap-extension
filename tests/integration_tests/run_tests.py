@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 # torchtitan-npu override: the runner consumes the case definition at runtime.
@@ -79,6 +80,23 @@ _TEST_SUITES_FUNCTION = {
 # Held while a test writes its captured output so concurrent tests do not
 # interleave their lines.
 _OUTPUT_LOCK = threading.Lock()
+
+
+@dataclass
+class _CaseTiming:
+    """Wall time of one integration case, for the end-of-run summary."""
+
+    test_name: str
+    ngpu: int
+    start: float
+    elapsed: float
+
+
+# torchtitan-npu override: every case records its wall time here so the runner
+# can print the per-case cost once the run is over. Cases run concurrently, so
+# the list has its own lock.
+_CASE_TIMINGS: list[_CaseTiming] = []
+_CASE_TIMINGS_LOCK = threading.Lock()
 
 
 class GPUPool:
@@ -506,6 +524,52 @@ def run_single_test(
         compare_checkpoint_metrics(case_dir / "test_run", test_flavor.expected_steps)
 
 
+def _record_case_timing(test_name: str, ngpu: int, start: float, elapsed: float) -> None:
+    with _CASE_TIMINGS_LOCK:
+        _CASE_TIMINGS.append(_CaseTiming(test_name, ngpu, start, elapsed))
+
+
+def _run_single_test_timed(
+    test_flavor: OverrideDefinitions,
+    output_dir: str,
+    module: str | None = None,
+    config: str | None = None,
+    **kwargs,
+) -> None:
+    """Run one case and record its wall time for the end-of-run summary.
+
+    The window covers everything the case costs: all of its phases plus the
+    loss/checkpoint validation between them. Recording happens in ``finally``
+    so a failed or timed-out case still shows up in the summary — which is
+    exactly when its cost matters most.
+    """
+    start = time.monotonic()
+    try:
+        run_single_test(test_flavor, output_dir, module, config, **kwargs)
+    finally:
+        _record_case_timing(test_flavor.test_name, test_flavor.ngpu, start, time.monotonic() - start)
+
+
+def _print_case_timings() -> None:
+    """Print the per-case wall times recorded during this run.
+
+    Emitted as the last block of the run, after the scheduling telemetry, so a
+    CI reader gets each case's cost directly instead of correlating the
+    per-case ``start``/``end`` headers of the output blocks by hand. Summed
+    case time is the sequential equivalent; the pool window printed just above
+    is the wall time actually spent.
+    """
+    with _CASE_TIMINGS_LOCK:
+        timings = sorted(_CASE_TIMINGS, key=lambda timing: timing.start)
+    if not timings:
+        return
+    width = max(len(timing.test_name) for timing in timings)
+    log_print(f"[timing] per-case wall time ({len(timings)} case(s)):")
+    for timing in timings:
+        log_print(f"[timing]   {timing.test_name:<{width}}  ngpu={timing.ngpu}  {timing.elapsed:.1f}s")
+    log_print(f"[timing]   sum of case times: {sum(timing.elapsed for timing in timings):.1f}s")
+
+
 def _filter_tests(
     args,
     test_list: list[OverrideDefinitions],
@@ -591,7 +655,7 @@ def run_tests(
             gpus = pool.acquire(test_flavor.ngpu)
             log_print(f"[parallel] {test_flavor.test_name}: acquired NPUs {gpus} (ngpu={test_flavor.ngpu})")
             try:
-                run_single_test(
+                _run_single_test_timed(
                     test_flavor,
                     args.output_dir,
                     module,
@@ -619,7 +683,7 @@ def run_tests(
     else:
         for test_flavor in runnable:
             try:
-                run_single_test(
+                _run_single_test_timed(
                     test_flavor,
                     args.output_dir,
                     module,
@@ -629,6 +693,10 @@ def run_tests(
             except Exception as exc:
                 log_print(str(exc))
                 failed_tests.append((test_flavor.test_name, str(exc)))
+
+    # torchtitan-npu override: per-case cost, printed as the run's last block so
+    # it is still emitted when a case failed above.
+    _print_case_timings()
 
     if failed_tests:
         failure_summary = "\n".join(f"  {name}: {error}" for name, error in failed_tests)
