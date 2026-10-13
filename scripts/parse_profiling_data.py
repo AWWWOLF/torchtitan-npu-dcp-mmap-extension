@@ -26,8 +26,9 @@ def _find_ascend_pt_dirs(path: str) -> list[str]:
     if os.path.basename(path).endswith("_ascend_pt") and os.path.isdir(path):
         return [path]
 
-    candidates = sorted(glob.glob(os.path.join(path, "*_ascend_pt")))
-    nested = sorted(glob.glob(os.path.join(path, "profiling_data", "*_ascend_pt")))
+    literal_path = glob.escape(path)
+    candidates = sorted(glob.glob(os.path.join(literal_path, "*_ascend_pt")))
+    nested = sorted(glob.glob(os.path.join(literal_path, "profiling_data", "*_ascend_pt")))
     seen = set(candidates + nested)
     return sorted(directory for directory in seen if os.path.isdir(directory))
 
