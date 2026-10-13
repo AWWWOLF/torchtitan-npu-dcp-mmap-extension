@@ -22,6 +22,53 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import A
 from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
 
 
+@pytest.mark.parametrize(
+    "anticipatory_enabled,compile_enabled,initial_limit,expected_limit",
+    [
+        pytest.param(True, True, 16, 128, id="raise-limit"),
+        pytest.param(True, True, 256, 256, id="preserve-higher-limit"),
+        pytest.param(False, True, 16, 16, id="anticipatory-disabled"),
+        pytest.param(True, False, 16, 16, id="compile-disabled"),
+        pytest.param(False, False, 16, 16, id="both-disabled"),
+    ],
+)
+def test_trainer_sets_recompile_limit_before_parent_init(
+    monkeypatch, anticipatory_enabled, compile_enabled, initial_limit, expected_limit
+):
+    import torch._dynamo.config as dynamo_config
+
+    from torchtitan_npu.extensions import trainer as trainer_module
+
+    config = SimpleNamespace(
+        extension=SimpleNamespace(quantization=SimpleNamespace(enable_quantized_training=False)),
+        training=SimpleNamespace(extension=SimpleNamespace(allow_hf32=False)),
+        anticipatory=SimpleNamespace(enable=anticipatory_enabled),
+        compile=SimpleNamespace(enable=compile_enabled),
+        override=SimpleNamespace(imports=[]),
+        sdc=SimpleNamespace(build=lambda **kwargs: None),
+    )
+    parent_calls = []
+
+    def initialize_parent(self, received_config):
+        # Observe the real TrainerEx initialization before model compilation.
+        assert dynamo_config.recompile_limit == expected_limit
+        parent_calls.append(received_config)
+        self.model_parts = []
+        self.gradient_accumulation_steps = 1
+
+    # Restore this process-global setting after each parameterized case.
+    monkeypatch.setattr(dynamo_config, "recompile_limit", initial_limit)
+    monkeypatch.setattr(Trainer, "__init__", initialize_parent)
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda enabled: None)
+    monkeypatch.setattr(trainer_module, "AnticipatorySchedule", lambda trainer: object())
+
+    trainer = TrainerEx(config)
+
+    assert parent_calls == [config]
+    assert dynamo_config.recompile_limit == expected_limit
+    assert (trainer.anticipatory_schedule is not None) == anticipatory_enabled
+
+
 class Scheduler(torch.optim.lr_scheduler.StepLR):
     def get_metrics(self):
         return {"lr": self.get_last_lr()[0]}

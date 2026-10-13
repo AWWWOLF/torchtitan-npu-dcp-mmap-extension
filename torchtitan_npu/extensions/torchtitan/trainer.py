@@ -147,6 +147,13 @@ class TrainerEx(Trainer):
         set_allow_hf32(config.training.extension.allow_hf32)
         # Both parent initialization paths apply overrides before building the model.
         configure_router_override(config)
+
+        if config.anticipatory.enable and config.compile.enable:
+            import torch._dynamo.config as dynamo_config
+
+            # pyrefly: ignore [bad-assignment]
+            dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, 128)
+
         if getattr(config.training, "enable_cpu_offload", False):
             # CPU DTensor parameters need NPU-side initialization during
             # model materialization: Module._init_param fires inside
