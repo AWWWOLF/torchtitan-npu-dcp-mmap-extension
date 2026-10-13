@@ -354,3 +354,32 @@ def test_cp_history_preserves_packed_engram_training(cp_size):
         module.table.prepare_sparse_optimizer_step()
         optimizer.step()
     torch.testing.assert_close(engram.table.weight, reference.table.weight)
+
+
+@pytest.mark.parametrize("fused_attention", [False, True], ids=["reference", "fused"])
+def test_model_config_accepts_parameterized_engram_override(fused_attention):
+    from torchtitan.config.override import apply_overrides
+
+    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+    from torchtitan_npu.override.deepseek_v4_1.engram.mxfp8 import MXFP8HostOffloadEngramTable
+
+    config = deepseek_v4_1_debugmodel_text()
+    config.hf_assets_path = "tests/assets/deepseek_v3"
+    config.training.seq_len = 512
+    config.override.imports = [
+        ("torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8",
+         {"num_max_tokens_per_rank": 3072, "shard_over_efsdp": True}),
+    ]
+    if fused_attention:
+        config.override.imports += [
+            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+            ("torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc", {}),
+        ]
+    # Follow Trainer's order: model validation runs before applying overrides.
+    config.model_spec.model.update_from_config(config=config)
+    apply_overrides(config.override, config)
+
+    tables = [layer.engram.table for layer in config.model_spec.model.layers if layer.engram is not None]
+    assert tables
+    assert all(isinstance(table, MXFP8HostOffloadEngramTable.Config) for table in tables)
+    assert all(table.num_max_tokens_per_rank == 3072 and table.shard_over_efsdp for table in tables)

@@ -112,7 +112,7 @@ python -m tests.integration_tests.run_tests \
     --ngpu 2
   ```
 
-* **Engram HF 专项验证（超节点手动）**：
+* **Engram HF 专项验证（超节点）**：
   在具备 Engram MXFP8 Host 通信环境的超节点上，验证 V4.1 Engram 参数在原生 DCP 与 FP32 HF 权重格式之间的双向回环保存与恢复一致性：
   ```bash
   HF_ASSETS_PATH=/path/to/v41-tokenizer \
@@ -287,3 +287,24 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
 
 ### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 Lite Actions 调度系统运维说明或联系集群管理员排查。
+
+---
+
+## Engram HF 专项验证
+
+在支持 Engram MXFP8 Host 通信的超节点上激活 CANN、torch extension 和训练环境，准备 V4.1 tokenizer assets 后执行：
+
+```bash
+HF_ASSETS_PATH=/path/to/v41-tokenizer \
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
+python -m tests.integration_tests.run_tests /tmp/engram-hf-output \
+  --test_suite deepseek_v4_1_engram_hf --ngpu 4 --no-parallel
+```
+
+输出目录使用新目录。该 suite 包含 EP4/FSDP4 及 EP2×EFSDP2 联合分片两项用例，均为 V4.1 debug text、四卡、eager、seq512、GBS4，启用 Engram MXFP8 override，关闭普通模型 FP8 和 optimizer CPU offload。使用仓内 C4 数据及自动生成的微型 HF fixture，不需要正式模型权重。
+
+先训练两步并保存同一模型的原生 DCP 和 FP32 HF 权重，再各自通过真实 CheckpointManager 初始化模型，使用相同的新优化器和数据种子训练三步。每个 rank 校验加载后的 Engram 参数及 MXFP8 缓存/scale 有效行字节，随后对比 TensorBoard loss/grad_norm。失败会使测试返回非零，成功输出 `HF_ROUNDTRIP PASS`。不读取固定 golden，不验证优化器状态续训，也不覆盖正式整包非 Engram 量化权重的导入。
+
+仅验证 Engram 联合分片 HF 路径时，在上述命令追加
+`--test_name dsv41_engram_mxfp8_hf_ep2_efsdp2`。该用例保持相同的 native/HF
+加载后参数、MXFP8 缓存及三步 loss/grad_norm 精确比较，不加入默认 CI smoke。

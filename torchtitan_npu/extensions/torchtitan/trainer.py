@@ -242,8 +242,12 @@ class TrainerEx(Trainer):
     def train_step(self, data_iterator):
         if self.anticipatory_schedule is not None:
             with self.anticipatory_schedule.training_step_context(data_iterator) as batches:
-                return super().train_step(batches)
-        return super().train_step(data_iterator)
+                return super().train_step(self.step_batches(batches))
+        return super().train_step(self.step_batches(data_iterator))
+
+    def step_batches(self, batches):
+        """Adapt this step's batches after any anticipatory scheduling."""
+        return batches
 
     def batch_generator(self, data_iterable):
         if self.anticipatory_schedule is not None:

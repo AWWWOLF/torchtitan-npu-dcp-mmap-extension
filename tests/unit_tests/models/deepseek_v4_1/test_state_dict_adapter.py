@@ -165,7 +165,8 @@ class TestComposedAdapterPartition:
 @pytest.mark.skipif(
     not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required"
 )
-def test_engram_hf_shard_load_and_export(tmp_path):
+@pytest.mark.parametrize("layout,shards", [("ep", 2), ("efsdp_ep", 4)])
+def test_engram_hf_shard_load_and_export(tmp_path, layout, shards):
     """DCP reads global HF rows into an EP shard and omits native padding on save."""
     config = model_registry("deepseek_v4_1_debugmodel_text").model
     table = config.layers[1].engram.table
@@ -180,22 +181,27 @@ def test_engram_hf_shard_load_and_export(tmp_path):
     (source / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": {"layers.1.engram.embed.weight": "model-00001-of-00001.safetensors"}})
     )
-    key = "layers.1.engram.table.weight.ep_shard_00001_of_00002"
-    native = {key: torch.full((24, 32), -1.0)}
+    rows = 48 // shards
+    offset = (shards - 1) * rows
+    valid = 41 - offset
+    key = f"layers.1.engram.table.weight.{layout}_shard_{shards - 1:05d}_of_{shards:05d}"
+    native = {key: torch.full((rows, 32), -1.0)}
     hf = adapter.to_hf(native)
     dcp.load(hf, storage_reader=adapter.get_hf_storage_reader(str(source)))
     loaded = adapter.from_hf(hf)
     assert set(loaded) == {key}
-    torch.testing.assert_close(loaded[key][:17], weight[24:], rtol=0, atol=0)
-    assert torch.count_nonzero(loaded[key][17:]) == 0
+    torch.testing.assert_close(loaded[key][:valid], weight[offset:], rtol=0, atol=0)
+    assert torch.count_nonzero(loaded[key][valid:]) == 0
 
     full_native = adapter.from_hf({"layers.1.engram.embed.weight": weight})
     native_path = tmp_path / "native"
     full_key = "layers.1.engram.table.weight"
     dcp.save(
         {
-            full_key + ".ep_shard_00000_of_00002": full_native[full_key][:24].clone(),
-            full_key + ".ep_shard_00001_of_00002": full_native[full_key][24:].clone(),
+            f"{full_key}.{layout}_shard_{rank:05d}_of_{shards:05d}": full_native[full_key][
+                rank * rows : (rank + 1) * rows
+            ].clone()
+            for rank in range(shards)
         },
         checkpoint_id=str(native_path),
     )
@@ -210,9 +216,17 @@ def test_engram_hf_shard_load_and_export(tmp_path):
     torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight, rtol=0, atol=0)
 
     incomplete = tmp_path / "incomplete"
-    dcp.save({key: torch.zeros(24, 32)}, checkpoint_id=str(incomplete))
+    dcp.save({key: torch.zeros(rows, 32)}, checkpoint_id=str(incomplete))
     with pytest.raises(ValueError, match="Incomplete or unsupported Engram checkpoint shards"):
         load_dcp_model(full_native, dcp.FileSystemReader(str(incomplete)))
+
+    mixed = tmp_path / "mixed"
+    dcp.save(
+        {f"{full_key}.{kind}_shard_00000_of_00002": torch.zeros(24, 32) for kind in ("ep", "efsdp_ep")},
+        checkpoint_id=str(mixed),
+    )
+    with pytest.raises(ValueError, match="Mixed Engram checkpoint shard layouts"):
+        load_dcp_model(full_native, dcp.FileSystemReader(str(mixed)))
 
 
 def test_engram_quantized_hf_mapping():

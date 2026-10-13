@@ -50,7 +50,7 @@ class EngramTableParamGroupConfig(ParamGroupConfig):
     """The recipe-owned table group, distinct from user-defined groups."""
 
 
-class DeepSeekV41Trainer(GradientClippingTrainer, TrainerEx):
+class DeepSeekV41Trainer(TrainerEx, GradientClippingTrainer):
     """V4.1 training with instance-owned Host sparse gradient clipping."""
 
     @dataclass(kw_only=True, slots=True)
@@ -87,19 +87,20 @@ class DeepSeekV41Trainer(GradientClippingTrainer, TrainerEx):
             if isinstance(module, Selector) and type(module) is not Selector
         ]
 
-    def train_step(self, data_iterator):
+    def step_batches(self, batches):
+        batches = super().step_batches(batches)
         if not self._indexer_selectors:
-            return super().train_step(data_iterator)
+            return batches
         self._num_step_queries = 0
         self._indexer_denominator_ready = False
 
         def counted_batches():
-            for inputs, labels in data_iterator:
+            for inputs, labels in batches:
                 # Count before CP sharding; LI also trains unsupervised input positions.
                 self._num_step_queries += inputs["input"].numel()
                 yield inputs, labels
 
-        return super().train_step(counted_batches())
+        return counted_batches()
 
     def forward_backward_step(self, *args, **kwargs):
         if self._indexer_selectors and not self._indexer_denominator_ready:

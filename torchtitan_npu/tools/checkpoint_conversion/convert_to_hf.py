@@ -162,13 +162,20 @@ def load_dcp_model(state_dict, reader):
     for key, target in state_dict.items():
         if not key.endswith(".engram.table.weight") or key in metadata:
             continue
-        shards = sorted(k for k in metadata if k.startswith(key + ".ep_shard_"))
+        layouts = [
+            (prefix, sorted(k for k in metadata if k.startswith(key + prefix)))
+            for prefix in (".ep_shard_", ".efsdp_ep_shard_")
+        ]
+        layouts = [(prefix, shards) for prefix, shards in layouts if shards]
+        if len(layouts) > 1:
+            raise ValueError(f"Mixed Engram checkpoint shard layouts for {key}")
+        prefix, shards = layouts[0] if layouts else ("", [])
         if not shards:
             raise ValueError(f"Missing or unsupported Engram checkpoint layout for {key}")
         targets.pop(key)
         offset = 0
         for rank, shard_key in enumerate(shards):
-            suffix = f".ep_shard_{rank:05d}_of_{len(shards):05d}"
+            suffix = f"{prefix}{rank:05d}_of_{len(shards):05d}"
             if shard_key != key + suffix:
                 raise ValueError(f"Incomplete or unsupported Engram checkpoint shards for {key}")
             shape = metadata[shard_key].size

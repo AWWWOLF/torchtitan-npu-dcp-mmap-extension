@@ -3,11 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Two-rank CPU HF export and EP shard restore with native padding."""
+"""CPU HF export and EP / joint EFSDP-EP shard restore with native padding."""
 
 import json
 import sys
 from datetime import timedelta
+from itertools import product
 from pathlib import Path
 
 import torch
@@ -45,16 +46,22 @@ def main():
             )
         dist.barrier()
         weight = torch.arange(48 * 32, dtype=torch.float32).reshape(48, 32)
-        key = f"layers.1.engram.table.weight.ep_shard_{rank:05d}_of_00002"
         gate = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-        for mapped in (False, True):
+        # Four-rank local runs cover EP2 replicas and four distinct joint shards.
+        # The default two-rank UT remains small while checking both key formats.
+        for layout, mapped in product(("ep", "efsdp_ep"), (False, True)):
+            shards = 2 if layout == "ep" else dist.get_world_size()
+            shard_rank = rank % shards
+            rows = 48 // shards
+            offset = shard_rank * rows
+            key = f"layers.1.engram.table.weight.{layout}_shard_{shard_rank:05d}_of_{shards:05d}"
             adapter = DeepSeekV41StateDictAdapter(config, str(assets) if mapped else None)
-            native = {key: weight[rank * 24 : (rank + 1) * 24].clone(), "layers.1.engram.gate.q_weight": gate}
+            native = {key: weight[offset : offset + rows].clone(), "layers.1.engram.gate.q_weight": gate}
             # Trainer casts native state before calling to_hf for last-save export.
             native = {name: value.to(torch.bfloat16) for name, value in native.items()}
             hf = adapter.to_hf(native)
             assert type(hf["layers.1.engram.embed.weight"]) is torch.Tensor
-            path = root / ("mapped" if mapped else "unmapped")
+            path = root / f"{layout}_{'mapped' if mapped else 'unmapped'}"
             mapping = adapter.fqn_to_index_mapping
             dcp.save(
                 hf,
@@ -78,12 +85,12 @@ def main():
             dcp.load(restored, storage_reader=HuggingFaceStorageReader(str(path)))
             torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight[:41].bfloat16(), rtol=0, atol=0)
             torch.testing.assert_close(restored["layers.1.engram.q_weight"], gate.bfloat16(), rtol=0, atol=0)
-            target = adapter.to_hf({key: torch.full((24, 32), -1.0)})
+            target = adapter.to_hf({key: torch.full((rows, 32), -1.0)})
             dcp.load(target, storage_reader=HuggingFaceStorageReader(str(path)))
             loaded = adapter.from_hf(target)
             assert set(loaded) == {key}
-            valid = min(24, 41 - rank * 24)
-            expected = weight[rank * 24 : rank * 24 + valid].bfloat16().float()
+            valid = max(0, min(rows, 41 - offset))
+            expected = weight[offset : offset + valid].bfloat16().float()
             torch.testing.assert_close(loaded[key][:valid], expected, rtol=0, atol=0)
             assert torch.count_nonzero(loaded[key][valid:]) == 0
     finally:

@@ -43,7 +43,10 @@ def snapshot(manager):
             if storage is None:
                 continue
             rows = module.weight.shape[0]
-            valid = max(0, min(rows, module.logical_num_embeddings - module._ep_rank * rows))
+            mesh = module.lookup_mesh
+            shard_rank = mesh.get_local_rank() if mesh is not None else 0
+            # HF omits padding; joint storage uses the EFSDP x EP shard rank.
+            valid = max(0, min(rows, module.logical_num_embeddings - shard_rank * rows))
             prefix = f"cache.{part_index}.{name}"
             result[f"{prefix}.data"] = storage[:valid].view(torch.uint8).cpu().clone()
             result[f"{prefix}.scale"] = module._quantized_scale[:valid].view(torch.uint8).cpu().clone()
@@ -80,8 +83,9 @@ def load(self, state_dict, checkpoint_id, from_hf=False, from_quantized=False):
 def build_engram_hf_test_list():
     return [
         OverrideDefinitions(
-            test_name="dsv41_engram_mxfp8_hf_ep4",
-            test_descr="Engram HF initial load, MXFP8 cache rebuild and three training steps",
+            test_name=f"dsv41_engram_mxfp8_hf_{layout}",
+            test_descr=f"Engram {layout} HF load, MXFP8 cache rebuild and three training steps",
+            env_vars={"ENGRAM_HF_JOINT_SHARDING": joint},
             ngpu=4,
             check_loss=False,
             timeout=1800,
@@ -89,6 +93,7 @@ def build_engram_hf_test_list():
             train_args=(),
             override_args=[()],
         )
+        for layout, joint in (("ep4", "0"), ("ep2_efsdp2", "1"))
     ]
 
 

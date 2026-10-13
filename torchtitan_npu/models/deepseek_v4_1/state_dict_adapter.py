@@ -250,14 +250,16 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
 
         for key, value in state_dict.items():
             if ".engram.table.weight" in key:
-                match = re.fullmatch(r"layers\.(\d+)\.engram\.table\.weight(?:\.ep_shard_(\d+)_of_(\d+))?", key)
+                match = re.fullmatch(
+                    r"layers\.(\d+)\.engram\.table\.weight(?:\.(?:efsdp_)?ep_shard_(\d+)_of_(\d+))?", key
+                )
                 if match is None:
                     raise ValueError(f"Unexpected Engram table key: {key}")
                 layer_id = int(match[1])
                 config = self._engram_tables[layer_id]
                 rank, size = (int(match[2]), int(match[3])) if match[2] else (0, 1)
                 if not 0 <= rank < size or config.num_embeddings % size:
-                    raise ValueError(f"Invalid Engram EP shard: {key}")
+                    raise ValueError(f"Invalid Engram table shard: {key}")
                 shard_rows = config.num_embeddings // size
                 if tuple(value.shape) != (shard_rows, config.embedding_dim):
                     raise ValueError(f"Unexpected native Engram shard shape for {key}: {value.shape}")

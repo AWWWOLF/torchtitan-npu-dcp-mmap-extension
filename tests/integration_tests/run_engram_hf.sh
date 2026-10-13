@@ -14,7 +14,13 @@
   mkdir -p "$2"
   RUN_DIR=$(cd "$2" && pwd)
   export ENGRAM_HF_RUN_DIR="$RUN_DIR"
-  export CLI_OVERRIDES='torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8={"num_max_tokens_per_rank":3072}'
+  ep=4
+  case "${ENGRAM_HF_JOINT_SHARDING:-0}" in
+    0) joint=false ;;
+    1) joint=true; ep=2 ;;
+    *) echo "ENGRAM_HF_JOINT_SHARDING must be 0 or 1" >&2; exit 2 ;;
+  esac
+  export CLI_OVERRIDES="torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8={\"num_max_tokens_per_rank\":3072,\"shard_over_efsdp\":$joint}"
   export NGPU=4 LOG_RANK=0,1,2,3
   export MODULE=torchtitan_npu.models.deepseek_v4_1
   export CONFIG=deepseek_v4_1_debugmodel_text
@@ -35,8 +41,9 @@
     export CKPT_SAVE_LOAD_PATH="$RUN_DIR/$mode/checkpoint"
     bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh \
       --extension.quantization.no-enable-quantized-training \
+      --compile.no-enable \
       --optimizer.name AdamW --training.no-enable-cpu-offload \
-      --parallelism.expert-parallel-degree 4 \
+      --parallelism.expert-parallel-degree "$ep" \
       --parallelism.data-parallel-shard-degree 4 \
       --parallelism.data-parallel-replicate-degree 1 \
       --training.global-batch-size 4 --training.seq-len 512 --training.steps "$steps" \

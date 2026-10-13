@@ -245,7 +245,7 @@ _FUSED_ATTENTION_OVERRIDES = (
 
 def _requested_fused_attention(override) -> tuple[bool, bool]:
     """``(fused core, fused selector)``, as the run's overrides request them."""
-    requested = set(override.imports or ())
+    requested = {entry if isinstance(entry, str) else entry[0] for entry in override.imports or ()}
     core, selector = _FUSED_ATTENTION_OVERRIDES
     return core in requested, selector in requested
 
