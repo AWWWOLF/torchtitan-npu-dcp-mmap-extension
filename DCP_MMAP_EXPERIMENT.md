@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | A：仅 torchtitan-npu 扩展 | GitHub（已推送） | `AWWWOLF/torchtitan-npu-dcp-mmap-extension` | `exp/dcp-mmap-extension-only` | GitCode `cann/torchtitan-npu@5307125a76f9c0c0b9a6fbc33c18cf2de854740e` |
 | A：仅 torchtitan-npu 扩展 | GitCode（待创建） | `ZHANGJIAOGOU/torchtitan-npu-dcp-mmap-extension` | 同上 | 同上 |
-| B：PyTorch 原生能力 | GitHub（仓已创建，分支待推送） | `AWWWOLF/pytorch-dcp-mmap` | `exp/dcp-mmap-upstream` | `pytorch/pytorch@880a5f4f7b005b364a09e3acc658a8450ce4233a` |
+| B：PyTorch 原生能力 | GitHub（已推送，既有个人 fork） | `AWWWOLF/pytorch` | `exp/dcp-mmap-upstream` | `pytorch/pytorch@880a5f4f7b005b364a09e3acc658a8450ce4233a` |
 | B：PyTorch 原生能力 | GitCode（待创建） | `ZHANGJIAOGOU/pytorch-dcp-mmap` | 同上 | 同上 |
 | B：torchtitan-npu 薄适配 | GitHub（已推送） | `AWWWOLF/torchtitan-npu-dcp-mmap-upstream` | `exp/dcp-mmap-upstream-adapter` | GitCode `cann/torchtitan-npu@5307125a76f9c0c0b9a6fbc33c18cf2de854740e` |
 | B：torchtitan-npu 薄适配 | GitCode（待创建） | `ZHANGJIAOGOU/torchtitan-npu-dcp-mmap-upstream` | 同上 | 同上 |
