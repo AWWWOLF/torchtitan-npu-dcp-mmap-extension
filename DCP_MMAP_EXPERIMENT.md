@@ -7,13 +7,13 @@
 | 路线 | 托管 | 仓库 | 分支 | 固定基线 |
 |---|---|---|---|---|
 | A：仅 torchtitan-npu 扩展 | GitHub（已推送） | `AWWWOLF/torchtitan-npu-dcp-mmap-extension` | `exp/dcp-mmap-extension-only` | GitCode `cann/torchtitan-npu@5307125a76f9c0c0b9a6fbc33c18cf2de854740e` |
-| A：仅 torchtitan-npu 扩展 | GitCode（待创建） | `ZHANGJIAOGOU/torchtitan-npu-dcp-mmap-extension` | 同上 | 同上 |
+| A：仅 torchtitan-npu 扩展 | GitCode（已推送，既有个人项目） | `ZHANGJIAOGOU/torchtitan-npu` | 同上 | 同上 |
 | B：PyTorch 原生能力 | GitHub（已推送，既有个人 fork） | `AWWWOLF/pytorch` | `exp/dcp-mmap-upstream` | `pytorch/pytorch@880a5f4f7b005b364a09e3acc658a8450ce4233a` |
 | B：PyTorch 原生能力 | GitCode（待创建） | `ZHANGJIAOGOU/pytorch-dcp-mmap` | 同上 | 同上 |
 | B：torchtitan-npu 薄适配 | GitHub（已推送） | `AWWWOLF/torchtitan-npu-dcp-mmap-upstream` | `exp/dcp-mmap-upstream-adapter` | GitCode `cann/torchtitan-npu@5307125a76f9c0c0b9a6fbc33c18cf2de854740e` |
-| B：torchtitan-npu 薄适配 | GitCode（待创建） | `ZHANGJIAOGOU/torchtitan-npu-dcp-mmap-upstream` | 同上 | 同上 |
+| B：torchtitan-npu 薄适配 | GitCode（已推送，既有个人项目） | `ZHANGJIAOGOU/torchtitan-npu` | 同上 | 同上 |
 
-GitCode 仓尚未创建；当前环境的 GitCode SSH 身份可以访问已有仓库，但服务端拒绝向不存在项目 push，且没有可用 API token。GitHub 的 A 与 B-adapter 已完成分支推送；PyTorch 分支的同步状态见本说明末尾。
+GitCode 的 A 与 B-adapter 已推送到既有 `ZHANGJIAOGOU/torchtitan-npu` 的独立实验分支。PyTorch 的 GitCode 目标仍未创建；当前环境的 GitCode SSH 身份可以访问已有仓库，但服务端拒绝向不存在项目 push，且没有可用 API token。
 
 GitHub 的 `torchtitan-npu/torchtitan-npu` 镜像在整理时位于 `dc3e27c34bc23ef61b130e4e703b115a9c2fa1fe`，与 GitCode 官方仓最新提交不同。为包含已合并的 GitCode !688 并让两托管平台内容一致，两个 torchtitan-npu 实验仓统一固定在 GitCode 基线 `5307125...`。
 
