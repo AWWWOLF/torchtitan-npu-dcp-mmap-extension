@@ -18,7 +18,6 @@ __all__ = ["DispatchHandle", "ElasticBufferHandle"]
 from typing import Any, cast
 
 import torch
-import torch.distributed as dist
 import torch_npu  # noqa: F401 - registers the Ascend device type
 from cann_ops_transformer import ElasticBuffer, EPHandle
 from torch._library.opaque_object import (
@@ -82,7 +81,6 @@ def _dispatch_op_impl(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         num_experts=num_experts,
-        num_max_tokens_per_rank=x.shape[0],
         # In non-cached dispatch, there is no handle with a previously known receive count.
         # ``do_cpu_sync=True`` resets a host-pinned counter to -1; after the NPU
         # finishes computing the number of expert-routed token rows received by
@@ -127,17 +125,19 @@ def _combine_op_impl(
     x: torch.Tensor,
     handle: DispatchHandle,
     num_tokens: int,
+    num_permuted_tokens_src: torch.Tensor,
     buffer: ElasticBufferHandle,
 ) -> torch.Tensor:
-    """Pure-reduction combine; routing scores are applied outside this op."""
+    """Pure-reduction combine; routing scores are applied outside this op.
+
+    ``num_permuted_tokens_src`` has one entry per routed row. It is saved
+    for backward to recover the row count from a dispatch tensor input,
+    avoiding an unbacked size from a recomputed expert intermediate.
+    The combine kernel does not read its values.
+    """
     x = x.contiguous()
     elastic_buffer = buffer.value
     combined, _ = elastic_buffer.combine(x, handle.value, topk_weights=None)
-    # Workaround for a CANN ElasticBuffer combine issue observed with the
-    # dedicated DeepEP communication domain: without a process-group
-    # synchronization, one rank can observe non-finite values from the
-    # combine result, so synchronize once here.
-    dist.barrier(elastic_buffer._group)
     return combined
 
 
@@ -146,6 +146,7 @@ def _combine_fake(
     x: torch.Tensor,
     handle: DispatchHandle,
     num_tokens: int,
+    num_permuted_tokens_src: torch.Tensor,
     buffer: ElasticBufferHandle,
 ):
     # CANN combine permutes the routed tokens back to the original token order,
@@ -176,11 +177,6 @@ def _dispatch_backward_op_impl(
         # The custom-op schema always returns a Tensor for this slot; the
         # autograd wrapper discards it when the forward score output is unused.
         grad_topk_weights = grad_scores.new_empty(topk_idx.shape)
-    # Workaround for a CANN ElasticBuffer combine issue observed with the
-    # dedicated DeepEP communication domain: without a process-group
-    # synchronization, one rank can observe non-finite values from the
-    # combine result, so synchronize once here.
-    dist.barrier(elastic_buffer._group)
     return grad_x, cast("torch.Tensor", grad_topk_weights)
 
 
@@ -285,21 +281,22 @@ def _dispatch_backward(
 
 
 def _combine_setup_context(ctx, inputs, output) -> None:
-    x, handle, _, buffer = inputs
+    _, handle, _, num_permuted_tokens_src, buffer = inputs
     ctx.handle = handle
     ctx.buffer = buffer
-    ctx.num_permuted_tokens = x.shape[0]
+    ctx.save_for_backward(num_permuted_tokens_src)
 
 
 def _combine_backward(ctx, grad_combined):
     """Scatter combined gradients through the cached CANN dispatch path."""
+    (num_permuted_tokens_src,) = ctx.saved_tensors
     grad_x = torch.ops.deepep.combine_backward(
         grad_combined,
         ctx.handle,
-        ctx.num_permuted_tokens,
+        num_permuted_tokens_src.shape[0],
         ctx.buffer,
     )
-    return grad_x, None, None, None
+    return grad_x, None, None, None, None
 
 
 torch.library.register_autograd("deepep::dispatch", _dispatch_backward, setup_context=_dispatch_setup_context)

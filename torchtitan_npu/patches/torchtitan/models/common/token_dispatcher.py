@@ -10,12 +10,11 @@
 
 The TorchTitan revision pinned by ``requirements.txt`` applies scores after
 combine. This patch adds the opt-in score transport needed by standard EP1/EP2
-dispatch while keeping the default path numerically identical. DeepEP keeps
-its pinned dispatch/combine behavior for now, but exposes the same
-``absorb_router_scores`` configuration knob for NPU dispatcher composition;
-score absorption remains disabled by default. HybridEP, MinimalAsyncEP, and
-TorchAO keep their pinned behavior and are not patched here. The dispatcher
-contract follows the upstream design in
+dispatch while keeping the default path numerically identical. DeepEP only
+exposes the same ``absorb_router_scores`` configuration knob here; pre-W2
+absorption is implemented by the NPU dispatcher override. HybridEP,
+MinimalAsyncEP, and TorchAO keep their pinned behavior and are not patched here.
+The dispatcher contract follows the upstream design in
 https://github.com/pytorch/torchtitan/pull/4095.
 """
 
@@ -359,13 +358,7 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
 
 
 class DeepEPTokenDispatcher(TorchTitanDeepEPTokenDispatcher):
-    """DeepEP dispatcher with a forward-compatible absorption config knob.
-
-    DeepEP's score transport is owned by its backend-specific dispatch state,
-    so this patch intentionally does not alter dispatch or combine. The
-    ``absorb_router_scores`` field is exposed for dispatcher config composition
-    and remains disabled by default until DeepEP pre-W2 absorption is wired.
-    """
+    """Expose the absorption setting for backend-specific DeepEP dispatchers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(TorchTitanDeepEPTokenDispatcher.Config):

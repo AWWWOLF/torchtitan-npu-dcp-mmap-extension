@@ -24,7 +24,7 @@ EP 通信域分离只替换 `ep` 轴对应的 process group，其他轴、mesh l
 | --- | --- | --- |
 | `spmd_types` | 注册 sparse mesh 时替换 `ep` 轴；`maybe_set_sparse_mesh()` 继续使用真实 `DeviceMesh` | 返回原 mesh，不创建新 process group |
 | `default` / `full_dtensor` | 通过 `BaseEPTokenDispatcher.wire_meshes()` 将独立 EP mesh 传给 dispatcher | 返回原 mesh，不创建新 process group |
-| DeepEP | 继承上述 dispatcher wiring；按 `ElasticBuffer` 容量配置，显式调用 `get_deepep_group()` | 不创建独立 group |
+| DeepEP | 继承上述 dispatcher wiring；NPU override 显式调用 `get_deepep_group()` 创建专用通信组 | 不创建独立 group |
 
 ## 通信域关系
 
@@ -65,18 +65,22 @@ dispatcher 自己的 EP mesh，不再创建通用的独立 mesh。
 
 ### 3. DeepEP 专用 group
 
-`get_deepep_group()` 为需要按 buffer 容量配置通信组的 NPU DeepEP 调用方提供显式
-接口：
+`get_deepep_group(ep_mesh)` 统一完成校验、缓存查询和专用 HCCL group 创建：
 
-1. 使用 `ElasticBuffer.get_moe_ep_ccl_buffer_size()` 根据 EP world size、
-   `num_max_tokens_per_rank`、hidden dim、expert 数量和 `top_k` 计算容量。
-2. 使用 `ProcessGroupHCCL.Options()` 设置
-   `{"hccl_buffer_size": <capacity_mb>}`。
-3. 通过 `dist.new_group(..., backend="hccl", group_desc="npu_deepep")` 创建
-   HCCL process group。
-4. 按源 EP group 的 `group_name` 缓存 group。后续调用复用同一 group；如果请求的
-   buffer 容量更大，则报错，要求共享同一 EP group 的 dispatcher 使用共同的最大配置。
+1. EP size ≤ 1 时抛出 `ValueError`，不创建通信组。
+2. 按源 EP group 的 `group_name` 缓存，命中即复用；缓存键与 mesh 对象或 ranks 无关。
+3. 未命中时以相同 ranks 创建 group，设置 `group_desc="asc_deepep"` 和
+   `use_local_synchronization=True`，缓存后返回。
+
+通信组使用默认 HCCL 选项，不配置 `hccl_buffer_size`；算子通信 buffer 的创建与复用
+由 NPU dispatcher 中的 `ElasticBuffer` 单独管理。
+
+`ops-transformer` 的 `ElasticBuffer.get_moe_ep_ccl_buffer_size()` 仅返回默认值
+200 MB，不代表 dispatch/combine 实际所需的通信 buffer 大小。实际容量由内部
+`_get_moe_ep_window_bytes()` 根据 EP world size、`num_max_tokens_per_rank`、
+hidden dim、expert 数量和 `top_k` 计算，并由内部运行时申请和注册。
+本仓不调用该私有函数，也不将默认值作为实际容量写入 HCCL 配置。
 
 当前上游 `DeepEPTokenDispatcher` 通过 `BaseEPTokenDispatcher.wire_meshes()` 获取
-独立 EP mesh；`get_deepep_group()` 是按 `ElasticBuffer` 需求创建专用 group 的显式
+独立 EP mesh；`get_deepep_group()` 是为 NPU `ElasticBuffer` 创建专用 group 的显式
 API，不会额外 patch dispatcher 的底层算子。

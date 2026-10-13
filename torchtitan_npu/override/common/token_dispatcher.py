@@ -362,6 +362,7 @@ class DispatchState:
 
     recv_scores: torch.Tensor
     handle: "DispatchHandle"
+    routed_scores_R: torch.Tensor | None = None  # noqa: N815
 
 
 class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
@@ -397,17 +398,10 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         *,
         hidden_dim: int,
         num_max_tokens_per_rank: int,
-        num_experts: int,
         top_k: int,
     ) -> tuple["ElasticBuffer", "ProcessGroup"]:
         """Resolve the DeepEP group and create the process-global buffer."""
-        deepep_group = get_deepep_group(
-            ep_mesh,
-            hidden_dim=hidden_dim,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_experts=num_experts,
-            top_k=top_k,
-        )
+        deepep_group = get_deepep_group(ep_mesh)
 
         if cls._buffer is not None:
             return cls._buffer, deepep_group
@@ -434,7 +428,6 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
             ep_mesh,
             hidden_dim=hidden_dim,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_experts=self.num_experts,
             top_k=self.top_k,
         )
         from torchtitan_npu.ops.ascendc.deepep import ElasticBufferHandle
@@ -473,6 +466,7 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
             DispatchState(
                 recv_scores=recv_scores,
                 handle=handle,
+                routed_scores_R=recv_scores if self.absorb_router_scores else None,
             ),
         )
 
@@ -489,11 +483,15 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         # weighting outside combine so autograd first computes grad(recv_scores);
         # dispatch_backward then passes it to ElasticBuffer.combine(..., topk_weights=...)
         # to recover grad(topk_weights).
-        weighted_states = routed_output_RD * metadata.recv_scores.to(routed_output_RD.dtype).reshape(-1, 1)
+        weighted_states = routed_output_RD
+        if not self.absorb_router_scores:
+            weighted_states = routed_output_RD * metadata.recv_scores.to(routed_output_RD.dtype).reshape(-1, 1)
         combined_TD = torch.ops.deepep.combine(
             weighted_states,
             metadata.handle,
             x_TD.shape[0],
+            # Preserve the dispatch row-count source for compiled backward.
+            metadata.recv_scores,
             self._deepep_buffer_handle,
         )
         return combined_TD

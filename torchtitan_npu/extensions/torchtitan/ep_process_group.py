@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 _EP_MESHES: dict[str, DeviceMesh] = {}
 _SPARSE_MESHES: dict[tuple[str, ...], DeviceMesh] = {}
-_DEEPEP_GROUPS: dict[str, tuple[ProcessGroup, int]] = {}
+_DEEPEP_GROUPS: dict[str, ProcessGroup] = {}
 
 
 def _is_fake_group(group: Any) -> bool:
@@ -140,79 +140,34 @@ def _patch_base_dispatcher_wiring() -> None:
     BaseEPTokenDispatcher.wire_meshes = patched
 
 
-def _create_deepep_group(
-    source_group: ProcessGroup,
-    *,
-    hidden_dim: int,
-    num_max_tokens_per_rank: int,
-    num_experts: int,
-    top_k: int,
-) -> ProcessGroup:
-    """Create a dedicated HCCL group configured for the NPU DeepEP buffer."""
-    import torch_npu
-    from cann_ops_transformer import ElasticBuffer
+def get_deepep_group(ep_mesh: DeviceMesh) -> ProcessGroup:
+    """Return the cached dedicated NPU DeepEP group, creating it if needed."""
+    if ep_mesh.size() <= 1:
+        raise ValueError("NPU DeepEP requires an EP mesh with more than one rank.")
 
+    source_group = ep_mesh.get_group()
     source_key = source_group.group_name
-    ccl_buffer_size_mb = ElasticBuffer.get_moe_ep_ccl_buffer_size(
-        source_group.size(),
-        num_max_tokens_per_rank,
-        hidden_dim,
-        num_experts,
-        top_k,
-    )
     cached = _DEEPEP_GROUPS.get(source_key)
     if cached is not None:
-        cached_group, configured_size_mb = cached
-        if ccl_buffer_size_mb > configured_size_mb:
-            raise RuntimeError(
-                "The cached NPU DeepEP process group buffer is too small: "
-                f"configured={configured_size_mb} MB, required={ccl_buffer_size_mb} MB. "
-                "All dispatchers sharing an EP group must use a common worst-case "
-                "configuration."
-            )
-        return cached_group
+        return cached
 
     ranks = dist.get_process_group_ranks(source_group)
-    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    options.hccl_config = {"hccl_buffer_size": ccl_buffer_size_mb}
     deepep_group = cast(
         "ProcessGroup",
         dist.new_group(
             ranks=ranks,
             backend="hccl",
-            pg_options=options,
-            group_desc="npu_deepep",
+            group_desc="asc_deepep",
             use_local_synchronization=True,
         ),
     )
-    _DEEPEP_GROUPS[source_key] = (deepep_group, ccl_buffer_size_mb)
+    _DEEPEP_GROUPS[source_key] = deepep_group
     logger.info(
-        "Created dedicated NPU DeepEP process group: source=%s deepep=%s hccl_buffer_size=%d MB",
+        "Created dedicated NPU DeepEP process group: source=%s deepep=%s",
         source_key,
         deepep_group.group_name,
-        ccl_buffer_size_mb,
     )
     return deepep_group
-
-
-def get_deepep_group(
-    ep_mesh: DeviceMesh,
-    *,
-    hidden_dim: int,
-    num_max_tokens_per_rank: int,
-    num_experts: int,
-    top_k: int,
-) -> ProcessGroup:
-    """Return the dedicated NPU DeepEP group for an EP mesh."""
-    if ep_mesh.size() <= 1:
-        raise ValueError("NPU DeepEP requires an EP mesh with more than one rank.")
-    return _create_deepep_group(
-        ep_mesh.get_group(),
-        hidden_dim=hidden_dim,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_experts=num_experts,
-        top_k=top_k,
-    )
 
 
 _patch_sparse_mesh_registration()

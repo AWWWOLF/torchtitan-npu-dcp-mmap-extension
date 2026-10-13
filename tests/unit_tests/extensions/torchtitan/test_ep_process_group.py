@@ -156,107 +156,115 @@ def test_ep_mesh_is_created_once_and_group_is_resolved(ep_process_group, monkeyp
 
 
 def test_deepep_group_is_resolved_for_an_ep_mesh(ep_process_group, monkeypatch):
-    source_group = SimpleNamespace(group_name="source", size=lambda: 2)
+    source_group = SimpleNamespace(group_name="source")
     source_mesh = _FakeMesh(source_group)
     dedicated_group = SimpleNamespace(group_name="deepep")
-    calls = []
-
-    def create(group, **kwargs):
-        calls.append((group, kwargs))
-        return dedicated_group
-
-    monkeypatch.setattr(ep_process_group, "_create_deepep_group", create)
-
-    first = ep_process_group.get_deepep_group(
-        source_mesh,
-        hidden_dim=4096,
-        num_max_tokens_per_rank=4096,
-        num_experts=16,
-        top_k=2,
-    )
-    assert first is dedicated_group
-    assert calls == [
-        (
-            source_group,
-            {
-                "hidden_dim": 4096,
-                "num_max_tokens_per_rank": 4096,
-                "num_experts": 16,
-                "top_k": 2,
-            },
-        ),
-    ]
-
-
-def test_deepep_group_requires_multiple_ep_ranks(ep_process_group):
-    source_mesh = _FakeMesh(SimpleNamespace(group_name="ep1"), size=1)
-    with pytest.raises(ValueError, match="more than one rank"):
-        ep_process_group.get_deepep_group(
-            source_mesh,
-            hidden_dim=256,
-            num_max_tokens_per_rank=128,
-            num_experts=4,
-            top_k=1,
-        )
-
-
-def test_deepep_group_creation_is_cached_and_checks_capacity(ep_process_group, monkeypatch):
-    class _Options:
-        def __init__(self):
-            self.hccl_config = None
-
-    class _ProcessGroupHCCL:
-        Options = _Options
-
-    fake_torch_npu = types.SimpleNamespace(
-        _C=types.SimpleNamespace(_distributed_c10d=types.SimpleNamespace(ProcessGroupHCCL=_ProcessGroupHCCL))
-    )
-
-    class _ElasticBuffer:
-        @staticmethod
-        def get_moe_ep_ccl_buffer_size(world_size, capacity, hidden_dim, num_experts, top_k):
-            del world_size, hidden_dim, num_experts, top_k
-            return capacity
-
-    fake_cann_ops_transformer = types.SimpleNamespace(ElasticBuffer=_ElasticBuffer)
-    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
-    monkeypatch.setitem(sys.modules, "cann_ops_transformer", fake_cann_ops_transformer)
-    monkeypatch.setattr(ep_process_group.dist, "get_process_group_ranks", lambda group: [0, 1])
+    expected_groups = {"source": dedicated_group}
+    resolved = []
     created = []
+
+    def get_ranks(group):
+        resolved.append(group)
+        return [2, 5]
 
     def new_group(**kwargs):
         created.append(kwargs)
-        return SimpleNamespace(group_name="deepep")
+        return dedicated_group
 
+    monkeypatch.setattr(ep_process_group.dist, "get_process_group_ranks", get_ranks)
     monkeypatch.setattr(ep_process_group.dist, "new_group", new_group)
-    source_group = SimpleNamespace(group_name="source", size=lambda: 2)
 
-    first = ep_process_group._create_deepep_group(
-        source_group,
-        hidden_dim=256,
-        num_max_tokens_per_rank=1024,
-        num_experts=16,
-        top_k=2,
-    )
-    second = ep_process_group._create_deepep_group(
-        source_group,
-        hidden_dim=256,
-        num_max_tokens_per_rank=512,
-        num_experts=16,
-        top_k=2,
-    )
+    group = ep_process_group.get_deepep_group(source_mesh)
 
-    assert first is second
+    assert group is dedicated_group
+    assert resolved == [source_group]
+    assert created == [
+        {
+            "ranks": [2, 5],
+            "backend": "hccl",
+            "group_desc": "asc_deepep",
+            "use_local_synchronization": True,
+        },
+    ]
+    assert expected_groups == ep_process_group._DEEPEP_GROUPS
+
+
+def test_deepep_group_requires_multiple_ep_ranks(ep_process_group, monkeypatch):
+    source_mesh = _FakeMesh(SimpleNamespace(group_name="ep1"), size=1)
+    calls = []
+
+    def get_group():
+        calls.append("get_group")
+        return source_mesh._group
+
+    def new_group(**kwargs):
+        calls.append("new_group")
+
+    monkeypatch.setattr(source_mesh, "get_group", get_group)
+    monkeypatch.setattr(ep_process_group.dist, "new_group", new_group)
+
+    with pytest.raises(ValueError, match="more than one rank"):
+        ep_process_group.get_deepep_group(source_mesh)
+
+    assert calls == []
+    assert ep_process_group._DEEPEP_GROUPS == {}
+
+
+def test_deepep_group_is_cached_by_source_group_name(ep_process_group, monkeypatch):
+    source_group = SimpleNamespace(group_name="source")
+    dedicated_group = SimpleNamespace(group_name="deepep")
+    expected_groups = {"source": dedicated_group}
+    resolved = []
+    created = []
+
+    def get_ranks(group):
+        resolved.append(group)
+        return [0, 1]
+
+    def new_group(**kwargs):
+        created.append(kwargs)
+        return dedicated_group
+
+    monkeypatch.setattr(ep_process_group.dist, "get_process_group_ranks", get_ranks)
+    monkeypatch.setattr(ep_process_group.dist, "new_group", new_group)
+    source_mesh = _FakeMesh(source_group)
+
+    first = ep_process_group.get_deepep_group(source_mesh)
+    second = ep_process_group.get_deepep_group(source_mesh)
+    third = ep_process_group.get_deepep_group(_FakeMesh(SimpleNamespace(group_name="source")))
+
+    assert first is second is third is dedicated_group
+    assert resolved == [source_group]
     assert len(created) == 1
-    assert created[0]["pg_options"].hccl_config == {"hccl_buffer_size": 1024}
-    with pytest.raises(RuntimeError, match="buffer is too small"):
-        ep_process_group._create_deepep_group(
-            source_group,
-            hidden_dim=256,
-            num_max_tokens_per_rank=2048,
-            num_experts=16,
-            top_k=2,
-        )
+    assert expected_groups == ep_process_group._DEEPEP_GROUPS
+
+
+def test_deepep_groups_are_separate_for_distinct_source_groups(ep_process_group, monkeypatch):
+    source_groups = [SimpleNamespace(group_name="source-a"), SimpleNamespace(group_name="source-b")]
+    resolved = []
+    created = []
+
+    def get_ranks(group):
+        resolved.append(group)
+        return [0, 1]
+
+    def new_group(**kwargs):
+        dedicated_group = SimpleNamespace(group_name=f"deepep-{len(created)}")
+        created.append(dedicated_group)
+        return dedicated_group
+
+    monkeypatch.setattr(ep_process_group.dist, "get_process_group_ranks", get_ranks)
+    monkeypatch.setattr(ep_process_group.dist, "new_group", new_group)
+
+    first = ep_process_group.get_deepep_group(_FakeMesh(source_groups[0]))
+    second = ep_process_group.get_deepep_group(_FakeMesh(source_groups[1]))
+    expected_groups = {"source-a": created[0], "source-b": created[1]}
+
+    assert first is created[0]
+    assert second is created[1]
+    assert first is not second
+    assert resolved == source_groups
+    assert expected_groups == ep_process_group._DEEPEP_GROUPS
 
 
 def test_dedicated_mesh_is_not_recursively_recreated(ep_process_group, monkeypatch):
