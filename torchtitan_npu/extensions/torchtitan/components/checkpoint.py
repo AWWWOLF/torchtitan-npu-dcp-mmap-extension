@@ -5,9 +5,11 @@
 
 """Checkpoint manager extension with NPU-aware save and hash verification."""
 
+import os
+
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -15,12 +17,17 @@ import torchtitan.components.checkpoint
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torchtitan.components.checkpoint import (
     AsyncMode,
+    MODEL,
 )
 from torchtitan.components.checkpoint import (
     CheckpointManager as _CheckpointManager,
 )
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.utils import GarbageCollection
+
+from torchtitan_npu.extensions.torchtitan.components.dcp_mmap_reader import (
+    MmapFileSystemReader,
+)
 
 from torchtitan_npu.extensions.components.validation import (
     mark_checkpoint_manifest_pending,
@@ -32,6 +39,8 @@ from torchtitan_npu.extensions.components.validation import (
 @dataclass(kw_only=True, slots=True)
 class CheckpointExtensions:
     verify_hash_manifest: bool = False
+    dcp_read_mode: Literal["default", "mmap"] = "default"
+    """Local DCP tensor read mode. ``mmap`` is experimental and opt-in."""
     """
     ``verify_hash_manifest`` enables per-file SHA-256 integrity verification.
     On save, a ``_checkpoint_hash_manifest.json`` is written containing the
@@ -66,6 +75,9 @@ class CheckpointManager(_CheckpointManager):
             )
 
         self.verify_hash_manifest = config.extensions.verify_hash_manifest
+        self.dcp_read_mode = config.extensions.dcp_read_mode
+        if self.dcp_read_mode not in ("default", "mmap"):
+            raise ValueError(f"invalid dcp_read_mode: {self.dcp_read_mode!r}")
         super().__init__(config=config, **kwargs)
 
     @torch.no_grad()
@@ -114,12 +126,19 @@ class CheckpointManager(_CheckpointManager):
         if self.verify_hash_manifest:
             verify_checkpoint_manifest(checkpoint_id)
 
-        return super().dcp_load(
+        is_local_dcp = not from_hf and "://" not in os.fspath(checkpoint_id)
+        if self.dcp_read_mode == "default" or not is_local_dcp:
+            return super().dcp_load(
+                state_dict, checkpoint_id, from_hf, from_quantized
+            )
+
+        dcp.load(
             state_dict,
-            checkpoint_id,
-            from_hf,
-            from_quantized,
+            storage_reader=MmapFileSystemReader(checkpoint_id),
         )
+        if MODEL in self.states:
+            self.states[MODEL].load_state_dict(state_dict)
+        return None
 
 
 torchtitan.components.checkpoint.CheckpointManager = CheckpointManager
