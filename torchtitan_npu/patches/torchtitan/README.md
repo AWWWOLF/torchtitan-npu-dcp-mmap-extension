@@ -26,7 +26,7 @@
   ```
 
 - 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR." 结尾。
-- 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`、`LoggedAuxLoss`、`VarlenCPMetadata`）不需要 `apply()`。
+- 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`、`AuxLoss`、`VarlenCPMetadata`）不需要 `apply()`。
 
 校验（除 `__init__.py` 等包胶水文件外，每个补丁文件都应命中）：
 
@@ -39,7 +39,7 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | --- | --- |
 | [#3430](https://github.com/pytorch/torchtitan/pull/3430) | 为变长注意力补充 CP 和 Full DTensor 支持 |
 | [#3634](https://github.com/pytorch/torchtitan/pull/3634) | 补充 DeepSeek-V4 所需的公共组件及训练接入 |
-| [#3864](https://github.com/pytorch/torchtitan/pull/3864) | 为 torchtitan 补充 LoggedAuxLoss 辅助损失框架 |
+| [#3864](https://github.com/pytorch/torchtitan/pull/3864) | 为 torchtitan 补充 AuxLoss 辅助损失框架 |
 | [#4474](https://github.com/pytorch/torchtitan/pull/4474) | 补齐部分初始化的 optimizer state，支持完整 checkpoint 恢复 |
 | [#3985](https://github.com/pytorch/torchtitan/pull/3985) | 为 Trainer 补充 EMA 权重维护及 checkpoint 集成 |
 | [#4411](https://github.com/pytorch/torchtitan/pull/4411) | 为 DistMuon 补充 HSDP replica compute 去重 |

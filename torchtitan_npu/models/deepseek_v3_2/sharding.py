@@ -115,7 +115,7 @@ def _apply_v3_2_attention_sharding(
         attention.inner_attention.indexer_loss  # pyrefly: ignore [missing-attribute]
     )
     indexer_loss_cfg.sharding_config = ShardingConfig(
-        state_shardings={"_acc": dense_param_placement(tp=spmd.I)},
+        state_shardings={"instance_acc": dense_param_placement(tp=spmd.I)},
         in_src_shardings={
             "q_BLNH": dense_activation_placement(tp=spmd.S(2)),
             "k_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.R),

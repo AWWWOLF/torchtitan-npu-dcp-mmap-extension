@@ -133,16 +133,18 @@ with patch.object(module.FaultTolerantTrainer, '__init__', initialize_once), \\
         recovery.assert_not_called()
 
 class AuxiliaryLoss(torch.nn.Module):
-    _step_acc = {'loss': 3.0}
+    # The production aux-loss state: a per-instance accumulator buffer and the
+    # per-group step registers the optimizer pre-hook fills.
+    group_acc = {'loss': 3.0}
 
     def __init__(self):
         super().__init__()
-        self.register_buffer('_acc', torch.tensor(3.0), persistent=False)
+        self.register_buffer('instance_acc', torch.tensor(3.0), persistent=False)
 
 auxiliary = AuxiliaryLoss()
 module.FaultTolerantTrainerEx._reset_auxiliary_state(Mock(model_parts=[auxiliary]))
-assert auxiliary._acc.item() == 0
-assert AuxiliaryLoss._step_acc == {}
+assert auxiliary.instance_acc.item() == 0
+assert AuxiliaryLoss.group_acc == {}
 """
     result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr

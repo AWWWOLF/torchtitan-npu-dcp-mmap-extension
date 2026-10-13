@@ -91,8 +91,8 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
         # Inspect that state without coupling recovery to a model's patch class.
         for part in self.model_parts:
             for module in part.modules():
-                accumulator = module._buffers.get("_acc")
-                step_metrics = getattr(type(module), "_step_acc", None)
+                accumulator = module._buffers.get("instance_acc")
+                step_metrics = getattr(type(module), "group_acc", None)
                 if isinstance(accumulator, torch.Tensor) and isinstance(step_metrics, dict):
                     accumulator.zero_()
                     step_metrics.clear()

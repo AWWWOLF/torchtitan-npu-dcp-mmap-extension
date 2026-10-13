@@ -88,7 +88,7 @@ class AnticipatoryTrainingEngine:
 
     @contextmanager
     def _isolated_forward(self):
-        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import LoggedAuxLoss
+        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
         trainer = self.trainer
         # Save registered buffers, including model-specific forward statistics.
@@ -100,7 +100,7 @@ class AnticipatoryTrainingEngine:
             for name, value in m._buffers.items()
             if value is not None
         ]
-        aux = copy.deepcopy(LoggedAuxLoss._step_acc)
+        aux = copy.deepcopy(AuxLoss.group_acc)
         tokens = trainer.ntokens_seen
         python_rng, numpy_rng = random.getstate(), np.random.get_state()
         devices = [] if self.device.type == "cpu" else [self.device.index or 0]
@@ -112,8 +112,8 @@ class AnticipatoryTrainingEngine:
                 for module, name, original, before in buffers:
                     original.copy_(before)
                     module._buffers[name] = original
-            LoggedAuxLoss._step_acc.clear()
-            LoggedAuxLoss._step_acc.update(aux)
+            AuxLoss.group_acc.clear()
+            AuxLoss.group_acc.update(aux)
             trainer.ntokens_seen = tokens
             random.setstate(python_rng)
             np.random.set_state(numpy_rng)
@@ -211,7 +211,7 @@ class AnticipatoryTrainingEngine:
     def _reset_transient_training_state(self):
         from torchtitan.models.common.moe import MoE
 
-        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import LoggedAuxLoss
+        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
         # Ascend uses the eager gradient lifecycle here; no CUDA graph storage must be preserved.
         self.trainer.optimizers.zero_grad(set_to_none=True)
@@ -220,9 +220,9 @@ class AnticipatoryTrainingEngine:
                 for module in part.modules():
                     if isinstance(module, MoE):
                         module.tokens_per_expert_E.zero_()
-                    if isinstance(module, LoggedAuxLoss):
-                        module._acc.zero_()
-        LoggedAuxLoss._step_acc.clear()
+                    if isinstance(module, AuxLoss):
+                        module.instance_acc.zero_()
+        AuxLoss.group_acc.clear()
         self.last_global_loss = None
         self._step_loss_sum = None
         self._reset_fsdp()

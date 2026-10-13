@@ -23,6 +23,7 @@ from torchtitan.trainer import Trainer
 
 from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
 from torchtitan_npu.patches.torchtitan.components.ema import EMAOptimizersContainer
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 logger = logging.getLogger(__name__)
 
@@ -129,13 +130,32 @@ def patched_pp_forward_backward_step(self, *args, **kwargs):
             del schedule.step
 
 
-# Backport TorchTitan #4421 only for DataLoader batch H2D copies.
-def patch_async_h2d() -> None:
+# Backport TorchTitan #4421 for the DataLoader batch H2D copies, plus the
+# aux-loss denominator of #3864: both land in the same method.
+def patch_train_step() -> None:
     src = textwrap.dedent(inspect.getsource(Trainer.train_step))
     assert src.count("value.to(self.device)") == src.count("labels.to(self.device)") == 1
     src = src.replace("value.to(self.device)", "value.to(self.device, non_blocking=True)")
     src = src.replace("labels.to(self.device)", "labels.to(self.device, non_blocking=True)")
+
+    # Auxiliary losses normalize by the same per-step token count as the main
+    # loss, so their scale is independent of parallelism degrees.  The token
+    # count is a local of this method, so the call is inserted into its source,
+    # right after the last branch that assigns it.
+    # ``textwrap.dedent`` strips the method's own indentation, so the body sits at four spaces.
+    anchor = "    # Process each gradient accumulation step, then free its inputs."
+    assert src.count(anchor) == 1
+    # The inserted statement must sit at the *anchor's own* indentation: a comment line does not
+    # close the preceding suite, so a deeper insertion silently becomes that suite's last statement
+    # -- which is how this call once ended up inside the ``else:`` branch of the dp check and never
+    # ran when data parallelism was enabled.
+    indent = " " * (len(anchor) - len(anchor.lstrip()))
+    statement = f"{indent}AuxLoss.set_step_denominator(global_valid_tokens)"
+    src = src.replace(anchor, f"{statement}\n\n{anchor}")
+    assert f"\n{statement}\n" in src
+
     scope = dict(Trainer.train_step.__globals__)
+    scope["AuxLoss"] = AuxLoss
     exec(src, scope)
     Trainer.train_step = scope["train_step"]
 
@@ -162,8 +182,8 @@ class EMATrainer(Trainer):
 def apply() -> None:
     logger.info("[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process")
     Trainer.post_dataloading_process = patched_post_dataloading_process
-    logger.info("[PATCH] Trainer.train_step -> async H2D source rewrite (upstream #4421)")
-    patch_async_h2d()
+    logger.info("[PATCH] Trainer.train_step -> async H2D and aux-loss denominator (upstream #4421, #3864)")
+    patch_train_step()
     logger.info("[PATCH] Trainer.pp_forward_backward_step -> patched_pp_forward_backward_step")
     Trainer.pp_forward_backward_step = patched_pp_forward_backward_step
     torchtitan.trainer.Trainer = EMATrainer

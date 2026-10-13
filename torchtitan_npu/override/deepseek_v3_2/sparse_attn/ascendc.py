@@ -26,6 +26,7 @@ from torchtitan_npu.models.deepseek_v3_2.model import (
     SparseIndexerLoss,
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 @spmd.register_autograd_function
@@ -46,7 +47,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         k_rope_T1H,
         actual_seq_qlen,
         actual_seq_klen,
-        coeff,
         acc_buffer,
     ):
         ctx.save_for_backward(
@@ -64,7 +64,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         ctx.scale_value = scale_value
         ctx.actual_seq_qlen = actual_seq_qlen
         ctx.actual_seq_klen = actual_seq_klen
-        ctx.coeff = coeff
         ctx.acc_buffer = acc_buffer
         return torch.zeros((), device=q_nope_TNH.device, dtype=torch.float32)
 
@@ -83,7 +82,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         k_rope_T1H,
         actual_seq_qlen,
         actual_seq_klen,
-        coeff,
         acc_buffer,
     ):
         return _AscSparseIndexerLossFunc.apply(
@@ -100,7 +98,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
             k_rope_T1H,
             actual_seq_qlen,
             actual_seq_klen,
-            coeff,
             acc_buffer,
         )
 
@@ -137,12 +134,19 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
             sparse_mode=3,
         )
 
-        # Convert summed KL outputs using coeff / (tokens * global batch size).
+        # ``grad_scale`` arrives from ``AuxLoss.inject`` and already carries
+        # ``coeff / global_valid_tokens`` -- one factor for the coefficient and one
+        # for the step's token count, the denominator the main loss uses.
         d_q_idx = d_q_idx * grad_scale
         d_k_idx = d_k_idx * grad_scale
         d_w = d_w * grad_scale
 
-        ctx.acc_buffer.add_(loss.squeeze() * grad_scale / ctx.coeff)
+        # The kernel answers with the summed KL only on the backward, so the metric
+        # is accumulated here; ``inject``'s forward accumulation adds the zero
+        # placeholder it was handed.
+        denominator = AuxLoss._step_denominator
+        assert denominator is not None, "AuxLoss.set_step_denominator() must be called"
+        ctx.acc_buffer.add_(loss.squeeze() / denominator)
 
         return (
             None,
@@ -203,11 +207,11 @@ class AscSparseIndexerLoss(SparseIndexerLoss):
             k_rope_T1H,
             actual_seq_qlen,
             actual_seq_klen,
-            self.coeff,
-            self._acc,
+            self.instance_acc,
         )
-        # Normalize the summed KL value before logging.
-        return self.inject(carrier, dummy / q_nope_TNH.shape[0])
+        # ``AuxLoss`` owns the per-step normalization: the summed KL goes in raw,
+        # and the coefficient and the global valid-token count are applied inside.
+        return self.inject(dummy, carrier=carrier)
 
 
 class AscSparseInnerAttention(VarlenAttention):

@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
+import torch
+
 from tests.unit_tests.models.mtp_test_utils import (
     BATCH_SIZE,
     SEQ_LEN,
@@ -20,6 +23,7 @@ from torchtitan_npu.models.deepseek_v3_2 import (
     _build_dsv3_2_layers,
     _build_mtp_layers,
 )
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 def _build_rope_config() -> ComplexRoPE.Config:
@@ -58,9 +62,6 @@ def _build_model_config():
         index_head_dim=8,
         index_topk=4,
     )
-    layers[0].attention.inner_attention.indexer_loss.global_batch_size = (
-        BATCH_SIZE
-    )
     return DeepSeekV32Model.Config(
         vocab_size=VOCAB_SIZE,
         dim=dim,
@@ -76,6 +77,14 @@ def _build_model_config():
         layers=layers,
         mtp_layers=_build_mtp_layers(layers[-1], dim=dim, num_mtp_layers=1),
     )
+
+
+@pytest.fixture(autouse=True)
+def _step_denominator():
+    """The trainer sets the step's global valid-token count; the indexer loss normalizes by it."""
+    AuxLoss.set_step_denominator(torch.tensor(BATCH_SIZE * SEQ_LEN, dtype=torch.float32))
+    yield
+    AuxLoss._step_denominator = None
 
 
 def test_deepseek_v32_mtp_model_supports_packed_sequences():

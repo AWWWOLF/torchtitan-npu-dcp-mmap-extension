@@ -4,9 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from contextlib import contextmanager
-from unittest.mock import Mock, patch
-
 import torch
 
 BATCH_SIZE = 1
@@ -16,24 +13,10 @@ _DOCUMENT_LEN = SEQ_LEN // 2
 PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMENT_LEN)]).unsqueeze(0)
 
 
-@contextmanager
-def _single_process_parallel_dims():
-    mesh = Mock()
-    mesh.size.return_value = 1
-    parallel_dims = Mock()
-    parallel_dims.get_optional_mesh.return_value = mesh
-    with patch(
-        "torchtitan_npu.patches.torchtitan.models.common.aux_loss.ParallelDims.get",
-        return_value=parallel_dims,
-    ):
-        yield
-
-
 def build_cpu_model(config):
     torch.manual_seed(42)
-    with _single_process_parallel_dims():
-        model = config.build()
-        model.init_states(buffer_device=torch.device("cpu"))
+    model = config.build()
+    model.init_states(buffer_device=torch.device("cpu"))
     return model.train()
 
 

@@ -28,7 +28,7 @@ from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import LoggedAuxLoss
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 
@@ -171,7 +171,24 @@ def _build_selected_bm(
     )
 
 
-class SparseIndexerLoss(LoggedAuxLoss):
+# The reference indexer loss guards two different spaces, and they cannot share one constant:
+#
+# * ``_MASKED_LOGIT`` lives in *logit* space: it stands in for ``-inf`` on a slot the selection left
+#   unused, so both softmaxes stay finite and the masked slot gets exactly zero mass instead of
+#   producing ``0 * -inf = NaN`` (which ``torch.where`` would carry through the unselected branch's
+#   backward).  It has to stay far below every real logit at all times, which is why it is enormous
+#   rather than the logarithm of some small probability.
+# * ``_MIN_TEACHER_MASS`` lives in *probability* space: the masked slot's mass is exactly zero, and
+#   the teacher's own ``log`` would be ``-inf`` there.  Its weight is zero too, so the value only
+#   has to be finite.
+#
+# Deriving one from the other would tie the mask's depth to the log guard (``log(1e-30) == -69`` is
+# not below a logit of, say, ``-100``), so they stay separate.
+_MASKED_LOGIT = -1e30
+_MIN_TEACHER_MASS = 1e-30
+
+
+class SparseIndexerLoss(AuxLoss):
     """Indexer alignment loss with gradient injection.
 
     Only top-k Q/K pairs are gathered, avoiding a dense
@@ -179,9 +196,11 @@ class SparseIndexerLoss(LoggedAuxLoss):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(LoggedAuxLoss.Config):
+    class Config(AuxLoss.Config):
         coeff: float = 1.0
-        pass
+        # The indexer loss is additive over tokens, so ranks contribute distinct
+        # data: reduce over the loss mesh (dp+cp), not only the batch mesh.
+        reduce_mesh: str = "loss"
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -196,25 +215,40 @@ class SparseIndexerLoss(LoggedAuxLoss):
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
-        B, _Lq, _K = topk_indices_BLqK.shape
+        # A slot the selection left unused is masked out of both distributions with a large finite
+        # negative rather than ``-inf``: ``0 * -inf`` is NaN, and ``torch.where`` would carry that
+        # NaN through the unselected branch's backward.
+        valid_BLqK = topk_indices_BLqK >= 0
+        slots_BLqK = topk_indices_BLqK.clamp(min=0)
 
+        # Teacher: the attention's own distribution over the selected slots, taken as
+        # log-probabilities of the same logits -- not ``log(softmax(...))``, which underflows to
+        # ``-inf`` exactly where the student is peaked.  It is constant with respect to the indexer:
+        # the caller hands over detached q/k and the gradient arrives through ``carrier``.  This
+        # model has no window and no sink, so the selection is the whole support, every head's mass
+        # is one, and the teacher is the head-averaged softmax.
         k_sqz = k_BL1H.float().squeeze(2)
-        b_idx = torch.arange(B, device=topk_indices_BLqK.device)[:, None, None]
-        k_gathered = k_sqz[b_idx, topk_indices_BLqK.clamp(min=0)]
+        batch_idx = torch.arange(q_BLNH.size(0), device=slots_BLqK.device)[:, None, None]
+        k_gathered = k_sqz[batch_idx, slots_BLqK]
+        teacher_logits = torch.einsum("blhd,blkd->blhk", q_BLNH.float(), k_gathered).mul(scale)
+        teacher_logits = teacher_logits.masked_fill(~valid_BLqK.unsqueeze(2), _MASKED_LOGIT)
+        teacher = F.log_softmax(teacher_logits, dim=-1).exp().mean(dim=2)
 
-        logits = torch.einsum("blhd,blkd->blhk", q_BLNH.float(), k_gathered)
-        logits = logits * scale
-        logits = logits.masked_fill((topk_indices_BLqK < 0).unsqueeze(2), float("-inf"))
-        p = F.softmax(logits, dim=-1).mean(dim=2)
+        # Student: the indexer's log-probabilities over the same slots under the same mask, so its
+        # softmax normalizes exactly where the operator's does.  No epsilon or clamp appears on this
+        # path, so autograd yields the operator's ``Y - teacher`` exactly, saturated slots included.
+        student_logits = index_scores_BLqLkv.float().gather(-1, slots_BLqK)
+        student_logits = student_logits.masked_fill(~valid_BLqK, _MASKED_LOGIT)
+        log_student = F.log_softmax(student_logits, dim=-1)
 
-        scores_BLqK = index_scores_BLqLkv.gather(-1, topk_indices_BLqK.clamp(min=0))
-        scores_BLqK = scores_BLqK.masked_fill(topk_indices_BLqK < 0, float("-inf"))
-        q_pred = F.softmax(scores_BLqK, dim=-1)
-
-        # Use the same epsilon as the fused NPU loss kernel for parity.
-        eps = 1e-8
-        kl_loss = (p * ((p + eps).log() - (q_pred + eps).log())).sum(dim=-1).mean()
-        return self.inject(carrier, kl_loss)
+        # ``teacher * (log teacher - log student)`` is the teacher-weighted KL, summed over this
+        # microbatch's query rows.  The clamp only guards a mass that fp32 could underflow to zero;
+        # a row whose every slot is unused is uniform on both sides and contributes exactly zero.
+        kl = (teacher * (teacher.clamp_min(_MIN_TEACHER_MASS).log() - log_student)).sum(dim=-1)
+        # ``AuxLoss`` normalizes by the step's global valid-token count, the same denominator the
+        # main loss uses, so what is handed over is that sum rather than a mean already divided by
+        # the row count.
+        return self.inject(kl.sum(), carrier=carrier)
 
 
 class SparseInnerAttention(FlexAttention):

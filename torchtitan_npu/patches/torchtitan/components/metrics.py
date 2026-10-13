@@ -24,7 +24,7 @@ original_log = MetricsProcessor.log
 @functools.wraps(original_log)
 def patched_log(self, step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
     """Add auxiliary losses to step metrics and structured logs."""
-    aux_metrics = collect_aux_loss_metrics(self.model_parts, self.parallel_dims)
+    aux_metrics = collect_aux_loss_metrics(self.parallel_dims)
     original_log(
         self,
         step,
