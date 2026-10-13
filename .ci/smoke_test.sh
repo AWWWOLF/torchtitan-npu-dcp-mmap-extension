@@ -26,7 +26,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 SMOKE_DESELECT=(
     --deselect tests/smoke_tests/ops/test_mhc_triton.py
     --deselect tests/smoke_tests/ops/test_qwen3_5_npu_runtime.py::test_merged_gdn_forward_backward
-    --deselect tests/smoke_tests/sdc/test_sdc.py::test_three_gradient_strikes_activate_checksum_without_recompiling
+    --deselect tests/smoke_tests/sdc/test_sdc_smoke.py::test_three_gradient_strikes_activate_checksum_without_recompiling
 )
 
 SMOKE_TESTS_START="$(date +%s)"

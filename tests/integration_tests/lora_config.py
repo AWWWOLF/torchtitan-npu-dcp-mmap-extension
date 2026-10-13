@@ -15,7 +15,7 @@ from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
 from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter
 from torchtitan.distributed.flex_shard.dist_muon import DistMuon

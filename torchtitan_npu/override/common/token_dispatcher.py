@@ -51,7 +51,7 @@ from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_spars
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.token_dispatcher import BaseEPTokenDispatcher
 
-from torchtitan_npu.extensions.ep_process_group import get_deepep_group
+from torchtitan_npu.extensions.torchtitan.ep_process_group import get_deepep_group
 from torchtitan_npu.ops.ascendc.moe_re_routing import npu_moe_re_routing
 from torchtitan_npu.ops.ascendc.moe_token_unpermute import npu_moe_token_unpermute
 from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import (

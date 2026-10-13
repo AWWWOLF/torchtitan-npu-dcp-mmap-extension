@@ -50,7 +50,7 @@ def _make_checkpoint_fixture(tmp_path, save_training_state, checkpoint_format, w
         model = Model()
         if wrapper_scope == "block-fp8":
             pytest.importorskip("torchao_npu")
-            from interfaces.torchao_converter import _block_fp8_param_swap
+            from torchtitan_npu.extensions.adaptor.torchao.converter import _block_fp8_param_swap
             from torchao_npu.wrapper_tensors.block_mx_wrapper_tensor import BlockMXTrainingWeightWrapperTensor
 
             policy = _block_fp8_param_swap()

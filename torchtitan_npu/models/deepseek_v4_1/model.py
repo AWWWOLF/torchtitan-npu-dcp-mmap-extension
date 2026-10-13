@@ -819,7 +819,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         """
         from torchtitan.config import TORCH_DTYPE_MAP
 
-        from torchtitan_npu.extensions.distributed.fsdp import apply_fsdp_to_vision_encoder
+        from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_vision_encoder
 
         apply_fsdp_to_vision_encoder(
             self.vision_encoder,

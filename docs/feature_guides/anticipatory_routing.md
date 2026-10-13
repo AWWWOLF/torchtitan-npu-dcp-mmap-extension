@@ -157,7 +157,7 @@ engine 在初始化时包装当前 checkpointer 实例的 `save()`。恢复阶�
 
 | 路径                                                         | 职责                                                                                 |
 | ------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| `torchtitan_npu/extensions/trainer.py`                       | 配置接入、一次初始化及训练上下文编排。                                               |
+| `torchtitan_npu/extensions/torchtitan/trainer.py`            | 配置接入、一次初始化及训练上下文编排。                                               |
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/config.py`   | 声明恢复配置、参数范围及配置兼容性校验。                                                             |
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/engine.py`   | 组件初始化、loss 汇总、仅前向隔离、checkpoint 选择及恢复、保存保护。 |
 | `torchtitan_npu/extensions/experiment/anticipatory_routing/schedule.py` | 管理 FIFO 队列、阶段转换、训练数据供应及 spike 响应。                                |
@@ -180,7 +180,7 @@ engine 在初始化时包装当前 checkpointer 实例的 `save()`。恢复阶�
 `tests/unit_tests/extensions/experiment/anticipatory_routing/test_detector.py` 覆盖持续水平漂移、恒定 loss 后的微小噪声、
 跨回滚及 ACTIVE/DRAIN 更新的冷却计数、非有限阈值校验、零回滚预算的 checkpoint 校验、PP 拒绝和 ID 存储类型边界。
 
-`tests/smoke_tests/anticipatory_routing/test_anticipatory_routing.py` 使用小型 NPU 路由模型和上游训练步，覆盖以下场景：
+`tests/smoke_tests/anticipatory_routing/test_anticipatory_routing_smoke.py` 使用小型 NPU 路由模型和上游训练步，覆盖以下场景：
 
 - 一次性扰动 labels 引起真实 loss 升高，由自动检测器识别 spike 并触发回滚。
 - 选择并加载磁盘 DCP checkpoint，恢复模型、optimizer、LR scheduler、训练进度及 dataloader 状态。

@@ -199,7 +199,7 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 量化入口根据模型类型选择匹配规则，通过 converter 转换模型配置节点，并在模块构建时应用 TorchAO-NPU 量化。本文依据当前配置、转换逻辑和启动脚本整理，未在本文档重构中执行 NPU 训练；不同并行配置的精度与性能需在目标环境中验证。
 
 - [量化配置字段](../../torchtitan_npu/config/configs.py)
-- [TorchAO-NPU converter 与 recipe](../../interfaces/torchao_converter.py)
+- [TorchAO-NPU converter 与 recipe](../../torchtitan_npu/extensions/adaptor/torchao/converter.py)
 - [Block FP8 权重与 FSDP 预量化实现](../../experiments/torchao-npu/torchao_npu/wrapper_tensors/block_mx_wrapper_tensor.py)
 - [V4.1 Lightning Indexer 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/v41_lightning_indexer.py)
 - [V4.1 稀疏 attention 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/v41_sparse_attention.py)

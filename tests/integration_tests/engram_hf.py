@@ -17,7 +17,7 @@ from torchtitan.train import main
 
 import torchtitan_npu  # noqa: F401
 from tests.integration_tests import OverrideDefinitions
-from torchtitan_npu.extensions.components.checkpoint import CheckpointManager
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 
 _save = CheckpointManager.dcp_save
 _load = CheckpointManager.dcp_load

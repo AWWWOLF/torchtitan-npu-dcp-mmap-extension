@@ -20,16 +20,16 @@
 ## 插件仓专属原则
 
 1. **不修改上游 checkout。** torchtitan-npu 不直接编辑 torchtitan 源码。适配按职责放入以下位置：
-   - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或替换当前运行时中缺失的 Python/CANN 符号。`patches/torchtitan/` 只允许有上游依据的临时 patch；`patches/torch_npu/` 和 `patches/workaround/` 用于当前有效的 NPU runtime compatibility patch
+   - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或替换当前运行时中缺失的 Python/CANN 符号。`patches/torchtitan/` 只允许有上游依据的临时 patch；`patches/torch_npu/` 用于当前有效的 NPU runtime compatibility patch
    - **配置级 override**（`torchtitan_npu/override/`）：使用 `@override` 声明组件替换，通过 `override.imports` 显式启用
    - **模型模块**（`torchtitan_npu/models/`）：提供 DeepSeek-V3.2 和 DeepSeek-V4 的模型配置、并行化与 checkpoint 适配
    - **NPU 算子**（`torchtitan_npu/ops/`）：封装 CANN 或设备专属算子能力
 
-2. **理解 patch 生效机制。** `torchtitan_npu/__init__.py` 导入 `torchtitan_npu.patches`，后者继续导入 `torch_npu`、`torchtitan` 和 `workaround` 子包，因此导入 `torchtitan_npu` 即会注册或应用其中的入口 patch。只有需要随包导入生效的 patch 才应加入对应的 `__init__.py`；供模型或 override 直接复用的兼容模块按调用路径显式导入。
+2. **理解 patch 生效机制。** `torchtitan_npu/__init__.py` 导入 `torchtitan_npu.patches`，后者继续导入 `torch_npu` 和 `torchtitan` 子包，因此导入 `torchtitan_npu` 即会注册或应用其中的入口 patch。只有需要随包导入生效的 patch 才应加入对应的 `__init__.py`；供模型或 override 直接复用的兼容模块按调用路径显式导入。
 
 3. **Override 显式启用。** 每个 override 工厂使用 `@override` 注册，并以完整的 `module.function` 写入 `override.imports`。不要在 `__init__.py` 中批量导入具体 override。
 
-4. **固定上游基线。** 当前 torchtitan commit 同时记录在 `requirements.txt` 和 `.ci/setup_torchtitan.sh`。调整上游版本时同步更新两处，并检查 patch 目标、函数签名、模型接口和测试是否仍有效。
+4. **固定上游基线。** `requirements.txt` 声明当前 torchtitan 版本；`.ci/setup_torchtitan.sh` 从该版本推导对应 tag。调整上游版本时检查 patch 目标、函数签名、模型接口和测试是否仍有效。
 
 5. **临时 patch 可删除。** `torchtitan_npu/patches/torchtitan/` 只保存已提交上游但当前依赖版本尚未包含的临时补丁。补丁文件必须记录对应 PR；上游合入并更新依赖后删除相关补丁和导入。
 
@@ -49,11 +49,14 @@
 
 | 目录 | 职责 |
 | --- | --- |
+| `torchtitan_npu/config/` | NPU 配置 schema、转换器和注册 API |
 | `torchtitan_npu/patches/torchtitan/` | 包导入时生效的上游临时补丁 |
-| `torchtitan_npu/patches/torch_npu/`、`workaround/` | 当前有效的 NPU runtime compatibility patch；保留其自动加载和生效时机 |
+| `torchtitan_npu/patches/torch_npu/` | 当前有效的 NPU runtime compatibility patch；保留其自动加载和生效时机 |
+| `torchtitan_npu/extensions/` | 永久扩展、组件集成和可选外部 adaptor |
 | `torchtitan_npu/override/` | 通过 `override.imports` 显式启用的配置级组件替换 |
 | `torchtitan_npu/models/` | DeepSeek-V3.2、DeepSeek-V4 模型配置、实现、并行化和 checkpoint 适配 |
 | `torchtitan_npu/ops/` | CANN 与 NPU 专属算子封装 |
+| `torchtitan_npu/tools/` | 随 package 分发的 checkpoint 转换与导出工具 |
 | `tests/unit_tests/` | CPU 单测和静态契约测试 |
 | `scripts/` | 训练、合规检查及其他仓库级脚本 |
 
@@ -119,5 +122,5 @@ python -m pre_commit run --all-files --show-diff-on-failure
 ### 5. PR 与流水线
 
 - PR 描述解释「为什么」而非只写「做了什么」；非简单改动附数值证据，模型变更说明 checkpoint 兼容性。
-- 创建或推送 PR、读取改动与评论时使用 `gitcode-pr`，并按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写。标题使用正确的英文类型标签，如 `feat`、`fix`、`refactor`、`docs` 或 `test`；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。
-- 用户要求触发或等待 CI 时使用 `gitcode-pipeline`，根据实际失败日志定位问题。
+- 已安装 `gitcode-pr` skill 时，创建或推送 PR、读取改动与评论使用该 skill，并按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写。标题使用正确的英文类型标签，如 `feat`、`fix`、`refactor`、`docs` 或 `test`；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。
+- 已安装 `gitcode-pipeline` skill 时，用户要求触发或等待 CI 使用该 skill，并根据实际失败日志定位问题。

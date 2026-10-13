@@ -80,6 +80,12 @@ repos:
   # OAT compliance check (Open Source Audit Tool)
   - repo: local
     hooks:
+      - id: architecture-boundaries
+        name: Architecture boundary ratchet
+        entry: python scripts/check_architecture_boundaries.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
       - id: oat-check
         name: OAT Compliance Check
         entry: bash scripts/oat_check.sh

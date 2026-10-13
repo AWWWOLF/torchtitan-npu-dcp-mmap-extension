@@ -232,34 +232,40 @@ pip install -e .
 
 # 项目结构
 
-`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过三类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力；`extensions/` 提供 NPU 的扩展能力。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`。此外，`config/` 提供配置注册与管理，`compile/` 提供编译期扩展，`distributed/` 提供 NPU 后端 HF32 控制。
+`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过三类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力；`extensions/` 提供 NPU 的训练组件、编译和运行期扩展，其中只有包入口显式导入的模块会自动生效，其他模块按调用路径加载。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`，`config/` 提供配置 schema 与转换，`tools/` 提供随 Python package 分发的离线工具。
 
 ```text
 torchtitan-npu/
 ├── torchtitan_npu/
-│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
-│   ├── override/                  # 配置级组件替换，含 common 与各模型专属目录
-│   ├── patches/                   # 补齐 PyTorch NPU backend 缺口与临时上游能力
-│   ├── extensions/                # 随 package 导入自动生效的运行时扩展
-│   │   ├── components/            # 训练组件扩展（checkpoint/metrics 等）
-│   │   ├── experiment/            # 实验性质的特性
-│   │   │   └── torchft/           # TorchFT 容错训练适配
-│   │   ├── novaswap/              # NovaSwap 显存交换扩展
-│   │   └── tools/                 # 工具扩展
 │   ├── config/                    # 配置注册与管理（configs/manager 等）
-│   ├── compile/                   # 编译期扩展（SDC checksum pass）
-│   ├── distributed/               # NPU 后端 HF32 控制（set_allow_hf32）
+│   ├── patches/                   # PyTorch/torch_npu 补丁与临时上游能力
+│   ├── extensions/                # 永久训练、编译和运行期扩展
+│   │   ├── torchtitan/            # 按上游 torchtitan 目录镜像的扩展
+│   │   │   ├── components/        # checkpoint、metrics、LoRA、optimizer 扩展
+│   │   │   ├── distributed/       # FSDP 扩展
+│   │   │   ├── experiments/       # GraphTrainer 与 TorchFT 扩展
+│   │   │   └── tools/             # profiler 与上游工具扩展
+│   │   ├── adaptor/               # TorchAO-NPU 等可选外部包适配，按需导入
+│   │   ├── compile/               # 编译期扩展（SDC checksum pass）
+│   │   ├── components/            # 本仓训练组件及接线逻辑
+│   │   ├── cpu_offload/           # CPU offload 运行时与 staging
+│   │   ├── distributed/           # 梯度累积与梯度裁剪扩展
+│   │   ├── experiment/            # Anticipatory Routing、CV Parallel 等实验能力
+│   │   ├── mx_storage_reader/     # MX 量化权重读取能力
+│   │   └── novaswap/              # NovaSwap 显存交换扩展
+│   ├── override/                  # 配置级组件替换，含 common 与模型专属目录
+│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
 │   │   ├── ascendc/               # AscendC 算子适配（导入时自动加载）
 │   │   ├── misc/                  # 杂项算子
 │   │   ├── pypto/                 # PyPTO 算子
 │   │   ├── tilelang/              # TileLang 融合算子
 │   │   └── triton/                # Triton 算子（MHC/GDN 等）
+│   ├── tools/                     # 随 package 分发的 checkpoint 转换与导出工具
 │   ├── __init__.py                # 导入 package patch 与 extension
 │   └── train.py                   # 训练入口
 ├── examples/                      # 各模型训练示例脚本与说明
 ├── experiments/                   # 实验性适配包（torchao-npu 量化）
-├── interfaces/                    # 量化接入接口（torchao_converter）
 ├── scripts/                       # 训练与仓库辅助脚本
 ├── tests/                         # 单元测试和测试数据
 └── docs/                          # 使用指南与设计说明

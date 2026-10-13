@@ -17,7 +17,7 @@ from torch.distributed.tensor import DTensor, Replicate
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
 
 class TorchNpuCheckerFake:
@@ -321,13 +321,13 @@ def test_sdc_build_finishes_runtime_initialization_in_one_call(monkeypatch) -> N
     monkeypatch.delenv("NPU_ASD_CONFIG", raising=False)
     monkeypatch.delenv("NPU_ASD_ENABLE", raising=False)
     checksum_installs: list[bool] = []
-    checksum_module = ModuleType("torchtitan_npu.compile.sdc_checksum")
+    checksum_module = ModuleType("torchtitan_npu.extensions.compile.sdc_checksum")
 
     def install_checksum_pass() -> None:
         checksum_installs.append(True)
 
     vars(checksum_module)["install_checksum_pass"] = install_checksum_pass
-    monkeypatch.setitem(sys.modules, "torchtitan_npu.compile.sdc_checksum", checksum_module)
+    monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.compile.sdc_checksum", checksum_module)
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16)))
 
@@ -588,7 +588,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
         return "base-result"
 
     monkeypatch.setattr(TrainerEx.__base__, "__init__", base_init)
-    monkeypatch.setattr("torchtitan_npu.extensions.trainer.set_allow_hf32", lambda _allow_hf32: None)
+    monkeypatch.setattr("torchtitan_npu.extensions.torchtitan.trainer.set_allow_hf32", lambda _allow_hf32: None)
     monkeypatch.setattr(TrainerEx.__base__, "init_distributed", init_distributed)
     monkeypatch.setattr(TrainerEx.__base__, "forward_backward_step", forward_backward_step)
     return events, config

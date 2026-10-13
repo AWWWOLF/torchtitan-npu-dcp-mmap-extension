@@ -95,7 +95,7 @@ class SDC(Configurable):
         checker.set_grad_sample_interval(config.grad_sample_interval)
         if config.with_checksum:
             # Model compile wrappers exist, but the first training graph is still lazy.
-            from torchtitan_npu.compile.sdc_checksum import install_checksum_pass
+            from torchtitan_npu.extensions.compile.sdc_checksum import install_checksum_pass
 
             install_checksum_pass()
 

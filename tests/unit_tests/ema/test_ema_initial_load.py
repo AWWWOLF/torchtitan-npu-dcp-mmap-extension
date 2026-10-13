@@ -94,11 +94,11 @@ def _load_checkpoint_conversion_module() -> types.ModuleType:
     _register_packages(
         [
             ("torchtitan_npu", package_root),
-            ("torchtitan_npu.scripts", package_root / "scripts"),
-            ("torchtitan_npu.scripts.checkpoint_conversion", package_root / "scripts" / "checkpoint_conversion"),
+            ("torchtitan_npu.tools", package_root / "tools"),
+            ("torchtitan_npu.tools.checkpoint_conversion", package_root / "tools" / "checkpoint_conversion"),
         ]
     )
-    return importlib.import_module("torchtitan_npu.scripts.checkpoint_conversion.convert_to_hf")
+    return importlib.import_module("torchtitan_npu.tools.checkpoint_conversion.convert_to_hf")
 
 
 @pytest.fixture
@@ -505,7 +505,7 @@ def test_ema_schema_is_inherited_by_npu_trainer_ex_config() -> None:
     # A full package import registers custom ops; sys.modules rollback cannot
     # restore the PyTorch dispatcher after registering the same ops again.
     script = textwrap.dedent("""
-        from torchtitan_npu.extensions.trainer import TrainerEx
+        from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
         from torchtitan_npu.patches.torchtitan import trainer as trainer_module
         from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
         import torchtitan.components.checkpoint as upstream_checkpoint

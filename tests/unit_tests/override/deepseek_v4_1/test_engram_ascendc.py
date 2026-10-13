@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint, DefaultDeviceType
 from torchtitan.config import Configurable, OverrideConfig, TrainingConfig, apply_overrides
 from torchtitan.components.optimizer import ParamGroupConfig
 
-from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 from torchtitan_npu.models.deepseek_v4_1.parallelize import _shard_engram_tables
 from torchtitan_npu.override.deepseek_v4_1.engram import ascendc, mxfp8

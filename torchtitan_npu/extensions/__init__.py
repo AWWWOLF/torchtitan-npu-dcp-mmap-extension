@@ -5,10 +5,11 @@
 
 """extensions for torchtitan-npu."""
 
-from . import (
-    ep_process_group,  # noqa: F401
-    graph_trainer,  # noqa: F401
-    trainer,  # noqa: F401
-)
-from .components import metrics  # noqa: F401
-from .tools import utils  # noqa: F401
+# The import order is the extension activation order. Do not sort this block.
+# ruff: noqa: I001,F401
+from .torchtitan import ep_process_group
+from .torchtitan import trainer
+from .torchtitan.components import metrics
+from .torchtitan.experiments import graph_trainer
+from .torchtitan.tools import utils
+from .torchtitan import eager_flex

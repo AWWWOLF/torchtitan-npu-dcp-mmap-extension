@@ -28,7 +28,7 @@ from functools import wraps
 from torch.nn.attention.flex_attention import create_block_mask
 from torchtitan.models.qwen3_5 import vision_encoder as upstream_vision
 
-from torchtitan_npu.patches.workaround.eager_flex import (
+from torchtitan_npu.extensions.torchtitan.eager_flex import (
     mark_dense_sdpa_mask_mod,
 )
 

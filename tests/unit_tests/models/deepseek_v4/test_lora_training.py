@@ -126,7 +126,7 @@ def test_dsv4_muon_policy_resolves_combined_cp_storage_mesh(tmp_path, mesh_axis)
 @pytest.fixture
 def ao(monkeypatch):
     pytest.importorskip("torchao_npu")
-    module = importlib.import_module("interfaces.torchao_converter")
+    module = importlib.import_module("torchtitan_npu.extensions.adaptor.torchao.converter")
     monkeypatch.setattr(module, "_ensure_cann_ops_loaded", lambda: None)
     return module
 

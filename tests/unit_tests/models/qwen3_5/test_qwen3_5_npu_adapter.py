@@ -20,7 +20,7 @@ def _run_isolated(source: str, root: Path) -> None:
 def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override():
     root = Path(__file__).resolve().parents[4]
     script = (root / "examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
-    eager_flex = (root / "torchtitan_npu/patches/workaround/eager_flex.py").read_text(encoding="utf-8")
+    eager_flex = (root / "torchtitan_npu/extensions/torchtitan/eager_flex.py").read_text(encoding="utf-8")
 
 
     assert "bash scripts/run_train.sh" in script
@@ -57,7 +57,7 @@ def test_qwen3_5_adapter_applies_only_early_compatibility_patches():
         assert MultiModalCollator._build_mrope_positions is patched_build_mrope_positions
         assert upstream_vision.compiled_create_block_mask is eager_create_block_mask
         assert upstream_vision.Qwen35VisionEncoder.forward is owning_vision_encoder_forward
-        from torchtitan_npu.patches.workaround import eager_flex
+        from torchtitan_npu.extensions.torchtitan import eager_flex
         assert callable(eager_flex.mark_dense_sdpa_mask_mod)
         assert callable(eager_flex._run_eager_flex_attention)
         """,
@@ -195,7 +195,7 @@ def test_qwen3_5_flex_attention_preserves_aux_output_protocol():
         import torch
         import torchtitan_npu.models.qwen3_5
         from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, create_block_mask
-        from torchtitan_npu.patches.workaround.eager_flex import _run_eager_flex_attention
+        from torchtitan_npu.extensions.torchtitan.eager_flex import _run_eager_flex_attention
 
         q = torch.randn(1, 1, 4, 4)
         k = torch.randn(1, 1, 4, 4)

@@ -22,7 +22,7 @@ from torchtitan_npu.models.deepseek_v4_1 import (
 )
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 from torchtitan_npu.models.deepseek_v4_1.vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
-from torchtitan_npu.scripts.checkpoint_conversion.convert_to_hf import load_dcp_model
+from torchtitan_npu.tools.checkpoint_conversion.convert_to_hf import load_dcp_model
 
 
 def _build_model_config():

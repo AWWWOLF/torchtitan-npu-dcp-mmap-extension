@@ -13,9 +13,6 @@ from torchtitan_npu import (
     patches as _patches,
 )
 from torchtitan_npu import (
-    compile as _compile,
-)
-from torchtitan_npu import (
     config as _config,
 )
 from torchtitan_npu import (

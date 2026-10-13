@@ -100,7 +100,7 @@ def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, overr
 
     from torchtitan.config import Configurable, OverrideConfig, apply_overrides
 
-    from torchtitan_npu.extensions.components.optimizer import (
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
         HostSparseOptimizersContainer,
     )
     from torchtitan_npu.extensions.distributed import grad_accum, grad_clip

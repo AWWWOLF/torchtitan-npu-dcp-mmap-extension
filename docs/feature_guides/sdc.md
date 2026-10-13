@@ -135,9 +135,9 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 
 | 路径 | 职责 |
 | --- | --- |
-| `torchtitan_npu/extensions/trainer.py` | 编排标准 Trainer 与 SDC 生命周期。 |
+| `torchtitan_npu/extensions/torchtitan/trainer.py` | 编排标准 Trainer 与 SDC 生命周期。 |
 | `torchtitan_npu/extensions/components/sdc/sdc.py` | 一次完成配置校验、HCCL、checksum 和 gradient 初始化；在 accumulation 边界直接提交梯度。 |
-| `torchtitan_npu/compile/sdc_checksum.py`、`torchtitan_npu/ops/misc/sdc_checksum.py` | 安装 checksum pass 并注册 custom op。 |
+| `torchtitan_npu/extensions/compile/sdc_checksum.py`、`torchtitan_npu/ops/misc/sdc_checksum.py` | 安装 checksum pass 并注册 custom op。 |
 
 ## 验证范围
 
@@ -145,7 +145,7 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 通过 native checker 替身验证 typed tuning、参数筛选和累积提交，并检查 `TrainerEx`
 在模型构建后一次初始化 SDC，失败 backward 不提交梯度。
 
-`tests/smoke_tests/sdc/test_sdc.py` 为每个场景启动独立 Python worker，覆盖 Eager/compiled
+`tests/smoke_tests/sdc/test_sdc_smoke.py` 为每个场景启动独立 Python worker，覆盖 Eager/compiled
 控制与无效配置、BF16 gradient、checksum custom-op 输出修改、编译图 consumer、初始化通信后
 启用 HCCL 的训练路径，以及 three-strikes 后不重新编译的 checksum 激活。该文件是专项 NPU
 冒烟测试，不替代 `tests/integration_tests` 中的完整模型训练验证。

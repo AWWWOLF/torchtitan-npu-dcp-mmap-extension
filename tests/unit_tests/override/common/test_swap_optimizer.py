@@ -1178,7 +1178,7 @@ def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
     from torchtitan.components.optimizer import ParamGroupConfig
 
     from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
-    from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 
     allocations = []
 
@@ -1245,7 +1245,9 @@ def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
 def test_host_sparse_swap_checkpoint_resumes_exactly(monkeypatch, tmp_path, saved_steps):
     from torchtitan.components.optimizer import ParamGroupConfig
 
-    from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
+        HostSparseOptimizersContainer,
+    )
     from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 
     _patch_fake_swap_runtime(monkeypatch)
@@ -1326,8 +1328,8 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     """
     from torchtitan_npu.config.configs import TrainingConfig
     from torchtitan_npu.extensions import trainer as trainer_module
-    from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
-    from torchtitan_npu.extensions.trainer import TrainerEx
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
     from torchtitan_npu.override.common.optimizer import (
         CpuOffloadHostSparseNpuStateOptimizersContainer,
         CpuOffloadHostSparseOptimizersContainer,

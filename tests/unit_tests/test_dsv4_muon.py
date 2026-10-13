@@ -65,7 +65,7 @@ def test_dsv4_muon_profile_uses_validated_phase_one_policy():
     assert "muon_ns_steps=10" in optimizer_source
     assert "beta1=0.9" in optimizer_source
     assert "eps=1e-8" in optimizer_source
-    trainer_source = (_ROOT / "torchtitan_npu/extensions/trainer.py").read_text()
+    trainer_source = (_ROOT / "torchtitan_npu/extensions/torchtitan/trainer.py").read_text()
     assert "tensor_parallel_degree=1" in trainer_source
     assert "pipeline_parallel_degree=1" in trainer_source
     assert "def deepseek_v4_debugmodel_muon" not in file_source

@@ -229,13 +229,13 @@ flowchart TB
 `scripts/run_train.sh` 与 `scripts/run_train_multinodes.sh` 最终通过 `torchrun` 启动
 `torchtitan_npu.train`。训练入口复用上游 `torchtitan.train.main`，同时导入 `torchtitan_npu` 触发插件初始化。
 
-包初始化顺序为：
+当前包初始化顺序为：
 
 ```text
-patches → compile → config → extensions → ops
+patches → config → extensions → ops
 ```
 
-该顺序是运行时契约。NPU patch 必须在模型构建和首次编译前生效。新增初始化逻辑不能随意调整此顺序。
+`compile` 已迁入 `extensions/compile/`，不再是顶层自动导入阶段。该顺序是运行时契约。NPU patch 必须在模型构建和首次编译前生效。新增初始化逻辑不能随意调整此顺序。
 
 ### 5.2 模型和 loss 编译
 
@@ -269,7 +269,7 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 
 | Patch | 解决的问题 | 设计边界 |
 | --- | --- | --- |
-| `patches/workaround/device_copy.py` | non-blocking NPU-to-CPU copy 的 Host 可见性 | 只修正 NPU D2H 和 `prims.device_put`，不把 NPU 全局伪装为 GPU，避免误选 Triton 路径 |
+| `patches/torch_npu/device_copy.py` | non-blocking NPU-to-CPU copy 的 Host 可见性 | 只修正 NPU D2H 和 `prims.device_put`，不把 NPU 全局伪装为 GPU，避免误选 Triton 路径 |
 | `patches/torch_npu/inductor_runtime_estimation.py` | 编译期 roofline 估算探测 CUDA/Triton，以及 standalone compile 的 GraphModule 复制路径 | 仅在 NPU 可用时安装；带宽常量只参与调度估算，不代表硬件峰值 |
 
 两个 patch 都依赖包导入时机。CPU-only import 能验证模块可加载，但不能证明 NPU 条件分支已经生效。
@@ -320,10 +320,10 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 | 本仓 | `scripts/run_train.sh` | 单机启动与 AscendC 默认 Codegen |
 | 本仓 | `scripts/run_train_multinodes.sh` | 多机启动和 compile 参数；NPU backend 需在各节点显式统一 |
 | 本仓 | `torchtitan_npu/train.py` | 复用上游训练入口并触发插件初始化 |
-| 本仓 | `torchtitan_npu/__init__.py` | 固定 patches、compile、config、extensions 和 ops 的加载顺序 |
-| 本仓 | `torchtitan_npu/patches/workaround/device_copy.py` | NPU 异步 D2H 和 `device_put` 兼容 |
+| 本仓 | `torchtitan_npu/__init__.py` | 固定 patches、config、extensions 和 ops 的加载顺序 |
+| 本仓 | `torchtitan_npu/patches/torch_npu/device_copy.py` | NPU 异步 D2H 和 `device_put` 兼容 |
 | 本仓 | `torchtitan_npu/patches/torch_npu/inductor_runtime_estimation.py` | NPU runtime estimation 和 standalone compile 兼容 |
-| 本仓 | `torchtitan_npu/extensions/trainer.py` | 编译感知的 NPU Trainer 与量化转换 |
+| 本仓 | `torchtitan_npu/extensions/torchtitan/trainer.py` | 编译感知的 NPU Trainer 与量化转换 |
 | 上游/外部依赖 | `torchtitan.config.CompileConfig`、`torchtitan.distributed.compile` | 标准 compile 配置、Block 编译、Async TP 和 regional Inductor |
 | 外部依赖 | `torch_npu._inductor.ascendc` 与 CANN AutoFuse | NPU lowering、融合调度、tiling、Kernel 生成和编译 |
 

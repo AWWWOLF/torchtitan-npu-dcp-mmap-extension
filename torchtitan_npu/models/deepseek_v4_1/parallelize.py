@@ -1,3 +1,6 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
@@ -22,7 +25,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh, validate_config
 
-from torchtitan_npu.extensions.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel

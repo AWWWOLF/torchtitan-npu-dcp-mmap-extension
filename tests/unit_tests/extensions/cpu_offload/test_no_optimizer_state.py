@@ -17,7 +17,7 @@ import torch_npu
 from torchtitan_npu.config.configs import MuonOptimizerProfile, OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAdamW
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
 requires_npu = pytest.mark.skipif(
     not torch_npu.npu.is_available(), reason="NPU not available"

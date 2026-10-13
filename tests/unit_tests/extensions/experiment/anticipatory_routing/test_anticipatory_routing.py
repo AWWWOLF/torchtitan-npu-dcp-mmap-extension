@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch import nn
 
-from torchtitan_npu.extensions.trainer import Trainer, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import Trainer, TrainerEx
 from torchtitan_npu.extensions.experiment.anticipatory_routing.cache import RoutingMode
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
 

@@ -26,8 +26,8 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.config import MuonOptimizerProfile, OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingTrainer
-from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.muon import make_owned_layout
 
 from . import model_registry

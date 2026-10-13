@@ -39,8 +39,8 @@ from torchtitan_npu.config import (
     OptimizerConfig,
     TrainingConfig,
 )
-from torchtitan_npu.extensions.profiler import CANNProfiler
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
@@ -382,12 +382,12 @@ def _torchft_flash_config(
     global_batch_size: int = 1024,
 ) -> Trainer.Config:
     # Check the optional dependency before importing upstream TorchFT modules.
-    import_module("torchtitan_npu.extensions.experiment.torchft")
+    import_module("torchtitan_npu.extensions.torchtitan.experiments.torchft")
 
     from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 
-    from torchtitan_npu.extensions.experiment.torchft.optimizer import TorchFTOptimizersContainerEx
-    from torchtitan_npu.extensions.experiment.torchft.trainer import FaultTolerantTrainerEx
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.trainer import FaultTolerantTrainerEx
 
     def config_values(source: object, target: type) -> dict[str, Any]:
         return {

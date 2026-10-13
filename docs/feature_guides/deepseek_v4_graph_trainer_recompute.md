@@ -173,7 +173,7 @@ CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随�
 | SimpleFSDP | `torchtitan/experiments/graph_trainer/simple_fsdp.py` |
 | 函数式 compressor | `torchtitan_npu/models/deepseek_v4/compressor.py` |
 | 变异重算保真（functionalization backport） | `torchtitan_npu/patches/torchtitan/experiments/graph_trainer/functionalize_recompute_mutations.py` |
-| MoE 保存策略单测 | `tests/unit_tests/compile/test_swiglu_memory_policy.py` |
+| MoE 保存策略单测 | `tests/unit_tests/models/deepseek_v4/memory_policy/test_swiglu_memory_policy.py` |
 
 ## 7. 结论
 

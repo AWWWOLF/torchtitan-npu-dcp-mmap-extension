@@ -11,8 +11,8 @@ from functools import wraps
 def main():
     import torchtitan_npu  # noqa: F401
     from torchtitan.train import main as train_main
-    from torchtitan_npu.extensions.trainer import TrainerEx
-    from torchtitan_npu.extensions.components.checkpoint import CheckpointManager
+    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+    from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
     from torchtitan_npu.extensions.experiment.anticipatory_routing.router import AnticipatoryHashRouter
     from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import Phase
 

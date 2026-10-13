@@ -944,7 +944,7 @@ def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
 
     if quantized:
         pytest.importorskip("torchao_npu")
-        from interfaces import torchao_converter
+        from torchtitan_npu.extensions.adaptor.torchao import converter as torchao_converter
         from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
         monkeypatch.setattr(torchao_converter, "_npu_quantized_module_cache", {})

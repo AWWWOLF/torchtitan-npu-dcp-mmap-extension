@@ -47,7 +47,7 @@ class TrainingExtensionConfig:
 
 1. 在 `torchtitan_npu/config/configs.py` 中定义 NPU 配置类型，并继承对应的上游类型。
 2. 在 `TrainerEx.Config` 中将该字段声明为 NPU 配置类型。
-3. 在 `torchtitan_npu/extensions/trainer.py` 的 `component_types` 中加入字段名和配置类型。
+3. 在 `torchtitan_npu/extensions/torchtitan/trainer.py` 的 `component_types` 中加入字段名和配置类型。
 4. 在对应 Trainer 或组件中读取并应用新增字段。
 
 字段需要独立的 NPU 命名空间时，优先增加 `extension` 子配置；字段本身属于组件的公开

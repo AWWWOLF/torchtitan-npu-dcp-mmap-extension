@@ -30,11 +30,11 @@ from torchtitan.config import derive, override
 from torchtitan.distributed.flex_shard.dist_muon import DistMuon
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.cpu_offload import runtime as clip_state
 from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAdamW
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
 from torchtitan_npu.extensions.novaswap import swap_api
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 
 _ADAMW_SWAP_BUCKET_TIMES = 16
 _ADAMW_SWAP_RESIDENT_TARGET_BUCKETS = 3

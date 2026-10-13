@@ -31,7 +31,7 @@ from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.extensions.components.lora_compat import is_non_strict_tracing, upstream_adapter_sharding
+from torchtitan_npu.extensions.torchtitan.components.lora import is_non_strict_tracing, upstream_adapter_sharding
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .model import DeepSeekV4Model

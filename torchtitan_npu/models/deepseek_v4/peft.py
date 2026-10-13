@@ -20,7 +20,7 @@ from torchtitan.components.checkpoint_utils import canonical_fqn
 from torchtitan.tools import filesystem
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.extensions.components.checkpoint import CheckpointManager as NPUCheckpointManager
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager as NPUCheckpointManager
 
 
 def select_adapter_only_state(

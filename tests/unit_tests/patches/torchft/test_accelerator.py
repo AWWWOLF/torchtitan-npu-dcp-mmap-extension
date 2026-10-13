@@ -56,7 +56,7 @@ class BlockTorchFT(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, BlockTorchFT())
 import torchtitan_npu
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
 assert not any(name == 'torchft' or name.startswith('torchft.') for name in sys.modules)
 common_args = [

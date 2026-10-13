@@ -109,7 +109,11 @@ venv.bak/
 .opencode/*
 !.opencode/AGENTS.md
 !.opencode/skills
+.codex/*
+!.codex/AGENTS.md
+!.codex/skills
 outputs/
+third_party/
 
 # Third-party source trees are managed as submodules and are not scanned as project code.
 /third_party/
