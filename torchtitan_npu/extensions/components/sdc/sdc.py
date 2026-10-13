@@ -101,8 +101,7 @@ class SDC(Configurable):
 
         checker.init_stream()
         for name, parameter in self._iter_gradient_candidates(model_parts):
-            if parameter.dtype == torch.bfloat16:
-                checker.matmul_with_bf16 = True
+            checker.matmul_dtype_supported = True
             if not checker.parameter_filtering():
                 continue
             state_key = f"{name}_backward"

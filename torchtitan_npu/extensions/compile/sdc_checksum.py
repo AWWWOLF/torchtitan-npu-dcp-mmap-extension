@@ -39,14 +39,14 @@ def _is_checksum_candidate(node: torch.fx.Node) -> bool:
     return all(
         isinstance(value, torch.fx.Node)
         and isinstance(value.meta.get("val"), torch.Tensor)
-        and value.meta["val"].dtype == torch.bfloat16
+        and value.meta["val"].dtype in (torch.bfloat16, torch.float32)
         and value.meta["val"].device.type == "npu"
         for value in (left, right, node)
     )
 
 
 class _ChecksumPostGradPass(CustomInferenceAwareGraphPass):
-    """Instrument only BF16 NPU training matmuls supported by torch-npu checksum."""
+    """Instrument NPU training matmuls supported by the native checksum runtime."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:

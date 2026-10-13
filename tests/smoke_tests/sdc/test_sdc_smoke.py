@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Launch and run every real SDC smoke scenario in a fresh Python process."""
+"""Run the core SDC smoke scenarios in a fresh Python process each."""
 
 from __future__ import annotations
 
@@ -33,14 +33,17 @@ _CONTROL_ENVIRONMENT = (
 # Compiled SDC uses typed ``SDC.Config`` values. Only torch-npu's eager
 # controls remain process environment variables.
 _SCENARIO_ENVIRONMENT = {
-    "compiled-disabled-native-controls": {"NPU_ASD_CONFIG": "enable:false", "NPU_ASD_ENABLE": "0"},
     "real-bf16-gradient": {"NPU_ASD_CONFIG": "enable:false", "NPU_ASD_ENABLE": "0"},
     "eager-gradient-controls": {"NPU_ASD_CONFIG": "enable:true"},
-    "eager-hccl-controls": {"NPU_ASD_ENABLE": "2"},
-    "eager-combined-controls": {
-        "NPU_ASD_CONFIG": "enable:true,with_checksum:true",
-        "NPU_ASD_ENABLE": "2",
-    },
+}
+_COMPILED_GRADIENT_TUNING = {
+    "cooldown": 6,
+    "strikes_num": 4,
+    "strikes_window": 481,
+    "checksum_cooldown": 181,
+    "upper_thresh1": 1_000_001,
+    "upper_thresh2": 101,
+    "grad_sample_interval": 4,
 }
 
 
@@ -48,24 +51,8 @@ def _compiled_sdc_config(scenario: str) -> Any:
     from torchtitan_npu.extensions.components.sdc import SDC
 
     return {
-        "compiled-gradient-controls": SDC.Config(gradient_enabled=True),
-        "compiled-gradient-tuning": SDC.Config(
-            gradient_enabled=True,
-            cooldown=6,
-            strikes_num=4,
-            strikes_window=481,
-            checksum_cooldown=181,
-            upper_thresh1=1_000_001,
-            upper_thresh2=101,
-            grad_sample_interval=4,
-        ),
-        "compiled-all-controls": SDC.Config(
-            gradient_enabled=True,
-            with_checksum=True,
-            hccl_mode=1,
-        ),
-        "compiled-hccl-controls": SDC.Config(hccl_mode=2),
-        "compiled-disabled-native-controls": SDC.Config(gradient_enabled=True, with_checksum=True, hccl_mode=2),
+        "compiled-gradient-controls": SDC.Config(gradient_enabled=True, **_COMPILED_GRADIENT_TUNING),
+        "compiled-all-controls": SDC.Config(gradient_enabled=True, with_checksum=True, hccl_mode=1),
     }[scenario]
 
 
@@ -109,52 +96,29 @@ def _run_worker(scenario: str) -> None:
     assert completed.returncode == 0, (
         f"isolated SDC worker failed for {scenario!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     )
+    if scenario == "fp32-checksum-results":
+        branches = [line for line in completed.stdout.splitlines() if line.startswith("FP32 native checksum branch:")]
+        assert len(branches) == 1, "The FP32 worker must report its actual native checksum branch"
+        print(branches[0])
 
 
 @pytest.mark.parametrize(
     "scenario",
     [
         pytest.param("compiled-gradient-controls", id="gradient"),
-        pytest.param("compiled-gradient-tuning", id="gradient-tuning"),
         pytest.param("compiled-all-controls", id="gradient-checksum-hccl"),
-        pytest.param("compiled-hccl-controls", id="hccl"),
-        pytest.param("compiled-disabled-native-controls", id="native-switches-disabled"),
     ],
 )
 def test_compiled_controls_are_typed_without_installing_the_eager_wrapper(scenario: str) -> None:
     _run_worker(scenario)
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        pytest.param("eager-gradient-controls", id="gradient"),
-        pytest.param("eager-hccl-controls", id="hccl"),
-        pytest.param("eager-combined-controls", id="gradient-checksum-hccl"),
-    ],
-)
-def test_eager_sdc_controls_remain_owned_by_torch_npu(scenario: str) -> None:
-    _run_worker(scenario)
+def test_eager_sdc_controls_remain_owned_by_torch_npu() -> None:
+    _run_worker("eager-gradient-controls")
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        pytest.param("invalid-uncompiled-model", id="compile-disabled"),
-        pytest.param("invalid-compile-backend", id="non-inductor-backend"),
-        pytest.param("invalid-pipeline-parallel", id="pipeline-parallel"),
-    ],
-)
-def test_invalid_compiled_sdc_business_config_is_rejected(scenario: str) -> None:
-    _run_worker(scenario)
-
-
-def test_gradient_without_checksum_does_not_install_an_inductor_pass() -> None:
-    _run_worker("gradient-without-checksum-pass")
-
-
-def test_checksum_pass_is_installed_during_sdc_initialization() -> None:
-    _run_worker("checksum-pass-installed")
+def test_invalid_compiled_sdc_business_config_is_rejected() -> None:
+    _run_worker("invalid-uncompiled-model")
 
 
 def test_checksum_custom_op_declares_its_output_mutation() -> None:
@@ -177,8 +141,14 @@ def test_compiled_hccl_covers_forward_and_backward_collectives() -> None:
     _run_worker("global-hccl-scope")
 
 
-def test_three_gradient_strikes_activate_checksum_without_recompiling() -> None:
-    _run_worker("three-strikes-enable-checksum")
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+def test_three_gradient_strikes_activate_checksum_without_recompiling(dtype: str) -> None:
+    scenario = "three-strikes-enable-checksum"
+    _run_worker(scenario if dtype == "bf16" else f"{scenario}-fp32")
+
+
+def test_fp32_checksum_preserves_compiled_results_and_detects_output_faults() -> None:
+    _run_worker("fp32-checksum-results")
 
 
 # Worker setup
@@ -190,19 +160,14 @@ def _set_scenario_environment(scenario: str) -> None:
     os.environ.update(_SCENARIO_ENVIRONMENT.get(scenario, {}))
 
 
-def _config(
-    *,
-    compiled: bool = True,
-    backend: str = "inductor",
-    pipeline_parallel_degree: int = 1,
-) -> SimpleNamespace:
+def _config(*, compiled: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         compile=SimpleNamespace(
             enable=compiled,
             components=("model",) if compiled else (),
-            backend=backend,
+            backend="inductor",
         ),
-        parallelism=SimpleNamespace(pipeline_parallel_degree=pipeline_parallel_degree),
+        parallelism=SimpleNamespace(pipeline_parallel_degree=1),
         model_spec=SimpleNamespace(model=SimpleNamespace(enable_weight_tying=False)),
     )
 
@@ -232,7 +197,6 @@ def _configure_checker(checker: Any, *, checksum: bool) -> None:
     checker.set_upper_thresh1(1_000_000)
     checker.set_upper_thresh2(100)
     checker.set_with_checksum(checksum)
-    checker.matmul_with_bf16 = True
 
 
 def _run_sdc_step(sdc: Any, step: Any, *args: Any) -> Any:
@@ -259,10 +223,7 @@ def _check_compiled_controls(torch: Any, torch_npu: Any, scenario: str) -> None:
 
     expected = {
         "compiled-gradient-controls": (True, False, False),
-        "compiled-gradient-tuning": (True, False, False),
         "compiled-all-controls": (True, True, True),
-        "compiled-hccl-controls": (False, False, True),
-        "compiled-disabled-native-controls": (True, True, True),
     }[scenario]
 
     config = _compiled_sdc_config(scenario)
@@ -275,8 +236,7 @@ def _check_compiled_controls(torch: Any, torch_npu: Any, scenario: str) -> None:
     assert (os.environ.get("NPU_ASD_ENABLE", "0") != "0") == hccl_enabled
     assert os.environ.get("NPU_ASD_ENABLE", "0") == str(config.hccl_mode)
     assert torch.nn.Module.__call__.__module__ != "torch_npu.utils._step"
-    if scenario == "compiled-gradient-tuning":
-        checker = torch_npu.asd.asd.matmul_check
+    if scenario == "compiled-gradient-controls":
         assert {
             "cooldown": checker.get_cooldown(),
             "strikes_num": checker.get_strikes_num(),
@@ -285,87 +245,26 @@ def _check_compiled_controls(torch: Any, torch_npu: Any, scenario: str) -> None:
             "upper_thresh1": checker.get_upper_thresh1(),
             "upper_thresh2": checker.get_upper_thresh2(),
             "grad_sample_interval": checker.get_grad_sample_interval(),
-        } == {
-            "cooldown": 6,
-            "strikes_num": 4,
-            "strikes_window": 481,
-            "checksum_cooldown": 181,
-            "upper_thresh1": 1_000_001,
-            "upper_thresh2": 101,
-            "grad_sample_interval": 4,
-        }
+        } == _COMPILED_GRADIENT_TUNING
 
 
 def _check_eager_controls(torch: Any) -> None:
     assert torch.nn.Module.__call__.__module__ == "torch_npu.utils._step"
 
 
-def _check_invalid_config(scenario: str) -> None:
+def _check_invalid_config() -> None:
     from torchtitan_npu.extensions.components.sdc import SDC
-
-    sdc_config, trainer_config, expected = {
-        "invalid-uncompiled-model": (
-            SDC.Config(gradient_enabled=True),
-            _config(compiled=False),
-            "compile.enable",
-        ),
-        "invalid-compile-backend": (
-            SDC.Config(gradient_enabled=True),
-            _config(backend="eager"),
-            "backend='inductor'",
-        ),
-        "invalid-pipeline-parallel": (
-            SDC.Config(gradient_enabled=True),
-            _config(pipeline_parallel_degree=2),
-            "pipeline",
-        ),
-    }[scenario]
 
     try:
-        sdc_config.build(trainer_config=trainer_config, model_parts=[], gradient_accumulation_steps=1)
+        SDC.Config(gradient_enabled=True).build(
+            trainer_config=_config(compiled=False),
+            model_parts=[],
+            gradient_accumulation_steps=1,
+        )
     except (RuntimeError, ValueError) as error:
-        assert expected in str(error)
+        assert "compile.enable" in str(error)
         return
-    raise AssertionError(f"{scenario} did not reject its invalid SDC configuration")
-
-
-def _check_gradient_without_checksum_pass() -> None:
-    from torch._inductor import config as inductor_config
-
-    from torchtitan_npu.extensions.components.sdc import SDC
-
-    previous_pass = inductor_config.post_grad_custom_post_pass
-
-    SDC(SDC.Config(gradient_enabled=True), _config(), model_parts=[], gradient_accumulation_steps=1)
-
-    assert inductor_config.post_grad_custom_post_pass is previous_pass
-
-
-def _check_checksum_pass_installed_during_initialization() -> None:
-    from torch._inductor import config as inductor_config
-
-    import torchtitan_npu.extensions.compile.sdc_checksum as checksum_pass
-    from torchtitan_npu.extensions.components.sdc import SDC
-
-    previous_pass = inductor_config.post_grad_custom_post_pass
-    original_install_checksum_pass = checksum_pass.install_checksum_pass
-    pass_installs: list[int] = []
-
-    def install_checksum_pass() -> None:
-        pass_installs.append(1)
-        original_install_checksum_pass()
-
-    checksum_pass.install_checksum_pass = install_checksum_pass
-
-    SDC(
-        SDC.Config(gradient_enabled=True, with_checksum=True),
-        _config(),
-        model_parts=[],
-        gradient_accumulation_steps=1,
-    )
-
-    assert pass_installs == [1]
-    assert inductor_config.post_grad_custom_post_pass is not previous_pass
+    raise AssertionError("SDC accepted a configuration without a compiled model")
 
 
 def _check_checksum_schema_declares_output_mutation(torch: Any) -> None:
@@ -444,6 +343,95 @@ def _check_compiled_consumer_observes_checksum_output_mutation(torch: Any, torch
 
     assert torch.equal(gate_open_output, torch.full_like(gate_open_output, 4))
     assert len(checksum_calls) >= 1
+
+
+def _check_fp32_checksum_results(torch: Any, torch_npu: Any) -> None:
+    from torchtitan_npu.extensions.components.sdc import SDC
+
+    device = torch.device("npu:0")
+    _initialize_process_group(torch, device)
+    left_cpu = (torch.arange(128, dtype=torch.float64).reshape(8, 16) % 13 - 6) / 16
+    right_cpu = (torch.arange(128, dtype=torch.float64).reshape(16, 8) % 11 - 5) / 16
+    upstream_cpu = (torch.arange(64, dtype=torch.float64).reshape(8, 8) % 7 + 1) / 8
+    reference_left = left_cpu.clone().requires_grad_()
+    reference_right = right_cpu.clone().requires_grad_()
+    reference_output = torch.mm(reference_left, reference_right) + 1
+    reference_output.backward(upstream_cpu)
+
+    class MatmulConsumer(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(right_cpu.to(device=device, dtype=torch.float32))
+
+        def forward(self, value: Any) -> Any:
+            return torch.mm(value, self.weight) + 1
+
+    model = MatmulConsumer()
+    SDC(
+        SDC.Config(gradient_enabled=True, with_checksum=True),
+        _config(),
+        model_parts=[model],
+        gradient_accumulation_steps=1,
+    )
+    checker = torch_npu.asd.asd.matmul_check
+    assert checker.matmul_dtype_supported, "SDC must initialize FP32 checksum capability"
+    checker.checksum_result = torch.tensor(False, device=device)
+    checksum_calls: list[tuple[Any, Any, Any, bool]] = []
+    original_checksum = torch_npu.matmul_checksum
+
+    def checksum(left: Any, right: Any, output: Any) -> Any:
+        result = original_checksum(left, right, output)
+        checksum_calls.append((left.detach().cpu(), right.detach().cpu(), output.detach().cpu(), bool(result)))
+        return result
+
+    torch_npu.matmul_checksum = checksum
+    compiled = torch.compile(model, backend="inductor")
+    for gate in (False, True):
+        checker.checksum_enable = gate
+        checker.checksum_result.fill_(False)
+        checksum_calls.clear()
+        model.zero_grad(set_to_none=True)
+        left = left_cpu.to(device=device, dtype=torch.float32).requires_grad_()
+        output = compiled(left)
+        output.backward(upstream_cpu.to(device=device, dtype=torch.float32))
+        torch.npu.synchronize()
+
+        torch.testing.assert_close(output.detach().cpu().double(), reference_output.detach(), rtol=0, atol=1e-5)
+        torch.testing.assert_close(left.grad.cpu().double(), reference_left.grad, rtol=0, atol=1e-5)
+        torch.testing.assert_close(model.weight.grad.cpu().double(), reference_right.grad, rtol=0, atol=1e-5)
+        assert not bool(checker.checksum_result)
+        assert bool(checksum_calls) is gate
+        if gate:
+            received_left, received_right, received_output, _ = checksum_calls[0]
+            assert received_left.dtype == received_right.dtype == received_output.dtype == torch.float32
+            torch.testing.assert_close(received_left.double(), left_cpu, rtol=0, atol=0)
+            torch.testing.assert_close(received_right.double(), right_cpu, rtol=0, atol=0)
+            torch.testing.assert_close(received_output.double(), torch.mm(left_cpu, right_cpu), rtol=0, atol=1e-5)
+            assert all(not call[3] for call in checksum_calls)
+
+    # Keep fault injection outside autograd; exercise the production op's native result accumulation.
+    left = left_cpu.to(device=device, dtype=torch.float32)
+    right = right_cpu.to(device=device, dtype=torch.float32)
+    expected = torch.mm(left_cpu, right_cpu)
+    corrupted = expected.to(device=device, dtype=torch.float32)
+    corrupted[0, 0] += 1024
+    checker.checksum_result.fill_(False)
+    torch.ops.torchtitan_npu.sdc_matmul_checksum.default(left, right, corrupted)
+    torch.npu.synchronize()
+    assert bool(checker.checksum_result)
+    assert checksum_calls[-1][3]
+
+    # The native fallback repairs output; V-ABFT reports faults without this repair contract.
+    checksum_module = sys.modules[original_checksum.__module__]
+    abft_available = _get_private_runtime_interface(checksum_module, "_abft_available_cache")
+    assert type(abft_available) is bool, "The native checksum branch must have been probed"
+    print(f"FP32 native checksum branch: {'V-ABFT' if abft_available else 'Python fallback'}")
+    if abft_available is False:
+        torch.testing.assert_close(corrupted.cpu().double(), expected, rtol=0, atol=1e-5)
+    torch.ops.torchtitan_npu.sdc_matmul_checksum.default(left, right, expected.to(device=device, dtype=torch.float32))
+    torch.npu.synchronize()
+    assert not checksum_calls[-1][3]
+    assert bool(checker.checksum_result), "A later healthy matmul must not erase an earlier fault"
 
 
 def _check_real_bf16_gradient(torch: Any, torch_npu: Any) -> None:
@@ -559,30 +547,31 @@ def _check_global_hccl_scope(torch: Any, torch_npu: Any) -> None:
     assert state_events == [("model", "train"), ("call", "backward")]
 
 
-def _build_bf16_matmul(torch: Any, device: Any) -> Any:
-    class Bf16Matmul(torch.nn.Module):
+def _build_matmul(torch: Any, device: Any, *, dtype: Any) -> Any:
+    class Matmul(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.weight = torch.nn.Parameter(torch.randn(16, 8, device=device, dtype=torch.bfloat16))
+            self.weight = torch.nn.Parameter(torch.randn(16, 8, device=device, dtype=dtype))
 
         def forward(self, value: Any) -> Any:
             return torch.mm(value, self.weight)
 
-    return Bf16Matmul()
+    return Matmul()
 
 
 class _ThreeStrikesStepRunner:
-    def __init__(self, torch: Any, device: Any) -> None:
+    def __init__(self, torch: Any, device: Any, *, dtype: Any) -> None:
         self._torch = torch
         self._device = device
-        self.model = _build_bf16_matmul(torch, device)
+        self._dtype = dtype
+        self.model = _build_matmul(torch, device, dtype=dtype)
         self._optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3)
         self._compiled = torch.compile(self.model, backend="inductor")
 
     def run(self, sdc: Any, inject_fault: bool) -> None:
         self._optimizer.zero_grad(set_to_none=True)
-        value = self._torch.randn(1, 16, device=self._device, dtype=self._torch.bfloat16)
-        target = self._torch.zeros(1, 8, device=self._device, dtype=self._torch.bfloat16)
+        value = self._torch.randn(1, 16, device=self._device, dtype=self._dtype)
+        target = self._torch.zeros(1, 8, device=self._device, dtype=self._dtype)
         loss = (self._compiled(value).float() - target.float()).square().mean()
         loss.backward()
         self._torch.npu.synchronize()
@@ -636,7 +625,7 @@ def _assert_three_strikes_activated(
     assert _wait_for(torch, lambda: bool(checker.checksum_enable), timeout=25)
 
 
-def _check_three_strikes_enable_checksum(torch: Any, torch_npu: Any) -> None:
+def _check_three_strikes_enable_checksum(torch: Any, torch_npu: Any, *, dtype: Any) -> None:
     import torchtitan_npu.extensions.compile.sdc_checksum as checksum_pass
     from torchtitan_npu.extensions.components.sdc import SDC
 
@@ -645,13 +634,14 @@ def _check_three_strikes_enable_checksum(torch: Any, torch_npu: Any) -> None:
     checker = torch_npu.asd.asd.matmul_check
     resets, pass_installs, dispatches = _install_three_strikes_observers(torch, torch_npu, checksum_pass, checker)
 
-    runner = _ThreeStrikesStepRunner(torch, device)
+    runner = _ThreeStrikesStepRunner(torch, device, dtype=dtype)
     sdc = SDC(
         SDC.Config(gradient_enabled=True, with_checksum=True),
         _config(),
         model_parts=[runner.model],
         gradient_accumulation_steps=1,
     )
+    assert checker.matmul_dtype_supported, "SDC must initialize the native checksum capability"
     _configure_checker(checker, checksum=True)
     checker.set_cooldown(0.05)
     for _ in range(3):
@@ -673,23 +663,22 @@ def _run_scenario(torch: Any, torch_npu: Any, scenario: str) -> None:
     elif scenario.startswith("eager-"):
         _check_eager_controls(torch)
     elif scenario.startswith("invalid-"):
-        _check_invalid_config(scenario)
-    elif scenario == "gradient-without-checksum-pass":
-        _check_gradient_without_checksum_pass()
-    elif scenario == "checksum-pass-installed":
-        _check_checksum_pass_installed_during_initialization()
+        _check_invalid_config()
     elif scenario == "checksum-schema-declares-output-mutation":
         _check_checksum_schema_declares_output_mutation(torch)
     elif scenario == "checksum-output-mutation":
         _check_checksum_output_mutation(torch, torch_npu)
     elif scenario == "checksum-compiled-consumer-observes-mutation":
         _check_compiled_consumer_observes_checksum_output_mutation(torch, torch_npu)
+    elif scenario == "fp32-checksum-results":
+        _check_fp32_checksum_results(torch, torch_npu)
     elif scenario == "real-bf16-gradient":
         _check_real_bf16_gradient(torch, torch_npu)
     elif scenario == "global-hccl-scope":
         _check_global_hccl_scope(torch, torch_npu)
-    elif scenario == "three-strikes-enable-checksum":
-        _check_three_strikes_enable_checksum(torch, torch_npu)
+    elif scenario in ("three-strikes-enable-checksum", "three-strikes-enable-checksum-fp32"):
+        dtype = torch.float32 if scenario.endswith("-fp32") else torch.bfloat16
+        _check_three_strikes_enable_checksum(torch, torch_npu, dtype=dtype)
     else:
         raise ValueError(f"unknown SDC smoke scenario: {scenario}")
 

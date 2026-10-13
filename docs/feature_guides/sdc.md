@@ -125,7 +125,7 @@ SDC 使用进程级 torch-npu 和 Inductor 状态，不提供运行期重配置�
 达到阈值后只打开 native gate，后续 step 直接在原图执行 checksum，不调用
 `torch.compiler.reset()`。
 
-checksum pass 对训练图中的 BF16 NPU `aten.mm.default`、`aten.matmul.default` 和
+checksum pass 对训练图中的 BF16/FP32 NPU `aten.mm.default`、`aten.matmul.default` 和
 `aten.bmm.default` 插入 checksum custom op。
 
 `SDC.finalize_sdc_step()` 只在成功 step 后执行 gradient accumulation 边界提交。HCCL 状态不会在
@@ -141,11 +141,7 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 
 ## 验证范围
 
-`tests/unit_tests/test_sdc.py` 覆盖 config、gradient 和 HCCL 的 CPU 可观察契约，
-通过 native checker 替身验证 typed tuning、参数筛选和累积提交，并检查 `TrainerEx`
-在模型构建后一次初始化 SDC，失败 backward 不提交梯度。
+`tests/unit_tests/test_sdc.py` 覆盖配置校验、运行时初始化、梯度累积提交及 checksum 图插桩的 CPU 可观察契约。
 
-`tests/smoke_tests/sdc/test_sdc_smoke.py` 为每个场景启动独立 Python worker，覆盖 Eager/compiled
-控制与无效配置、BF16 gradient、checksum custom-op 输出修改、编译图 consumer、初始化通信后
-启用 HCCL 的训练路径，以及 three-strikes 后不重新编译的 checksum 激活。该文件是专项 NPU
-冒烟测试，不替代 `tests/integration_tests` 中的完整模型训练验证。
+`tests/smoke_tests/sdc/test_sdc_smoke.py` 在独立 NPU worker 中验证 Eager/compiled 控制、gradient/checksum/HCCL
+联动及 checksum 激活不触发重新编译，不替代 `tests/integration_tests` 中的完整模型训练验证。

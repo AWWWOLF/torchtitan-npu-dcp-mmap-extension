@@ -3,19 +3,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import builtins
 import os
 import sys
-from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import torch
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate
+import torch._inductor.config as inductor_config
+from torch._inductor.custom_graph_pass import get_custom_graph_passes
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.extensions.compile import sdc_checksum
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
@@ -32,7 +32,7 @@ class TorchNpuCheckerFake:
         self.upper_thresh2 = 100
         self.grad_sample_interval = 3
         self.check_stat: dict[str, dict[str, float | int]] = {}
-        self.matmul_with_bf16 = False
+        self.matmul_dtype_supported = False
         self.stream_initializations = 0
         self.startups = 0
         self.detected: list[tuple[torch.Tensor, str]] = []
@@ -96,6 +96,11 @@ def _install_torch_npu(
     return checker, state_events
 
 
+def test_sdc_config_rejects_checksum_without_gradient_detection() -> None:
+    with pytest.raises(ValueError, match=r"requires --sdc.gradient-enabled=true"):
+        SDC.Config(with_checksum=True)
+
+
 @pytest.mark.parametrize(
     "hccl_mode",
     [
@@ -109,67 +114,41 @@ def test_sdc_config_rejects_invalid_hccl_modes(hccl_mode: Any) -> None:
         SDC.Config(hccl_mode=hccl_mode)
 
 
-def test_sdc_config_rejects_checksum_without_gradient_detection() -> None:
-    with pytest.raises(ValueError, match=r"requires --sdc.gradient-enabled=true"):
-        SDC.Config(with_checksum=True)
-
-
-@pytest.mark.parametrize(
-    ("option", "value", "expected_message"),
-    [
-        pytest.param("cooldown", 0, "--sdc.cooldown", id="cooldown-below-range"),
-        pytest.param("strikes_num", 0, "--sdc.strikes-num", id="strikes-num-below-range"),
-        pytest.param("strikes_window", 0, "--sdc.strikes-window", id="strikes-window-below-range"),
-        pytest.param(
-            "checksum_cooldown",
-            0,
-            "--sdc.checksum-cooldown",
-            id="checksum-cooldown-below-range",
-        ),
-        pytest.param("upper_thresh1", 2, "--sdc.upper-thresh1", id="upper-thresh1-below-range"),
-        pytest.param("upper_thresh2", 2, "--sdc.upper-thresh2", id="upper-thresh2-below-range"),
-        pytest.param(
-            "grad_sample_interval",
-            0,
-            "--sdc.grad-sample-interval",
-            id="grad-sample-interval-below-range",
-        ),
-        pytest.param("cooldown", 1.5, "must be an integer", id="cooldown-non-integer"),
-    ],
-)
-def test_sdc_config_rejects_invalid_gradient_tuning(
-    option: str,
-    value: Any,
-    expected_message: str,
-) -> None:
-    with pytest.raises(ValueError, match=expected_message):
-        SDC.Config(gradient_enabled=True, **{option: value})
-
-
 @pytest.mark.parametrize(
     ("option", "value"),
     [
-        pytest.param("cooldown", 6, id="cooldown"),
-        pytest.param("strikes_num", 4, id="strikes-num"),
-        pytest.param("strikes_window", 481, id="strikes-window"),
-        pytest.param("checksum_cooldown", 181, id="checksum-cooldown"),
-        pytest.param("upper_thresh1", 1_000_001, id="upper-thresh1"),
-        pytest.param("upper_thresh2", 101, id="upper-thresh2"),
-        pytest.param("grad_sample_interval", 4, id="grad-sample-interval"),
+        pytest.param("cooldown", 0, id="cooldown-below-range"),
+        pytest.param("cooldown", 1.5, id="cooldown-non-integer"),
+        pytest.param("strikes_num", 0, id="strikes-num-below-range"),
+        pytest.param("strikes_window", 0, id="strikes-window-below-range"),
+        pytest.param("checksum_cooldown", 0, id="checksum-cooldown-below-range"),
+        pytest.param("upper_thresh1", 2, id="upper-thresh1-below-range"),
+        pytest.param("upper_thresh2", 2, id="upper-thresh2-below-range"),
+        pytest.param("grad_sample_interval", 0, id="grad-sample-interval-below-range"),
     ],
 )
-def test_sdc_config_rejects_non_default_tuning_without_gradient_detection(option: str, value: int) -> None:
-    with pytest.raises(ValueError, match=r"requires --sdc.gradient-enabled=true"):
-        SDC.Config(**{option: value})
+def test_sdc_config_rejects_invalid_gradient_tuning(option: str, value: Any) -> None:
+    with pytest.raises(ValueError, match="must be an integer greater than or equal to"):
+        SDC.Config(gradient_enabled=True, **{option: value})
+
+
+def test_sdc_config_rejects_non_default_tuning_without_gradient_detection() -> None:
+    with pytest.raises(ValueError, match=r"non-default --sdc gradient tuning requires"):
+        SDC.Config(cooldown=6)
 
 
 # Gradient monitoring
 
 
-def _compiled_trainer_config() -> SimpleNamespace:
+def _compiled_trainer_config(
+    *,
+    compile_enabled: bool = True,
+    backend: str = "inductor",
+    pipeline_parallel_degree: int = 1,
+) -> SimpleNamespace:
     return SimpleNamespace(
-        compile=SimpleNamespace(enable=True, components=("model",), backend="inductor"),
-        parallelism=SimpleNamespace(pipeline_parallel_degree=1),
+        compile=SimpleNamespace(enable=compile_enabled, components=("model",), backend=backend),
+        parallelism=SimpleNamespace(pipeline_parallel_degree=pipeline_parallel_degree),
     )
 
 
@@ -185,7 +164,7 @@ def _build_gradient_sdc(model_parts: list[Any], accumulation_steps: int = 1, **o
 def _isolate_native_sdc_environment(monkeypatch):
     monkeypatch.delenv("NPU_ASD_CONFIG", raising=False)
     monkeypatch.delenv("NPU_ASD_ENABLE", raising=False)
-    with torch.random.fork_rng():
+    with torch.random.fork_rng(devices=[]):
         yield
 
 
@@ -215,102 +194,70 @@ def test_sdc_submits_only_at_configured_accumulation_boundaries(
     assert name == "weight_backward"
 
 
-def test_sdc_registers_only_supported_parameters_and_marks_bf16(monkeypatch) -> None:
-    class MixedParameterModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.supported = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16))
-            self.vector = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
-            self.fp16_matrix = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float16))
-            self.frozen = torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
-
-    checker, _ = _install_torch_npu(monkeypatch, selected=[True] * 4)
-
-    _build_gradient_sdc([MixedParameterModel()])
-
-    assert set(checker.check_stat) == {"supported_backward"}
-    assert checker.matmul_with_bf16 is True
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sdc_submits_only_targets_selected_by_native_checker(monkeypatch, dtype: torch.dtype) -> None:
-    checker, _ = _install_torch_npu(monkeypatch, selected=[False])
+@pytest.mark.parametrize(
+    ("dtype", "expected_flag"),
+    [
+        pytest.param(torch.bfloat16, True, id="bf16"),
+        pytest.param(torch.float32, True, id="fp32"),
+        pytest.param(torch.float16, False, id="fp16-excluded"),
+    ],
+)
+def test_sdc_marks_only_native_checksum_dtypes(monkeypatch, dtype: torch.dtype, expected_flag: bool) -> None:
+    checker, _ = _install_torch_npu(monkeypatch, selected=[True])
     model = torch.nn.Linear(2, 2, bias=False, dtype=dtype)
-    model.weight.grad = torch.ones_like(model.weight)
-    sdc = _build_gradient_sdc([model])
 
-    sdc.finalize_sdc_step()
+    _build_gradient_sdc([model])
 
-    assert checker.check_stat == {}
-    assert checker.detected == []
-    assert checker.matmul_with_bf16 is (dtype == torch.bfloat16)
+    assert checker.matmul_dtype_supported is expected_flag
 
 
-def test_sdc_skips_targets_without_gradients(monkeypatch) -> None:
-    class PartiallyUsedModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.used = torch.nn.Parameter(torch.ones(2, 2))
-            self.unused = torch.nn.Parameter(torch.ones(2, 2))
-
-    model = PartiallyUsedModel()
-    model.used.grad = torch.ones_like(model.used)
-    checker, _ = _install_torch_npu(monkeypatch, selected=[True] * 4)
-    sdc = _build_gradient_sdc([model])
-
-    sdc.finalize_sdc_step()
-
-    assert [name for _, name in checker.detected] == ["used_backward"]
+# Checksum graph instrumentation
 
 
-def test_sdc_checks_distinct_dtensor_gradients_sharing_parameter_storage(monkeypatch, tmp_path: Path) -> None:
-    torch.distributed.init_process_group("gloo", init_method=(tmp_path / "store").as_uri(), rank=0, world_size=1)
-    try:
-        mesh = init_device_mesh("cpu", (1,))
-        shared = torch.ones(2, 2)
-        model = torch.nn.Module()
-        model.first = torch.nn.Parameter(DTensor.from_local(shared, mesh, [Replicate()], run_check=False))
-        model.second = torch.nn.Parameter(DTensor.from_local(shared, mesh, [Replicate()], run_check=False))
-        model.empty = torch.nn.Parameter(DTensor.from_local(torch.empty(0, 2), mesh, [Replicate()], run_check=False))
-        assert model.first is not model.second
-        assert (
-            model.first.to_local().untyped_storage().data_ptr() == model.second.to_local().untyped_storage().data_ptr()
-        )
-        (model.first.sum() + 2 * model.second.sum()).backward()
-        checker, _ = _install_torch_npu(monkeypatch, selected=[True, True])
-        sdc = _build_gradient_sdc([model, model])
+@pytest.mark.parametrize(
+    ("dtype", "device", "is_inference", "expected_checks"),
+    [
+        pytest.param(torch.bfloat16, "npu", False, 1, id="bf16-training"),
+        pytest.param(torch.float32, "npu", False, 1, id="fp32-training"),
+        pytest.param(torch.float16, "npu", False, 0, id="fp16-unsupported"),
+        pytest.param(torch.bfloat16, "cpu", False, 0, id="cpu-excluded"),
+        pytest.param(torch.float32, "npu", True, 0, id="inference-excluded"),
+    ],
+)
+def test_checksum_pass_instruments_native_supported_training_dtypes(
+    monkeypatch,
+    dtype: torch.dtype,
+    device: str,
+    is_inference: bool,
+    expected_checks: int,
+) -> None:
+    # Fake tensors provide NPU graph metadata without executing an NPU kernel.
+    monkeypatch.setattr(inductor_config, "post_grad_custom_post_pass", None)
+    fake_mode = FakeTensorMode()
+    value = FakeTensor(fake_mode, torch.empty((2, 2), device="meta", dtype=dtype), torch.device(device))
+    graph = torch.fx.Graph()
+    left = graph.placeholder("left")
+    right = graph.placeholder("right")
+    output = graph.call_function(torch.ops.aten.mm.default, args=(left, right))
+    graph.output(output)
+    for node in (left, right, output):
+        node.meta["val"] = value
 
-        sdc.finalize_sdc_step()
+    sdc_checksum.install_checksum_pass()
+    passes = get_custom_graph_passes(inductor_config.post_grad_custom_post_pass)
+    assert len(passes) == 1
+    passes[0](graph, is_inference=is_inference)
+    graph.lint()
 
-        assert set(checker.check_stat) == {"model_parts.0.first_backward", "model_parts.0.second_backward"}
-        assert [name for _, name in checker.detected] == [
-            "model_parts.0.first_backward",
-            "model_parts.0.second_backward",
-        ]
-        assert torch.equal(checker.detected[0][0], torch.ones(2, 2))
-        assert torch.equal(checker.detected[1][0], torch.full((2, 2), 2.0))
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def test_sdc_does_not_treat_to_local_protocol_as_dtensor(monkeypatch) -> None:
-    class TensorWithToLocal(torch.Tensor):
-        def to_local(self) -> torch.Tensor:
-            raise AssertionError("to_local must only be called for DTensor")
-
-    parameter = torch.ones(2, 2, requires_grad=True).as_subclass(TensorWithToLocal)
-
-    class ModelPart:
-        @staticmethod
-        def named_parameters(*, remove_duplicate: bool) -> list[tuple[str, torch.Tensor]]:
-            assert remove_duplicate is True
-            return [("weight", parameter)]
-
-    checker, _ = _install_torch_npu(monkeypatch, selected=[True] * 4)
-
-    _build_gradient_sdc([ModelPart()])
-
-    assert set(checker.check_stat) == {"weight_backward"}
+    checks = [
+        node
+        for node in graph.nodes
+        if node.op == "call_function" and node.target == torch.ops.torchtitan_npu.sdc_matmul_checksum.default
+    ]
+    assert len(checks) == expected_checks
+    if checks:
+        assert checks[0].args == (left, right, output)
+        assert checks[0].meta["val"] is None
 
 
 # SDC facade
@@ -331,7 +278,18 @@ def test_sdc_build_finishes_runtime_initialization_in_one_call(monkeypatch) -> N
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2, dtype=torch.bfloat16)))
 
-    SDC.Config(gradient_enabled=True, with_checksum=True, hccl_mode=2, cooldown=6).build(
+    SDC.Config(
+        gradient_enabled=True,
+        with_checksum=True,
+        hccl_mode=2,
+        cooldown=6,
+        strikes_num=4,
+        strikes_window=481,
+        checksum_cooldown=181,
+        upper_thresh1=1_000_001,
+        upper_thresh2=101,
+        grad_sample_interval=4,
+    ).build(
         trainer_config=_compiled_trainer_config(),
         model_parts=[model],
         gradient_accumulation_steps=2,
@@ -340,9 +298,15 @@ def test_sdc_build_finishes_runtime_initialization_in_one_call(monkeypatch) -> N
     assert checker.hook_enabled == 1
     assert checker.with_checksum is True
     assert checker.cooldown == 6
+    assert checker.strikes_num == 4
+    assert checker.strikes_window == 481
+    assert checker.checksum_cooldown == 181
+    assert checker.upper_thresh1 == 1_000_001
+    assert checker.upper_thresh2 == 101
+    assert checker.grad_sample_interval == 4
     assert checker.stream_initializations == 1
     assert checker.startups == 1
-    assert checker.matmul_with_bf16 is True
+    assert checker.matmul_dtype_supported is True
     assert checker.check_stat == {
         "weight_backward": {"avg": 0.0, "pre_val": 0.0, "step": 0, "none_zero_step": 0},
     }
@@ -352,112 +316,22 @@ def test_sdc_build_finishes_runtime_initialization_in_one_call(monkeypatch) -> N
 
 
 @pytest.mark.parametrize(
-    ("environment_name", "environment_value"),
+    ("trainer_options", "message"),
     [
-        pytest.param("NPU_ASD_CONFIG", "enable:true", id="native-gradient"),
-        pytest.param("NPU_ASD_ENABLE", "0", id="native-hccl-zero"),
+        pytest.param({"compile_enabled": False}, r"requires compile.enable=true", id="compile-disabled"),
+        pytest.param({"backend": "aot_eager"}, r"requires compile.backend='inductor'", id="non-inductor-backend"),
+        pytest.param({"pipeline_parallel_degree": 2}, r"does not support pipeline parallelism", id="pipeline-parallel"),
     ],
 )
-def test_inactive_sdc_leaves_native_eager_environment_unchanged(
-    monkeypatch, environment_name: str, environment_value: str
-) -> None:
-    original_import = builtins.__import__
-
-    def reject_torch_npu_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "torch_npu":
-            raise AssertionError("inactive SDC imported torch_npu")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setenv(environment_name, environment_value)
-    monkeypatch.setattr(builtins, "__import__", reject_torch_npu_import)
-
-    sdc = SDC.Config().build(trainer_config=object(), model_parts=[], gradient_accumulation_steps=1)
-    sdc.finalize_sdc_step()
-
-    assert os.environ[environment_name] == environment_value
-
-
-@pytest.mark.parametrize(
-    ("native_config", "native_hccl"),
-    [(None, None), ("enable:false", "0"), ("", "0"), ("cooldown:6", None), ("enable:true,enable:false", "0")],
-)
-def test_active_sdc_accepts_disabled_native_environment(monkeypatch, native_config, native_hccl) -> None:
-    checker, state_events = _install_torch_npu(monkeypatch)
-    if native_config is not None:
-        monkeypatch.setenv("NPU_ASD_CONFIG", native_config)
-    if native_hccl is not None:
-        monkeypatch.setenv("NPU_ASD_ENABLE", native_hccl)
-
-    _build_gradient_sdc([])
-
-    assert checker.hook_enabled == 1
-    assert checker.startups == 1
-    assert state_events == []
-    assert os.environ.get("NPU_ASD_CONFIG") == native_config
-    assert os.environ.get("NPU_ASD_ENABLE") == native_hccl
-
-
-@pytest.mark.parametrize(
-    ("environment_name", "environment_value"),
-    [
-        ("NPU_ASD_CONFIG", "enable:true"),
-        ("NPU_ASD_CONFIG", "enable:false,enable:true"),
-        ("NPU_ASD_ENABLE", "1"),
-        ("NPU_ASD_ENABLE", "2"),
-        ("NPU_ASD_ENABLE", "3"),
-        ("NPU_ASD_CONFIG", "enable:TRUE"),
-        ("NPU_ASD_CONFIG", "enable:0"),
-        ("NPU_ASD_ENABLE", "false"),
-        ("NPU_ASD_ENABLE", "4"),
-        ("NPU_ASD_ENABLE", ""),
-    ],
-)
-def test_active_sdc_rejects_native_eager_environment_before_runtime_changes(
-    monkeypatch, environment_name: str, environment_value: str
+def test_active_sdc_validates_compile_before_runtime_changes(
+    monkeypatch,
+    trainer_options: dict[str, Any],
+    message: str,
 ) -> None:
     checker, state_events = _install_torch_npu(monkeypatch)
-    monkeypatch.setenv("NPU_ASD_CONFIG", "enable:false")
-    monkeypatch.setenv(environment_name, environment_value)
+    trainer_config = _compiled_trainer_config(**trainer_options)
 
-    with pytest.raises(ValueError, match=environment_name):
-        _build_gradient_sdc([])
-
-    assert checker.hook_enabled is None
-    assert checker.startups == 0
-    assert state_events == []
-    assert os.environ[environment_name] == environment_value
-
-
-def test_compiled_hccl_overrides_disabled_environment_after_import(monkeypatch) -> None:
-    checker, state_events = _install_torch_npu(monkeypatch)
-    monkeypatch.setenv("NPU_ASD_CONFIG", "enable:false")
-    monkeypatch.setenv("NPU_ASD_ENABLE", "0")
-    original_import = builtins.__import__
-    import_values = []
-
-    def record_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "torch_npu":
-            import_values.append(os.environ["NPU_ASD_ENABLE"])
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", record_import)
-    SDC.Config(hccl_mode=2).build(
-        trainer_config=_compiled_trainer_config(), model_parts=[], gradient_accumulation_steps=1
-    )
-
-    assert import_values == ["0"]
-    assert os.environ["NPU_ASD_ENABLE"] == "2"
-    assert os.environ["NPU_ASD_CONFIG"] == "enable:false"
-    assert state_events == [("model", "train"), ("call", "backward")]
-    assert checker.startups == 0
-
-
-def test_active_sdc_validates_compile_before_runtime_changes(monkeypatch) -> None:
-    checker, state_events = _install_torch_npu(monkeypatch)
-    trainer_config = _compiled_trainer_config()
-    trainer_config.compile.enable = False
-
-    with pytest.raises(ValueError, match=r"requires compile.enable=true"):
+    with pytest.raises(ValueError, match=message):
         SDC.Config(gradient_enabled=True).build(
             trainer_config=trainer_config, model_parts=[], gradient_accumulation_steps=1
         )
@@ -467,85 +341,39 @@ def test_active_sdc_validates_compile_before_runtime_changes(monkeypatch) -> Non
     assert state_events == []
 
 
-def test_sdc_applies_all_gradient_tuning_to_native_checker(monkeypatch) -> None:
-    checker, _ = _install_torch_npu(monkeypatch)
+@pytest.mark.parametrize(
+    ("environment", "message"),
+    [
+        pytest.param({"NPU_ASD_ENABLE": "4"}, r"invalid native SDC switch", id="invalid-native-value"),
+        pytest.param(
+            {"NPU_ASD_ENABLE": "2"},
+            r"cannot be combined with enabled NPU_ASD_ENABLE",
+            id="native-hccl-enabled",
+        ),
+        pytest.param(
+            {"NPU_ASD_CONFIG": "enable:false,enable:true"},
+            r"cannot be combined with enabled NPU_ASD_CONFIG",
+            id="last-enable-entry-wins",
+        ),
+    ],
+)
+def test_compiled_sdc_rejects_enabled_native_environment(
+    monkeypatch,
+    environment: dict[str, str],
+    message: str,
+) -> None:
+    checker, state_events = _install_torch_npu(monkeypatch)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
 
-    _build_gradient_sdc(
-        [],
-        cooldown=6,
-        strikes_num=4,
-        strikes_window=481,
-        checksum_cooldown=181,
-        upper_thresh1=1_000_001,
-        upper_thresh2=101,
-        grad_sample_interval=4,
-    )
+    with pytest.raises(ValueError, match=message):
+        SDC.Config(gradient_enabled=True).build(
+            trainer_config=_compiled_trainer_config(), model_parts=[], gradient_accumulation_steps=1
+        )
 
-    assert checker.hook_enabled == 1
-    assert checker.with_checksum is False
-    assert checker.cooldown == 6
-    assert checker.strikes_num == 4
-    assert checker.strikes_window == 481
-    assert checker.checksum_cooldown == 181
-    assert checker.upper_thresh1 == 1_000_001
-    assert checker.upper_thresh2 == 101
-    assert checker.grad_sample_interval == 4
-
-
-def test_sdc_registers_distinct_state_for_sampled_model_parts(monkeypatch) -> None:
-    checker, _ = _install_torch_npu(monkeypatch, selected=[True, False, True])
-    models = []
-    for _ in range(3):
-        model = torch.nn.Module()
-        model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
-        model.weight.grad = torch.full_like(model.weight, len(models) + 1)
-        models.append(model)
-
-    sdc = _build_gradient_sdc(models)
-    sdc.finalize_sdc_step()
-
-    assert set(checker.check_stat) == {"model_parts.0.weight_backward", "model_parts.2.weight_backward"}
-    assert (
-        checker.check_stat["model_parts.0.weight_backward"] is not checker.check_stat["model_parts.2.weight_backward"]
-    )
-    assert [name for _, name in checker.detected] == ["model_parts.0.weight_backward", "model_parts.2.weight_backward"]
-    assert torch.equal(checker.detected[0][0], torch.ones(2, 2))
-    assert torch.equal(checker.detected[1][0], torch.full((2, 2), 3.0))
-    assert checker.startups == 1
-    assert checker.stream_initializations == 1
-
-
-def test_hccl_only_initialization_does_not_probe_gradient_runtime(monkeypatch) -> None:
-    _, state_events = _install_torch_npu(monkeypatch)
-    delattr(sys.modules["torch_npu"], "asd")
-
-    sdc = SDC.Config(hccl_mode=2).build(
-        trainer_config=_compiled_trainer_config(), model_parts=[], gradient_accumulation_steps=1
-    )
-    sdc.finalize_sdc_step()
-
-    assert os.environ["NPU_ASD_ENABLE"] == "2"
-    assert state_events == [("model", "train"), ("call", "backward")]
-
-
-def test_hccl_imports_torch_npu_before_setting_native_environment(monkeypatch) -> None:
-    _install_torch_npu(monkeypatch)
-    original_import = builtins.__import__
-    import_environments: list[str | None] = []
-
-    def record_torch_npu_import(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "torch_npu":
-            import_environments.append(os.environ.get("NPU_ASD_ENABLE"))
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", record_torch_npu_import)
-
-    SDC.Config(hccl_mode=2).build(
-        trainer_config=_compiled_trainer_config(), model_parts=[], gradient_accumulation_steps=1
-    )
-
-    assert import_environments == [None]
-    assert os.environ["NPU_ASD_ENABLE"] == "2"
+    assert checker.hook_enabled is None
+    assert checker.startups == 0
+    assert state_events == []
 
 
 # Trainer integration

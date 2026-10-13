@@ -20,13 +20,9 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 #     (ATen/ATen.h:5), so every Triton kernel launch fails to compile.
 #   * test_qwen3_5_npu_runtime.py::test_merged_gdn_forward_backward uses the
 #     same Triton host-stub compiler and fails with the same C++17/C++20 error.
-#   * the SDC three-strikes checksum case: torch_npu renamed the ASD checksum
-#     dtype flag (matmul_with_bf16 -> matmul_dtype_supported), so the checksum
-#     is never linked and `checksum_enable` never flips.
 SMOKE_DESELECT=(
     --deselect tests/smoke_tests/ops/test_mhc_triton.py
     --deselect tests/smoke_tests/ops/test_qwen3_5_npu_runtime.py::test_merged_gdn_forward_backward
-    --deselect tests/smoke_tests/sdc/test_sdc_smoke.py::test_three_gradient_strikes_activate_checksum_without_recompiling
 )
 
 SMOKE_TESTS_START="$(date +%s)"
