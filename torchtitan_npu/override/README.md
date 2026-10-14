@@ -346,7 +346,8 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscMetadataExtension.Config` | — |
+| `sparse_attn.asc_metadata` | `SparseAttentionMetadata.Config` | `SparseAttentionMetadata.Config` | 选择 `AscMetadataExtension` |
+| `compressor.asc_metadata` | `CompressorMetadata.Config` | `CompressorMetadata.Config` | 独立预构建 compressor 状态表 |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | — |
 | `sparse_attn.pypto` (replaces `sparse_attn.asc`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` | — |
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` | — |
@@ -363,6 +364,9 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `moe_router.tilelang` | `HashRouter.Config`（精确匹配） | `TilelangHashRouter.Config` | 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
 
 `sparse_attn.asc_metadata` 无需参数。`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
+使用 fused compressor 时，同时启用 `compressor.asc` 和 `compressor.asc_metadata`；稀疏注意力保留 `sparse_attn.asc_metadata`。
+CV metadata 入口也可与 `compressor.asc_metadata` 同时启用；它只与 `sparse_attn.asc_metadata` 互斥。
+仅启用 sparse-attention metadata 时不分配 compressor 状态表；CP 保持原有交换后构表路径。
 MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` / `tilelang_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。`triton_hc_head` 与 `tilelang_hc_head` 声明同一 `HcHead.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` / `asc_hc_post` 共存。
 

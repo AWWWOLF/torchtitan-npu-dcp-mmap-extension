@@ -13,7 +13,7 @@ import torch
 from torchtitan.config import derive, override
 from torchtitan.models.common.attention import VarlenMetadata
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata, MetadataExtension
+from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata, SparseAttentionMetadata
 from torchtitan_npu.models.deepseek_v4.metadata import (
     CompressedVarlenMetadata,
     build_compressed_varlen_metadata,
@@ -44,7 +44,9 @@ def _plain_batch_chunk_metadata(
     varlen = metadata.varlen
     if not torch.equal(varlen.cu_seq_q, varlen.cu_seq_k):
         raise ValueError("batch chunk metadata requires cu_seq_q == cu_seq_k")
-    cu_host = tuple(int(value) for value in varlen.cu_seq_q.cpu().tolist())
+    cu_host = metadata.cu_seq_q_host
+    if cu_host is None:
+        cu_host = tuple(int(value) for value in varlen.cu_seq_q.cpu().tolist())
     total_tokens = cu_host[-1]
     if total_tokens < 2 or total_tokens % 2:
         raise ValueError(f"batch chunk metadata requires an even positive token extent, got {total_tokens}")
@@ -105,6 +107,7 @@ def _metadata_tensor_fields(
             "first_indices",
             "compressed_rows",
             "cmp_k_global_gather_indices",
+            "compressor_state_block_table",
         ):
             add(f"plans.{ratio}.{field_name}", getattr(plan, field_name))
     for ratio, plan in metadata.asc_plans.items():
@@ -174,14 +177,19 @@ class BatchChunkMetadataExtension(AscMetadataExtension):
             plans=full.plans,
             window=full.window,
             seq_len_host=full.seq_len_host,
+            cu_seq_q_host=full.cu_seq_q_host,
             asc_plans=full.asc_plans,
             batch_chunk_tensors=_tag_batch_chunk_metadata(full, chunks),
         )
 
 
-@override(target=MetadataExtension.Config, description="Precompute AscendC metadata for two equal batch chunks")
-def asc_metadata(cfg: MetadataExtension.Config) -> AscMetadataExtension.Config:
+@override(
+    target=SparseAttentionMetadata.Config,
+    exact=True,
+    description="Precompute AscendC metadata for two equal batch chunks",
+)
+def asc_metadata(cfg: SparseAttentionMetadata.Config) -> SparseAttentionMetadata.Config:
     # Register the pipeline only when this experimental override is activated.
     from . import cv_parallel  # noqa: F401
 
-    return derive(cfg, BatchChunkMetadataExtension.Config)
+    return derive(cfg, SparseAttentionMetadata.Config, extension=BatchChunkMetadataExtension)

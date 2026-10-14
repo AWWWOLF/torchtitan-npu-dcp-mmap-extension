@@ -49,6 +49,49 @@ def test_compressor_override_composes_with_norm_and_rope(monkeypatch, reverse):
     )
 
 
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("batch_chunk", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_compressor_metadata_selection(dsv4, monkeypatch, fused, batch_chunk, reverse):
+    registry = importlib.import_module("torchtitan.config.override")
+    monkeypatch.setattr(registry, "_REGISTRY", registry._REGISTRY.copy())
+    cfg = _debugmodel()
+    metadata_target = (
+        "torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata.asc_metadata"
+        if batch_chunk else "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata"
+    )
+    imports = [metadata_target, "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata"]
+    if fused:
+        imports.extend([
+            "torchtitan_npu.override.deepseek_v4.compressor.asc_metadata",
+            "torchtitan_npu.override.deepseek_v4.compressor.asc",
+        ])
+    apply_overrides(OverrideConfig(imports=imports[::-1] if reverse else imports), cfg)
+    provider = cfg.metadata_extension.build()
+    li_provider = cfg.lightning_indexer_metadata.build()
+    captured = []
+    if batch_chunk:
+        from torchtitan_npu.extensions.experiment.cv_parallel import batch_chunk_metadata as cv
+
+        provider._chunk_li_metadata = li_provider
+        monkeypatch.setattr(cv, "_tag_batch_chunk_metadata", lambda full, chunks: captured.extend((full, *chunks)))
+    boundaries = torch.tensor([0, 8, 16], dtype=torch.int32)
+    metadata = build_compressed_varlen_metadata(
+        VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=8, max_k=8), (4,)
+    )
+    metadata = li_provider(metadata)
+    assert metadata.plans[4].li_metadata is not None
+    result = provider(metadata)
+    tables = [item.plans[4].compressor_state_block_table for item in (captured or [result])]
+    assert all((table is not None) == fused for table in tables)
+    if fused:
+        table, *_ = ascendc._state_inputs(
+            boundaries, torch.empty(16, 8), max_length=8, ratio=4, head_dim=8,
+            state_block_table=result.plans[4].compressor_state_block_table,
+        )
+        assert table is result.plans[4].compressor_state_block_table
+
+
 def _document_pool(x, wkv, wgate, ape, cu, ratio):
     outputs = []
     width = wkv.shape[0] // (2 if ratio == 4 else 1)
@@ -101,9 +144,96 @@ def compressor_factory(monkeypatch):
             torch._dynamo.reset()
 
 
+def test_prebuilt_compressor_tables_follow_current_boundaries():
+    widths = []
+    for lengths in ((16, 16), (8, 24), (8, 8, 16)):
+        boundaries = torch.tensor((0, *torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32)
+        metadata = build_compressed_varlen_metadata(
+            VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=16, max_k=16), (1, 4, 128)
+        )
+        # The current boundaries, not a possibly stale host maximum, size the table.
+        ascendc.build_compressor_state_tables(metadata)
+        assert metadata.plans[1].compressor_state_block_table is None
+        for ratio, block_size in ((4, 8), (128, 16)):
+            table = metadata.plans[ratio].compressor_state_block_table
+            assert table.shape == (len(lengths), (max(lengths) + block_size - 1) // block_size)
+            assert table.dtype == torch.int32 and table.is_contiguous()
+            assert not table.any()
+            assert getattr(table, "_dynamo_unbacked_indices") == {0, 1}
+        widths.append(metadata.plans[4].compressor_state_block_table.shape[1])
+    assert widths == [2, 3, 2]
+
+
+def test_prebuilt_compressor_table_is_a_pytree_input_and_is_reused(monkeypatch):
+    from torch.utils._pytree import tree_flatten, tree_unflatten
+
+    boundaries = torch.tensor([0, 8, 32], dtype=torch.int32)
+    metadata = build_compressed_varlen_metadata(
+        VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=24, max_k=24), (4,)
+    )
+    ascendc.build_compressor_state_tables(metadata)
+    table = metadata.plans[4].compressor_state_block_table
+    leaves, spec = tree_flatten(metadata)
+    assert any(leaf is table for leaf in leaves)
+    restored = tree_unflatten(leaves, spec)
+    assert restored.plans[4].compressor_state_block_table is table
+    assert restored.cu_seq_q_host is None  # The eager-only cache is not a graph input.
+    zeros = torch.zeros
+
+    def checked_zeros(shape, **kwargs):
+        assert len(shape) == 3, "only the state cache should be allocated inside the graph"
+        return zeros(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", checked_zeros)
+    inputs = ascendc._state_inputs(
+        boundaries,
+        torch.empty((1, 32, 8)),
+        max_length=32,
+        ratio=4,
+        head_dim=8,
+        state_block_table=table,
+    )
+    assert inputs[0] is table
+    torch.testing.assert_close(inputs[3], torch.tensor([8, 24], dtype=torch.int32))
+
+
+def test_prebuilt_compressor_table_width_changes_on_graph_replay():
+    from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer, run_traced
+
+    batches = []
+    for lengths in ((16, 16), (8, 24), (8, 8, 16)):
+        boundaries = torch.tensor((0, *torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32)
+        metadata = build_compressed_varlen_metadata(
+            VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=max(lengths), max_k=max(lengths)), (4,)
+        )
+        ascendc.build_compressor_state_tables(metadata)
+        setattr(boundaries, "_dynamo_unbacked_indices", {0})  # noqa: B010
+        batches.append(metadata)
+
+    def consume(metadata):
+        table, cache, _, _ = ascendc._state_inputs(
+            metadata.varlen.cu_seq_q,
+            torch.empty((1, 32, 8)),
+            max_length=32,
+            ratio=4,
+            head_dim=8,
+            state_block_table=metadata.plans[4].compressor_state_block_table,
+        )
+        return table + cache.sum().to(torch.int32)
+
+    traced = minimal_fx_tracer(consume)(batches[0])
+    run = run_traced(traced, _validate_runtime=True)
+    for metadata in batches:
+        actual = run(metadata)
+        torch.testing.assert_close(actual, metadata.plans[4].compressor_state_block_table)
+
+
 @pytest.mark.parametrize("ratio,indexer", [(4, False), (4, True), (128, False)], ids=["c4-attention", "c4-indexer", "c128"])
 @pytest.mark.parametrize("api", ["torch-op", "python-wrapper"])
-def test_compressor_cann_schema_document_outputs_and_gradients(compressor_factory, monkeypatch, ratio, indexer, api):
+@pytest.mark.parametrize("ape_dtype", [torch.float32, torch.bfloat16])
+def test_compressor_cann_schema_document_outputs_and_gradients(
+    compressor_factory, monkeypatch, ratio, indexer, api, ape_dtype
+):
     calls = []
 
     def fake_cann(x, wkv, wgate, state_cache, ape, cmp_ratio=4, *, state_block_table=None,
@@ -114,10 +244,11 @@ def test_compressor_cann_schema_document_outputs_and_gradients(compressor_factor
         assert ape.dtype == state_cache.dtype == torch.float32
         assert x.shape[1] == wkv.shape[1] == wgate.shape[1] == 1024
         assert wkv is module.wkv.weight and wgate is module.wgate.weight
-        assert ape is module.ape
+        torch.testing.assert_close(ape, module.ape.float())
         block_size = 8 if cmp_ratio == 4 else 16
         assert state_cache.shape == (1, block_size, 2 * coff * module.head_dim)
-        assert state_block_table.shape == (len(lengths), (max(lengths) + block_size - 1) // block_size)
+        assert state_block_table is metadata.plans[ratio].compressor_state_block_table
+        assert state_block_table.shape == (len(lengths), max((max(lengths) + block_size - 1) // block_size, 1))
         assert not state_block_table.any() and start_pos is None and cache_mode == 1
         torch.testing.assert_close(cu_seqlens, boundaries)
         torch.testing.assert_close(seqused, torch.tensor(lengths, dtype=torch.int32))
@@ -134,6 +265,7 @@ def test_compressor_cann_schema_document_outputs_and_gradients(compressor_factor
         monkeypatch.setattr(sys.modules["cann_ops_transformer.ops.compressor"], "compressor", fake_cann)
 
     module = compressor_factory(ratio, indexer)
+    module.ape = torch.nn.Parameter(module.ape.detach().to(ape_dtype), requires_grad=module.ape.requires_grad)
     module.wgate.weight.requires_grad_(not indexer)
     reference = copy.deepcopy(module)
     lengths = [2 * ratio + 1, ratio - 1, ratio + 2]
@@ -144,13 +276,18 @@ def test_compressor_cann_schema_document_outputs_and_gradients(compressor_factor
     metadata = build_compressed_varlen_metadata(
         VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=max(lengths), max_k=max(lengths)), (ratio,)
     )
+    ascendc.build_compressor_state_tables(metadata)
     generator = torch.Generator().manual_seed(21)
     x = (torch.randn(1, cu[-1], module.wkv.in_features, generator=generator) * 0.1).half().requires_grad_()
     reference_x = x.detach().clone().requires_grad_()
     perturbation = torch.linspace(-0.02, 0.03, module.head_dim)
 
     actual = module(x, metadata)
-    raw = _document_pool(reference_x[0], reference.wkv.weight, reference.wgate.weight, reference.ape, cu, ratio)
+    # Match the operator boundary: accumulate APE gradients in FP32, then cast
+    # once back to the BF16 parameter instead of rounding each sliced contribution.
+    raw = _document_pool(
+        reference_x[0], reference.wkv.weight, reference.wgate.weight, reference.ape.float(), cu, ratio
+    )
     expected = _postprocess(reference, (2 * raw + perturbation).half(), metadata.plans[ratio].block_positions)
     upstream_grad = torch.randn(actual.shape, generator=generator).half()
     actual.backward(upstream_grad)
@@ -203,6 +340,7 @@ def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api)
     metadata = build_compressed_varlen_metadata(
         VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=8, max_k=8), (4,)
     )
+    ascendc.build_compressor_state_tables(metadata)
     setattr(metadata.plans[4].gather_indices, "_dynamo_unbacked_indices", {0})  # noqa: B010
     x = torch.randn(1, 8, module.wkv.in_features, generator=torch.Generator().manual_seed(17)).requires_grad_()
     reference_x = x.detach().clone().requires_grad_()

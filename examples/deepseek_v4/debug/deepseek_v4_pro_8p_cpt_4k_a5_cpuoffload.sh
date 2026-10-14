@@ -141,6 +141,7 @@ else
         torchtitan_npu.override.common.rms_norm.asc
         torchtitan_npu.override.common.rope.asc_partial
         torchtitan_npu.override.deepseek_v4.compressor.asc
+        torchtitan_npu.override.deepseek_v4.compressor.asc_metadata
 
         torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata
         torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li

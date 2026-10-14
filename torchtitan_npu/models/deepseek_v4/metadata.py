@@ -38,7 +38,7 @@ compressed region is the concatenation of its documents' complete blocks,
 padded to ``S // ratio`` slots.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
@@ -128,6 +128,10 @@ class CompressedBlockLayout:
     li_metadata: torch.Tensor | None = None
     """Opaque ratio-4 LI metadata produced by the selected provider."""
 
+    compressor_state_block_table: torch.Tensor | None = None
+    """Optional backend state table, prebuilt outside the graph. Both document
+    count and table width vary by batch; the AscendC metadata extension fills it."""
+
     # ---- part 2: the dispatcher fields (CP only) ----
     exchange: "ExchangePlan | None" = None
     """The block exchange routing (alltoallv input/output splits) of the
@@ -190,6 +194,10 @@ class CompressedVarlenMetadata:
     ``build_compressed_varlen_metadata`` boundary so the ``seq_len`` property
     avoids a per-layer ``.item()`` D2H sync inside the compiled region."""
 
+    cu_seq_q_host: tuple[int, ...] | None = field(default=None, metadata={"pytree": False})
+    """Eager-only document boundaries shared by layout and backend builders.
+    Excluded from graph inputs because document count changes the tuple length."""
+
     @property
     def batch_size(self) -> int:
         """Container batch size (``1`` for the current packed scenario)."""
@@ -221,6 +229,8 @@ class CompressedKernelContract(Protocol):
 def build_kernel_layout(
     varlen: VarlenMetadata,
     compress_ratios: tuple[int, ...] | list[int],
+    *,
+    cu_seq_q_host: tuple[int, ...] | None = None,
 ) -> dict[int, CompressedBlockLayout]:
     """The kernel-contract tier: the per-ratio plans for a plain stream.
 
@@ -235,8 +245,11 @@ def build_kernel_layout(
         raise TypeError(f"build_kernel_layout expects a varlen stream, got {type(varlen)}.")
 
     cu_seq_q = varlen.cu_seq_q
-    if int(cu_seq_q[0].item()) != 0:
-        raise ValueError(f"varlen stream must start at token 0, got cu_seq_q[0]={cu_seq_q[0]}.")
+    cu = cu_seq_q_host if cu_seq_q_host is not None else varlen.cu_seq_q_host
+    if cu is None:
+        cu = tuple(cu_seq_q.cpu().tolist())
+    if cu[0] != 0:
+        raise ValueError(f"varlen stream must start at token 0, got cu_seq_q[0]={cu[0]}.")
     if not torch.equal(cu_seq_q, varlen.cu_seq_k):
         raise ValueError(
             "build_kernel_layout requires a plain stream (cu_seq_q == "
@@ -244,7 +257,7 @@ def build_kernel_layout(
         )
     # The packed scenario runs with local_batch_size == 1; raise seq_len
     # instead of local_batch_size.
-    seq_len = int(cu_seq_q[-1].item())
+    seq_len = cu[-1]
 
     # The plain per-document derivation: each document contributes its
     # complete leading blocks (the ``len % ratio`` tail produces no
@@ -252,7 +265,6 @@ def build_kernel_layout(
     # plans carry no dispatcher fields — the dispatcher's gather degrades
     # to the plain local gather, so the forward path never special-cases
     # context parallel.
-    cu = cu_seq_q.cpu().tolist()
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
     distinct_ratios = sorted({int(r) for r in compress_ratios})
     device = cu_seq_q.device
@@ -323,14 +335,16 @@ def build_compressed_varlen_metadata(
             authoritative for document boundaries.
         compress_ratios: Compression ratios present in the model.
     """
-    plans = build_kernel_layout(varlen, compress_ratios)
-    # Cache the total token count on the host so the ``seq_len`` property
-    # avoids a per-layer ``.item()`` D2H sync inside the compiled region.
-    # Built once here (eager boundary) from ``cu_seq_q[-1]``.
+    boundaries = varlen.cu_seq_q_host
+    if boundaries is None:
+        boundaries = tuple(varlen.cu_seq_q.cpu().tolist())
+    plans = build_kernel_layout(varlen, compress_ratios, cu_seq_q_host=boundaries)
+    # Reuse the same host boundaries for layout, state tables, and total length.
     return CompressedVarlenMetadata(
         varlen=varlen,
         plans=plans,
-        seq_len_host=int(varlen.cu_seq_q[-1].item()),
+        seq_len_host=boundaries[-1],
+        cu_seq_q_host=boundaries,
     )
 
 

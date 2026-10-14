@@ -300,6 +300,7 @@ class AscMetadataExtension(MetadataExtension):
 
     def __call__(self, metadata) -> AscCompressedVarlenMetadata:
         cfg = cast("AscMetadataExtension.Config", self.config)
+        self.prepare_compressor_metadata(metadata)
         plans = metadata.plans
         for ratio, p in plans.items():
             if ratio > 1 and p.gather_indices.numel() == 0:
@@ -342,6 +343,7 @@ class AscMetadataExtension(MetadataExtension):
             window=window,
             asc_plans=asc_plans,
             seq_len_host=metadata.seq_len_host,
+            cu_seq_q_host=metadata.cu_seq_q_host,
         )
         _mark_dynamic(result)
         return result
@@ -362,7 +364,11 @@ class AscLightningIndexer(LightningIndexer):
         if plan.cmp_k_global_gather_indices is not None:
             idx_k_tnd = flat_k[plan.cmp_k_global_gather_indices].unsqueeze(1).contiguous()
         else:
-            idx_k_tnd = flat_k[: plan.n_cmp_blocks_host].unsqueeze(1).contiguous()
+            if plan.block_positions is None:
+                raise ValueError("AscLightningIndexer requires plan.block_positions.")
+            # The marked tensor dimension tracks the current batch on replay;
+            # the host count would remain fixed at graph capture.
+            idx_k_tnd = flat_k[: plan.block_positions.numel()].unsqueeze(1).contiguous()
         li_metadata = plan.li_metadata
         if li_metadata is None:
             raise ValueError("AscLightningIndexer requires plan.li_metadata.")
@@ -692,7 +698,10 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         flat = container.flatten(0, 1)
         if asm is not None:
             return flat[asm].unsqueeze(1).contiguous()
-        return flat[: plan.n_cmp_blocks_host].unsqueeze(1).contiguous()
+        if plan.block_positions is None:
+            raise ValueError("TND assembly requires plan.block_positions.")
+        # Keep K's logical length in step with the current cumulative lengths.
+        return flat[: plan.block_positions.numel()].unsqueeze(1).contiguous()
 
     def forward(
         self,

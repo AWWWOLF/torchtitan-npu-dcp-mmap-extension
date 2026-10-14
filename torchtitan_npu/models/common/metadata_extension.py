@@ -11,11 +11,39 @@ on the Decoder — including its own context-parallel handling).  The
 ``MetadataExtension`` owns the remaining backend-specific metadata.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
+import tyro
 from torch.utils._pytree import GetAttrKey, KeyEntry, register_pytree_node
 from torchtitan.config.configurable import Configurable
+
+
+class SparseAttentionMetadata(Configurable):
+    """Select the sparse-attention metadata implementation independently."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        extension: Annotated[type[Configurable] | None, tyro.conf.Suppress] = None
+
+    def __init__(self, config: Config):
+        del config
+
+
+class CompressorMetadata(Configurable):
+    """Build compressor metadata only when explicitly selected."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        callback: Annotated[Callable[[Any], None] | None, tyro.conf.Suppress] = None
+
+    def __init__(self, config: Config):
+        self.callback = config.callback
+
+    def __call__(self, metadata) -> None:
+        if self.callback is not None:
+            self.callback(metadata)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -33,6 +61,8 @@ class MetadataExtension(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
+        sparse_attn: SparseAttentionMetadata.Config = field(default_factory=SparseAttentionMetadata.Config)
+        compressor: CompressorMetadata.Config = field(default_factory=CompressorMetadata.Config)
         window_size: int = 0
         """The sliding-window size (model-config constant), consumed by the
         vendor extension's kernel metadata fills."""
@@ -53,10 +83,23 @@ class MetadataExtension(Configurable):
         )
         """Shared LI operator contract available to backend extensions."""
 
+        def build(self, **kwargs):
+            from torchtitan.config import derive
+
+            selected: Configurable.Config = self
+            if self.sparse_attn.extension is not None:
+                selected = derive(self, self.sparse_attn.extension.Config)
+            return Configurable.Config.build(selected, **kwargs)
+
     def __init__(self, config: Config):
         self.config = config
+        self._compressor_metadata = config.compressor.build()
+
+    def prepare_compressor_metadata(self, metadata) -> None:
+        self._compressor_metadata(metadata)
 
     def __call__(self, metadata):
+        self.prepare_compressor_metadata(metadata)
         return metadata
 
 
@@ -97,7 +140,8 @@ def register_pytree_node_for_dataclass(cls: type) -> None:
 
     if cls in SUPPORTED_NODES:
         return
-    field_names = [f.name for f in fields(cls)]
+    # Eager-only caches must not add batch-dependent primitive leaves to a graph.
+    field_names = [f.name for f in fields(cls) if f.metadata.get("pytree", True)]
 
     def flatten(obj):
         return [getattr(obj, name) for name in field_names], None

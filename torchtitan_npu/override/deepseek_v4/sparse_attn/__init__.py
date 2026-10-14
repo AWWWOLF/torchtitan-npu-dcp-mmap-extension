@@ -18,7 +18,7 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 
 from torchtitan_npu.models.common.metadata_extension import (
     LightningIndexerMetadata,
-    MetadataExtension,
+    SparseAttentionMetadata,
 )
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
@@ -26,21 +26,22 @@ from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
 from .golden import GoldenCompressedSparseInnerAttention
 
 if TYPE_CHECKING:
-    from .ascendc import AscCompressedSparseInnerAttention, AscMetadataExtension
+    from .ascendc import AscCompressedSparseInnerAttention
     from .pypto import PyPTOCompressedSparseInnerAttention
 
 
 @override(
-    target=MetadataExtension.Config,
+    target=SparseAttentionMetadata.Config,
+    exact=True,
     description=("Precompute the AscendC sparse-attention metadata kernels onto the model-built DSV4 varlen contract"),
 )
 def asc_metadata(
-    cfg: MetadataExtension.Config,
-) -> "AscMetadataExtension.Config":
+    cfg: SparseAttentionMetadata.Config,
+) -> SparseAttentionMetadata.Config:
     # Imported lazily so the golden path does not require cann_ops_transformer.
     from .ascendc import AscMetadataExtension
 
-    return derive(cfg, AscMetadataExtension.Config)
+    return derive(cfg, SparseAttentionMetadata.Config, extension=AscMetadataExtension)
 
 
 @override(
