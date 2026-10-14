@@ -10,7 +10,6 @@ from functools import partial
 from typing import cast
 
 import torch.nn as nn
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, RoPE
@@ -24,7 +23,7 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata
+from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata, MetadataExtension
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention, UnitScaleRMSNorm
@@ -40,7 +39,6 @@ from .mtp import (
     MTPLoss,
 )
 from .parallelize import parallelize_deepseek_v4
-from .reference import ReferenceMetadataExtension
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
@@ -386,7 +384,6 @@ def _build_v4_layers(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
-    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -571,7 +568,6 @@ def _make_v4_config(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
-    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -673,10 +669,10 @@ def _make_v4_config(
         ),
         layers=layers,
         window_size=window_size,
-        block_size=block_size,
-        metadata_extension=ReferenceMetadataExtension.Config(
+        # The default extension is the identity: the packed offsets are the whole contract.
+        # The geometry fields are for the vendor extensions that replace it.
+        metadata_extension=MetadataExtension.Config(
             window_size=window_size,
-            block_size=block_size,
             num_heads=n_heads,
             head_dim=head_dim,
             index_n_heads=index_n_heads,

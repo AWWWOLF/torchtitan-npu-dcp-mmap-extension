@@ -247,12 +247,28 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
             q = torch.randn(1, 4, 2, 3, requires_grad=True)
             k = torch.randn(1, 2, 3, requires_grad=True)
             w = torch.randn(1, 4, 2, requires_grad=True)
-            mask = torch.ones(1, 1, 4, 2, dtype=torch.bool)
+            picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64).view(1, 4, 2)
+            cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
             context = partial(create_selective_checkpoint_contexts, list(ac.build().get_save_ops()))
-            _, actual = checkpoint(
-                dsv4.compressor.Indexer.select, q, k, w, mask, 2, use_reentrant=False, context_fn=context
+            actual = checkpoint(
+                dsv4.compressor.student_logits_at_picks,
+                q,
+                k,
+                w,
+                picks,
+                cu_seqlens,
+                cu_seqlens_k,
+                use_reentrant=False,
+                context_fn=context,
             )
-            expected = (torch.einsum("bshd,btd->bsht", q, k).relu() * w.unsqueeze(-1)).sum(2)
+            expected = torch.stack(
+                [
+                    (torch.einsum("hd,d->h", q[0, token], k[0, pick]).relu() * w[0, token]).sum()
+                    for token in range(4)
+                    for pick in (0, 1)
+                ]
+            ).view(1, 4, 2)
             torch.testing.assert_close(actual, expected)
             for result, reference in zip(
                 torch.autograd.grad(actual.sum(), (q, k, w)),

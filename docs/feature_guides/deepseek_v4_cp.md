@@ -16,7 +16,7 @@ NGPU=2 \
 
 - `--parallelism.context-parallel-degree > 1` 时即启用 CP；必须配合 `--parallelism.spmd-backend spmd_types`（`spmd_types` 后端是压缩容器 `S(1) -> R` 声明式 all-gather 的前提）。
 - `--parallelism.context-parallel-load-balancer` 支持 `headtail`（默认）与 `None`（plain 顺序切分）。headtail 要求 `seq_len` 整除 `2 * context_parallel_degree`，plain 要求整除 `context_parallel_degree`，不满足时 `_build_cp_metadata` 直接报错。
-- 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效，参考 tier 与 golden 限定无 CP（对 `cu_seq_q != cu_seq_k` 报错）。
+- 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效：分片帧由融合 metadata 承载，模型目录自带的默认内核与 golden 读不了这些帧，因而都只支持无 CP。
 - `local_batch_size == 1` 是当前文档打包约定（增大批数据应提高 `seq_len`）；DSA 路径 TP 固定为 1。
 
 ## 设计要点

@@ -113,9 +113,19 @@ def test_indexer_scores_and_gradients_with_checkpoint(forward_with_checkpoint):
     query = torch.randn(1, 4, 2, 3, requires_grad=True)
     key = torch.randn(1, 2, 3, requires_grad=True)
     weight = torch.randn(1, 4, 2, requires_grad=True)
-    mask = torch.ones(1, 1, 4, 2, dtype=torch.bool)
-    _, actual = forward_with_checkpoint(dsv4.compressor.Indexer.select, query, key, weight, mask, 2)
-    expected = (torch.einsum("bshd,btd->bsht", query, key).relu() * weight.unsqueeze(-1)).sum(dim=2)
+    picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64).view(1, 4, 2)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
+    actual = forward_with_checkpoint(
+        dsv4.compressor.student_logits_at_picks, query, key, weight, picks, cu_seqlens, cu_seqlens_k
+    )
+    expected = torch.stack(
+        [
+            (torch.einsum("hd,d->h", query[0, token], key[0, pick]).relu() * weight[0, token]).sum()
+            for token in range(4)
+            for pick in (0, 1)
+        ]
+    ).view(1, 4, 2)
     torch.testing.assert_close(actual, expected)
     _assert_gradients_match(actual, expected, (query, key, weight))
 

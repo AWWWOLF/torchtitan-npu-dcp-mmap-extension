@@ -49,7 +49,6 @@ from torchtitan_npu.models.deepseek_v4.metadata import (
     CompressedVarlenMetadata,
     register_pytree_node_for_dataclass,
 )
-from torchtitan_npu.models.deepseek_v4.reference import ReferenceCompressedVarlenMetadata
 from torchtitan_npu.override import _IS_A5
 
 _LAYOUT = "TND"
@@ -706,7 +705,7 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         *,
         attn_sink: torch.Tensor | None = None,
         sparse_indices=None,
-        attention_masks: ReferenceCompressedVarlenMetadata | None = None,
+        attention_masks: CompressedVarlenMetadata | None = None,
     ) -> torch.Tensor:
         hooks = self.hooks
         if not isinstance(attention_masks, AscCompressedVarlenMetadata):

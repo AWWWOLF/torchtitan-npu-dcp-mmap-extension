@@ -24,11 +24,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.metadata import CompressedVarlenMetadata
-from torchtitan_npu.models.deepseek_v4.reference import (
-    ReferenceCompressedVarlenMetadata,
+from torchtitan_npu.models.deepseek_v4.attention import (
+    CompressedSparseInnerAttention,
+    _reject_cp_frames,
 )
+from torchtitan_npu.models.deepseek_v4.metadata import CompressedVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
     _AuxLossInjection,
     _should_run_forward,
@@ -179,36 +179,6 @@ def _indexer_kl_loss_sum(
     return torch.stack(losses).sum()
 
 
-def _packed_block_docs(plan, total_blocks: int, device) -> torch.Tensor:
-    """Document id of every packed block (0-based, int64)."""
-    if total_blocks == 0:
-        return torch.empty((0,), dtype=torch.int64, device=device)
-    return torch.searchsorted(
-        plan.cu_seqlens_cmp_k[1:],
-        torch.arange(total_blocks, device=device),
-        right=True,
-    )
-
-
-def _container_to_local_indices(
-    sparse_indices: torch.Tensor,
-    metadata: ReferenceCompressedVarlenMetadata,
-) -> torch.Tensor:
-    if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
-        sparse_indices = sparse_indices.squeeze(2)
-    if sparse_indices.ndim != 3:
-        raise ValueError("golden LI expects sparse_indices with shape [B, L, K] or [B, L, 1, K].")
-    # Align global container slots from LI with packed local KV indices.
-    block_local = metadata.reference.ratios[4].block_local
-    if block_local is None:
-        raise ValueError("golden LI requires reference block-local indices.")
-    safe = sparse_indices.clamp_min(0).long()
-    block_local = block_local.unsqueeze(1).expand(-1, sparse_indices.shape[1], -1)
-    local = torch.gather(block_local, dim=2, index=safe)
-    valid = (sparse_indices >= 0) & (local >= 0)
-    return torch.where(valid, local, torch.full_like(local, -1)).flatten(0, 1)
-
-
 class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
     """Reference DSA sparse attention over packed varlen metadata."""
 
@@ -255,61 +225,6 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             indices[q_start:q_end, :compressed_len] = torch.where(candidates < limit.unsqueeze(1), candidates, -1)
         return indices
 
-    def _select_topk(
-        self,
-        idx_q,
-        idx_k,
-        idx_w,
-        metadata: ReferenceCompressedVarlenMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """CSA reference: FP32 indexer scores, per-document causal top-k.
-
-        Returns document-local compressed indices ``[T, topk]`` (``-1`` for
-        unused slots) and the masked scores, matching the baseline's
-        formulation.
-        """
-        if idx_q is None or idx_k is None or idx_w is None:
-            raise ValueError("ratio-4 golden reference requires all LI projection tensors.")
-        plan = metadata.plans[4]
-        idx_q = idx_q.flatten(0, 1)
-        idx_k = idx_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
-        idx_w = idx_w.flatten(0, 1)
-        total_tokens = idx_q.shape[0]
-        total_blocks = idx_k.shape[0]
-
-        index_score = torch.einsum("thd,ud->thu", idx_q.float(), idx_k.float())
-        index_score = (index_score.relu_() * idx_w.float().unsqueeze(-1)).sum(dim=1)
-
-        query_docs = metadata.reference.doc_of_token.flatten()
-        token_positions = metadata.reference.pos_in_doc.flatten()
-        causal_limit = torch.div(token_positions + 1, self.compress_ratio, rounding_mode="floor")
-        block_docs = _packed_block_docs(plan, total_blocks, idx_q.device)
-        if total_blocks:
-            block_local = torch.arange(total_blocks, device=idx_q.device) - (
-                plan.cu_seqlens_cmp_k[  # pyrefly: ignore [unsupported-operation]
-                    block_docs
-                ].long()
-            )
-            valid = torch.eq(query_docs.unsqueeze(1), block_docs.unsqueeze(0))
-            valid = torch.logical_and(valid, torch.lt(block_local.unsqueeze(0), causal_limit.unsqueeze(1)))
-            index_score = index_score.masked_fill(torch.logical_not(valid), torch.finfo(index_score.dtype).min)
-        else:
-            valid = torch.zeros((total_tokens, 0), dtype=torch.bool, device=idx_q.device)
-
-        selected_width = min(self.index_topk, total_blocks)
-        selected_score, selected_global = index_score.topk(selected_width, dim=-1)
-        selected_valid = torch.gather(valid, dim=-1, index=selected_global)
-        compressed_doc_starts = torch.searchsorted(block_docs, query_docs)
-        selected_local = selected_global - compressed_doc_starts.unsqueeze(1)
-        selected_local = torch.where(selected_valid, selected_local, -1)
-        selected_score = selected_score.masked_fill(~selected_valid, float("-inf"))
-
-        pad = self.index_topk - selected_width
-        if pad:
-            selected_local = F.pad(selected_local, (0, pad), value=-1)
-            selected_score = F.pad(selected_score, (0, pad), value=float("-inf"))
-        return selected_local, selected_score
-
     def forward(
         self,
         q,
@@ -321,7 +236,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         attn_sink=None,
         *,
         sparse_indices=None,
-        attention_masks: ReferenceCompressedVarlenMetadata | None = None,
+        attention_masks: CompressedVarlenMetadata | None = None,
     ):
         if not isinstance(attention_masks, CompressedVarlenMetadata):
             raise TypeError(
@@ -329,6 +244,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 f"CompressedVarlenMetadata attention masks, got "
                 f"{type(attention_masks)}."
             )
+        _reject_cp_frames(attention_masks)
         metadata = attention_masks
         query = q.flatten(0, 1)
         original_kv = swa_k.flatten(0, 1)
@@ -342,7 +258,13 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         if self.compress_ratio == 4:
             if sparse_indices is None:
                 raise ValueError("ratio-4 golden reference requires sparse_indices.")
-            compressed_indices = _container_to_local_indices(sparse_indices, metadata)
+            if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
+                sparse_indices = sparse_indices.squeeze(2)
+            if sparse_indices.ndim != 3:
+                raise ValueError("golden LI expects sparse_indices with shape [B, L, K] or [B, L, 1, K].")
+            # The caller's selection is already numbered inside each query's own document,
+            # which is the numbering both this golden and the packed operator read.
+            compressed_indices = sparse_indices.flatten(0, 1)
         elif self.compress_ratio > 1:
             compressed_indices = self._packed_compressed_indices(metadata, query.device)
         else:

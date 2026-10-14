@@ -407,10 +407,10 @@ gather-matmul 使用 FP32 计算，并用于与 `dsv4-infer-npu` 基线及 Ascen
 `sparse_attn.asc_metadata`。两种注意力实现声明同一 target，也不能同时启用。
 
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
-token 数时应调整 `seq_len`。Golden reference 使用包含 reference tier 的
-`CompressedVarlenMetadata`，当前仅支持无 context parallel 的连续文档布局。AscendC
-路径使用独立的精简 `AscCompressedVarlenMetadata`，只携带 kernel contract 和预计算
-的 AscendC metadata，不构造 Golden 路径使用的稠密 mask、文档位置和静态块列表。
+token 数时应调整 `seq_len`。Golden reference 与模型目录默认内核都使用公共的
+`CompressedVarlenMetadata`（只含 kernel contract 与 packed 偏移），当前仅支持无
+context parallel 的连续文档布局。AscendC 路径使用独立的精简
+`AscCompressedVarlenMetadata`，只携带 kernel contract 和预计算的 AscendC metadata。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 

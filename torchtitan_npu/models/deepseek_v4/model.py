@@ -12,7 +12,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
     _HeadTailLoadBalancer,
 )
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import TransformerBlock
@@ -85,7 +84,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         compress_ratios: tuple[int, ...]
         n_layers: int
         window_size: int
-        block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
         lightning_indexer_metadata: LightningIndexerMetadata.Config = field(
             default_factory=LightningIndexerMetadata.Config
@@ -113,8 +111,8 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
             # Context parallel is supported on the AscendC fused path only: the
             # model's build_attention_masks derives the per-rank dispatch
-            # plan when the trainer passes the CP mesh; the model-dir
-            # reference tier and the golden stay no-CP-only and raise there.
+            # plan when the trainer passes the CP mesh, and only the fused
+            # kernels take those frames through their own metadata.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -186,7 +184,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             layer.attention.compress_ratio for layer in cfg.mtp_layers
         )
         self.window_size = cfg.window_size
-        self.block_size = cfg.block_size
 
         self._metadata_extension = cfg.metadata_extension.build()
         self._lightning_indexer_metadata = cfg.lightning_indexer_metadata.build()
@@ -207,8 +204,8 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         (``build_compressed_varlen_metadata``) is always built; under CP
         ``_build_cp_metadata`` shards the inputs and derives the rank-local
         plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (e.g. the reference tier or the AscendC
-        kernel metadata) runs last.
+        the ``metadata_extension`` (the AscendC kernel metadata, for one)
+        runs last.
         """
         positions = extra_kwargs.get("positions")
         mtp_batch = None

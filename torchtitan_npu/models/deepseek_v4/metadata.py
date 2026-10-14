@@ -17,10 +17,9 @@ This module carries only the **common** contract — the kernel-contract
 Compressor, the kernels, and every attention path.  Further layers live
 outside this module; the LI metadata provider fills ``plans[4].li_metadata``:
 
-- the **reference tier** (per-token document ids/positions, the dense
-  attendability mask, the container-slot scatter, the static block
-  listing) is delivered by the ``metadata_extension`` seam
-  (``reference.py``'s ``ReferenceMetadataExtension``, the default);
+- the **vendor kernel metadata** (the AscendC tensors, for one) is delivered by the
+  ``metadata_extension`` seam, whose default is the identity: the packed offsets
+  are the whole contract an attention path needs;
 - the **context-parallel layer** (the plan builder + the dispatcher) lives
   in ``token_dispatcher.py``: a ratio-independent ``WindowPlan`` on the
   metadata (``window``) and the per-ratio block plans at ``plans[ratio]``,
@@ -160,7 +159,7 @@ class CompressedVarlenMetadata:
     Carried as ``attention_masks`` through the DSA layers.  Built by
     the model's ``build_attention_masks`` from a ``VarlenMetadata``
     stream: the kernel contract (``plans``).  The ``metadata_extension``
-    (e.g. the AscendC kernel metadata, or the reference tier) post-processes
+    (e.g. the AscendC kernel metadata) post-processes
     it into the concrete per-path contract.
 
     The container grid is ``[1, S]`` with ``S`` equal to the total token
@@ -212,8 +211,8 @@ class CompressedKernelContract(Protocol):
 
     Consumers that read only the plans (e.g. the Compressor) accept this
     protocol instead of the concrete metadata type, so the fused path's
-    slim metadata (which carries no reference tier) satisfies the contract
-    without the model directory knowing about it.
+    slim metadata satisfies the contract without the model directory
+    knowing about it.
     """
 
     plans: dict[int, CompressedBlockLayout]
@@ -225,9 +224,9 @@ def build_kernel_layout(
 ) -> dict[int, CompressedBlockLayout]:
     """The kernel-contract tier: the per-ratio plans for a plain stream.
 
-    Called once per batch by ``build_compressed_varlen_metadata``; the
-    AscendC path materializes no reference tier (its extension only consumes
-    the plans).  The container grid is ``[1, S]`` with ``S`` equal to the
+    Called once per batch by ``build_compressed_varlen_metadata``; a vendor
+    extension only consumes these plans and adds its own tensors on top.  The
+    container grid is ``[1, S]`` with ``S`` equal to the
     total token count, so the layout is derived purely from the document
     boundaries and the ratios.  Context-parallel streams must use
     ``build_cp_plan`` instead (guarded below).
@@ -315,9 +314,9 @@ def build_compressed_varlen_metadata(
     """Build the DSV4 varlen contract for one rank-local token stream.
 
     Called once per batch by the model's ``build_attention_masks``: the
-    common kernel contract (``build_kernel_layout``).  The reference tier
-    and the vendor kernel tensors are filled by the ``metadata_extension``
-    (``reference.py`` / the AscendC override).
+    common kernel contract (``build_kernel_layout``).  The vendor kernel
+    tensors are filled by the ``metadata_extension`` (the AscendC override,
+    for one).
 
     Args:
         varlen: Rank-local ``VarlenMetadata``.  ``cu_seq_q`` is

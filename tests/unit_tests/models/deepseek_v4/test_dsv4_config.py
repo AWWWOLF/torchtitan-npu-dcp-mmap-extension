@@ -42,6 +42,25 @@ def test_debugmodel_uses_cann_profiler_extension():
     assert isinstance(config.profiler.build(), CANNProfiler)
 
 
+def test_every_layer_pins_the_core_config_the_overrides_target():
+    """The sparse core's config type is the anchor the fused overrides replace.
+
+    ``asc``/``pypto``/``golden`` are registered against exactly this type, so a model that
+    moved to another Config class would quietly run the reference core instead of the fused
+    one.  The core's implementation may change; this anchor may not.
+    """
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+
+    model_config = model_registry("debugmodel").model
+    cores = [layer.attention.compressed_sparse_attention.inner_attention for layer in model_config.layers]
+
+    assert len(cores) == len(model_config.compress_ratios) == 4
+    for core in cores:
+        assert type(core) is CompressedSparseInnerAttention.Config
+        assert isinstance(core, CompressedSparseInnerAttention.Config)
+
+
 def test_flash_rope_configs_pin_split_per_site():
     """Every rope site's config carries the split matching its tensor width."""
     from torchtitan_npu.models.deepseek_v4 import model_registry

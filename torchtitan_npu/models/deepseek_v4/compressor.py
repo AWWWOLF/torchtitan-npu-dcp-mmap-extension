@@ -3,21 +3,23 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from dataclasses import dataclass, field
 from functools import cache
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from attn_gym.sparse import lightning_indexer
 from torchtitan.config import Configurable
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.models.common.metadata_extension import LightningIndexerKernelConfig
 
-from .metadata import CompressedKernelContract
 from .token_dispatcher import CPTokenDispatcher
 
 
@@ -153,7 +155,10 @@ class Compressor(Module):
         under context parallel it exchanges the projected rows of the
         plan's ``[A, B)`` block region.
         """
-        if not isinstance(attention_masks, CompressedKernelContract):
+        # The contract is checked by the attribute the compressor reads rather than by
+        # ``isinstance``: this protocol is runtime-checkable, and inside a dynamo region the
+        # static path rejects metadata that carries every member the check is about.
+        if getattr(attention_masks, "plans", None) is None:
             raise TypeError(
                 "DSV4 compression requires a CompressedKernelContract (the "
                 "model-dir CompressedVarlenMetadata or the NPU slim type), "
@@ -257,33 +262,71 @@ class Indexer(Module):
         idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
         return idx_q, idx_k, idx_w
 
-    @staticmethod
-    def select(
-        idx_q,
-        idx_k,
-        idx_w,
-        dense_mask: torch.Tensor,
-        topk: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select the top-k compressed container slots per query.
 
-        Scores are masked by the precomputed attendability dense mask (same
-        document and causally reachable), so all returned indices are
-        attendable.  Unused slots hold ``-1``.
+def select_compressed_slots(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    idx_w: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """The reference selection: Attention Gym's packed ``lightning_indexer``.
 
-        Returns:
-            topk_indices: ``[B, L, K]`` container-grid slots, ``K =
-                min(topk, S // ratio)``.
-            index_scores: ``[B, L, S // ratio]`` masked indexer scores.
-        """
-        index_score = torch.einsum("bshd,btd->bsht", idx_q.float(), idx_k.float())
-        index_score = index_score.relu() * idx_w.float().unsqueeze(-1)
-        index_score = index_score.sum(dim=2)
+    The operator applies each query's own document's causal limit itself and numbers the picks
+    inside that document -- the numbering ``gather_attn`` reads -- so nothing rebases them here.
+    Every row it cannot fill comes back as ``-1``, and the packed gather only reads entries
+    inside the query's own document pool, so an empty pool can never name its neighbour's row.
+    Its score is
+    ``sum_h w * relu(q . k) / sqrt(H * D)``, and the caller's weights already carry the model's
+    own scale, so multiplying them by ``sqrt(H * D)`` cancels that division exactly.  ``topk``
+    is clamped to the pool's width, as this model's selection has always been.
+    """
+    bsz, _, heads, head_dim = idx_q.shape
+    if bsz != 1:
+        raise ValueError(f"the packed selection addresses one row, got batch size {bsz}.")
+    return lightning_indexer(
+        idx_q.float(),
+        idx_k.float(),
+        idx_w.float() * math.sqrt(heads * head_dim),
+        min(topk, idx_k.size(1)),
+        causal=True,
+        compress_ratio=4,
+        cu_seqlens=cu_seqlens.contiguous(),
+        cu_seqlens_k=cu_seqlens_k.contiguous(),
+        impl="reference",
+    )
 
-        k = min(topk, idx_k.shape[1])
-        index_score = index_score.where(dense_mask.squeeze(1), float("-inf"))
-        topk_scores, topk_indices = index_score.topk(k, dim=-1)
-        return topk_indices.where(topk_scores.isfinite(), -1), index_score
+
+def student_logits_at_picks(
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    idx_w: torch.Tensor,
+    topk_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> torch.Tensor:
+    """The per-head scores at a document-local selection: the pass that carries gradient.
+
+    The selection itself is discrete, so only the picks can be scored differentiably -- and a
+    selection that returns indices alone leaves nothing to gather them from, which is why this
+    is a pass of its own rather than a by-product of the selection.  ``topk_indices`` is
+    renumbered onto the row-wide entries the pooled keys are stored in; a ``-1`` slot is
+    gathered harmlessly and marked ``-inf``, the value a softmax drops.  The row is the batch,
+    so the key axis is squeezed.  Returns ``[B, L, K]``, head-summed and in the model's own
+    score scale (``select_compressed_slots`` cancels the operator's internal division; this
+    pass never divides).
+
+    No production call site reads this pass yet: the reference recipe's indexer loss lives in
+    the golden override, and the fused one runs inside its SLIG bridge.  It is the reference
+    teacher pass that the LI/teacher binding is meant to consume, and until that lands it is
+    pinned by the unit tests only.
+    """
+    pool_start_L1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
+    picked_BLKDi = idx_k.squeeze(0)[(topk_indices + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)
+    scores_BLHK = torch.einsum("blhd,blkd->blhk", idx_q, picked_BLKDi)
+    weighted_BLHK = scores_BLHK.relu() * idx_w.unsqueeze(-1)
+    return weighted_BLHK.sum(dim=2).masked_fill(topk_indices < 0, -torch.inf)
 
 
 class LightningIndexer(Module):
@@ -298,5 +341,14 @@ class LightningIndexer(Module):
         self.li_kernel_config = config.li_kernel_config
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_masks):
-        dense_mask = attention_masks.reference.ratios[4].dense_mask
-        return Indexer.select(idx_q, idx_k, idx_w, dense_mask, self.index_topk)[0]
+        plan = attention_masks.plans.get(4)
+        if plan is None or plan.cu_seqlens_cmp_k is None:
+            raise ValueError("LightningIndexer requires a ratio-4 plan carrying a compressed pool.")
+        return select_compressed_slots(
+            idx_q,
+            idx_k,
+            idx_w,
+            attention_masks.varlen.cu_seq_q,
+            plan.cu_seqlens_cmp_k,
+            self.index_topk,
+        )

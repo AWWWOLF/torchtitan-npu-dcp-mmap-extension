@@ -15,9 +15,8 @@ from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.deepseek_v4 import _debugmodel
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.compressor import Indexer
+from torchtitan_npu.models.deepseek_v4.compressor import select_compressed_slots
 from torchtitan_npu.models.deepseek_v4.metadata import build_compressed_varlen_metadata
-from torchtitan_npu.models.deepseek_v4.reference import ReferenceMetadataExtension
 from torchtitan_npu.models.deepseek_v4.token_dispatcher import CPTokenDispatcher
 from torchtitan_npu.override.deepseek_v4.sparse_attn import golden as golden_factory
 from torchtitan_npu.override.deepseek_v4.sparse_attn.golden import GoldenCompressedSparseInnerAttention
@@ -35,15 +34,20 @@ def packed_metadata():
     # A short document has no compressed keys; the others have ragged tails.
     boundaries = torch.tensor([0, 3, 12, 24], dtype=torch.int32)
     varlen = VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries.clone(), max_q=12, max_k=12)
-    common = build_compressed_varlen_metadata(varlen, (1, 4))
-    return ReferenceMetadataExtension.Config(window_size=3, block_size=(4, 4)).build()(common)
+    return build_compressed_varlen_metadata(varlen, (1, 4))
+
+
+def _doc_relative_positions(metadata):
+    """The positions the model passes to the indexer: each document counts from zero."""
+    bounds = metadata.varlen.cu_seq_q.tolist()
+    return torch.cat([torch.arange(end - start) for start, end in zip(bounds[:-1], bounds[1:])]).unsqueeze(0)
 
 
 def _golden_core(monkeypatch, coefficient):
     registry = importlib.import_module("torchtitan.config.override")
     monkeypatch.setattr(registry, "_REGISTRY", registry._REGISTRY.copy())
     root = _RootConfig(attention=CompressedSparseInnerAttention.Config(
-        window_size=3, compress_ratio=4, softmax_scale=0.5, index_topk=3, block_size=(4, 4),
+        window_size=3, compress_ratio=4, softmax_scale=0.5, index_topk=3,
     ))
     apply_overrides(OverrideConfig(imports=[
         (f"{golden_factory.__module__}.{golden_factory.__name__}", {"indexer_loss_coeff": coefficient}),
@@ -70,15 +74,15 @@ def _dense_oracle(inputs, sparse, metadata):
         c_start, c_end = cmp_bounds[document:document + 2]
         for row in range(start, end):
             chosen = sparse[0, row]
-            chosen = chosen[(chosen >= c_start) & (chosen < c_end)]
+            chosen = chosen[chosen >= 0]
             window = window_k[0, max(start, row - 2):row + 1]
-            keys = torch.cat((window, cmp_k[0, chosen]))
+            keys = torch.cat((window, cmp_k[0, c_start + chosen]))
             logits = q[0, row] @ keys.T * 0.5
             probabilities = torch.cat((logits, sink[:, None]), dim=-1).softmax(-1)
             outputs.append(probabilities[:, :-1] @ keys)
             if chosen.numel():
                 teacher = probabilities[:, window.shape[0]:-1].detach().sum(0)
-                scores = (torch.relu(idx_q[0, row] @ idx_k[0, chosen].T) * idx_w[0, row, :, None]).sum(0)
+                scores = (torch.relu(idx_q[0, row] @ idx_k[0, c_start + chosen].T) * idx_w[0, row, :, None]).sum(0)
                 target = teacher / teacher.sum()
                 loss = loss + (teacher * (target.log() - scores.log_softmax(-1))).sum()
     return torch.stack(outputs).unsqueeze(0), loss * (0.5 / 24)
@@ -92,7 +96,9 @@ def test_golden_auxiliary_loss_and_gradients_match_dense_oracle(monkeypatch, pac
     inputs = _inputs()
     expected_inputs = [value.detach().clone().requires_grad_() for value in inputs]
     q, window_k, cmp_k, idx_q, idx_k, idx_w, sink = inputs
-    sparse, _ = Indexer.select(idx_q, idx_k, idx_w, packed_metadata.reference.ratios[4].dense_mask, 3)
+    sparse = select_compressed_slots(
+        idx_q, idx_k, idx_w, packed_metadata.varlen.cu_seq_q, packed_metadata.plans[4].cu_seqlens_cmp_k, 3
+    )
     expected_output, expected_aux = _dense_oracle(expected_inputs, sparse, packed_metadata)
 
     actual = core(q, window_k, cmp_k, idx_q, idx_k, idx_w, attn_sink=sink,
@@ -118,7 +124,9 @@ def test_golden_auxiliary_loss_preserves_forward_and_respects_disable(monkeypatc
         inactive.eval()
     inputs = _inputs()
     q, window_k, cmp_k, idx_q, idx_k, idx_w, sink = inputs
-    sparse, _ = Indexer.select(idx_q, idx_k, idx_w, packed_metadata.reference.ratios[4].dense_mask, 3)
+    sparse = select_compressed_slots(
+        idx_q, idx_k, idx_w, packed_metadata.varlen.cu_seq_q, packed_metadata.plans[4].cu_seqlens_cmp_k, 3
+    )
     kwargs = dict(attn_sink=sink, sparse_indices=sparse, attention_masks=packed_metadata)
 
     output = inactive(*inputs[:-1], **kwargs)
@@ -154,10 +162,12 @@ def test_golden_auxiliary_backward_reaches_all_indexer_parameters(monkeypatch, p
     qr = torch.randn(1, 24, config.wq_b.in_features, generator=generator)
     core = _golden_core(monkeypatch, 1.0)
     q, window_k, cmp_k, _, _, _, sink = _inputs()
-    idx_q, keys, idx_w = indexer(x, qr, positions=packed_metadata.reference.pos_in_doc,
+    idx_q, keys, idx_w = indexer(x, qr, positions=_doc_relative_positions(packed_metadata),
                                 attention_masks=packed_metadata)
     idx_k = CPTokenDispatcher.Config().build().select(keys, packed_metadata.plans[4])
-    sparse, _ = Indexer.select(idx_q, idx_k, idx_w, packed_metadata.reference.ratios[4].dense_mask, 3)
+    sparse = select_compressed_slots(
+        idx_q, idx_k, idx_w, packed_metadata.varlen.cu_seq_q, packed_metadata.plans[4].cu_seqlens_cmp_k, 3
+    )
 
     output = core(q, window_k, cmp_k, idx_q, idx_k, idx_w, attn_sink=sink,
                   sparse_indices=sparse, attention_masks=packed_metadata)

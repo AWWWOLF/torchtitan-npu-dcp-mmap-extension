@@ -35,12 +35,15 @@ golden 与 patched transformers 比特一致，AscendC 融合内核与 golden �
         │
         ├─ positions + VarlenMetadata
         │      └─ CompressedVarlenMetadata（build_compressed_varlen_metadata 一次性构建公共契约；
-        │         参考 tier 与 AscendC 内核张量经 metadata_extension 注入）
+        │         AscendC 内核张量经 metadata_extension 注入）
         │
         ├─ Compressor：按统一契约（gather_indices/block_positions/first_indices）压缩 → 池化键流；CP 下 Compressor 内部 borrow 原始行（borrow_x），调用侧按 plan 的 kept_indices/out_width 装入容器网格（pack_container）
         │
-        ├─ 参考内核（golden/默认）
-        │     kv = [swa_k | cmp_k 容器 | sink]，文档感知 BlockMask + dense mask top-k
+        ├─ 默认内核（CompressedSparseInnerAttention）
+        │     gather_attn(q, swa_k, cmp_k 容器, 选择) + sink；选择由 LightningIndexer 给出
+        │
+        ├─ golden override（eager 逐文档 FP32，比特级数值参考）
+        │     逐文档 gather-matmul + 逐文档 indexer top-k
         │
         └─ AscendC 融合内核（AscCompressedSparseInnerAttention）
              q/swa_k flatten → [T, N, D] / [T, 1, D]
@@ -65,12 +68,11 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 [`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `CompressedVarlenMetadata`。每个 batch 由 `DeepSeekV4Model.build_attention_masks` 统一构建：先从 `VarlenMetadata` 调用 `build_compressed_varlen_metadata` 生成公共契约；启用 CP 时，再由 `_build_cp_metadata` 调用 `build_cp_plan` 生成 rank-local varlen、压缩计划和窗口计划；最后由 `metadata_extension` 补充参考路径或 AscendC 路径专属的 metadata。结果供所有 DSA 层复用：
 
-- `varlen`：`VarlenMetadata` 或 CP 下的 `CPVarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。`build_kernel_layout` 只构建普通流计划，并明确要求 `cu_seq_q == cu_seq_k`；CP 的 rank-local 计划由 `build_cp_plan` 构建，不会把 CP metadata 传给 `build_kernel_layout`。参考 tier 同样只支持 `cu_seq_q == cu_seq_k` 的非 CP 连续文档。
+- `varlen`：`VarlenMetadata` 或 CP 下的 `CPVarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。`build_kernel_layout` 只构建普通流计划，并明确要求 `cu_seq_q == cu_seq_k`；CP 的 rank-local 计划由 `build_cp_plan` 构建，不会把 CP metadata 传给 `build_kernel_layout`。
 - `batch_size` / `seq_len`：容器网格形状。DSV4 打包场景使用 `local_batch_size == 1`，因此 `batch_size == 1`、`seq_len` 等于总 token 数（`cu_seq_q[-1]`），元数据完全由 varlen 流推导，不依赖 positions。
 - `plans[ratio]`：每个模型实际使用的压缩比（1、4、128）对应一个 `CompressedBlockLayout`：
   - `cu_seqlens_cmp_k`、`block_remainder`：打包压缩块流边界与每文档尾部余数，直接喂给 AscendC 算子；
   - `gather_indices`、`block_positions`、`first_indices`：统一的 Compressor 契约（块 token gather、文档内块起点 RoPE、文档/段首块位置——重叠 borrow 掩码），CP 与非 CP 以同一字段名提供。非 CP 字段由 `build_kernel_layout` 生成；CP 下的 `plans[ratio]` 由 `build_cp_plan` 生成，并额外携带 dispatcher 所需字段。
-- `reference.ratios[ratio]`：保存 `dense_mask`、`doc_of_block`、`block_local` 和 `static_blocks` 等参考路径字段，由 `ReferenceMetadataExtension` 一次性预计算，不属于公共 `plans[ratio]`。
 - `asc_plans[ratio]`：保存 AscendC 的 `smla_metadata`、`smla_grad_metadata`、`li_metadata` 和 `slig_metadata`。这些张量不进入模型目录的公共 metadata；AscendC extension 返回携带该字段的 `AscCompressedVarlenMetadata`。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
@@ -108,7 +110,9 @@ overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 
 ## 参考路径（默认内核与 golden）
 
-模型目录默认内核是 varlen 化的 `CompressedSparseInnerAttention`（上游 port）：在 `[swa_k | cmp_k | sink]` 拼接的容器 KV 上构建文档感知的两级 `BlockMask`（块列表超集 + token 级 `mask_mod`），CSA 的 top-k 由 `Indexer.select` 在 dense mask 上选择。块列表的静态部分（滑窗、sink、HCA 压缩区）由 `ReferenceMetadataExtension` 预计算进 `reference.ratios[ratio].static_blocks`，每层只做 CSA top-k scatter 与 mask_mod 过滤。golden override 用 eager 逐文档 FP32 实现（gather-matmul + 逐文档 indexer top-k）作为比特级数值参考。
+模型目录默认内核是 `CompressedSparseInnerAttention`：它只读公共 metadata 的 packed 偏移（`cu_seq_q` 与 `plans[ratio].cu_seqlens_cmp_k`），用 Attention Gym 的 `gather_attn` 在 `cat([swa_k, cmp_k 容器])` 上做滑窗 + sink，并按 ratio 取选择——`r=4` 走 `LightningIndexer` 给出的逐文档 TopK，`r=128` 直接取本查询本自然段内因果可达的全部压缩槽。选择与 `gather_attn` 都按“文档内”下标寻址（见 `models/common/document_intervals.py`），因此不再需要文档感知的 BlockMask，也不再需要 `metadata_extension` 预计算参考 tier。
+
+`golden` override 用 eager 逐文档 FP32（gather-matmul + 逐文档 indexer top-k）实现同一层，是当前唯一的比特级数值参考：`test_dsv4.py` 用它锚定默认内核（残差在 fp32 舍入底噪内），融合内核则与它做容差对照。
 
 ## AscendC 融合路径
 
