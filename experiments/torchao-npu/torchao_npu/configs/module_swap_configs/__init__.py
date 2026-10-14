@@ -6,17 +6,23 @@
 """Concrete module-swap quantization configs."""
 
 __all__ = [
-    "QuantCompressorConfig",
-    "QuantLightningIndexerConfig",
-    "QuantV41LightningIndexerConfig",
-    "QuantV41SparseAttentionConfig",
+    "DeepSeekV4QuantLightningIndexerConfig",
+    "DeepSeekV41QuantCompressorConfig",
+    "DeepSeekV41QuantLightningIndexerConfig",
+    "DeepSeekV41QuantSparseAttentionConfig",
     "quant_mode_for_config",
 ]
 
-from torchao_npu.configs.module_swap_configs.quant_compressor import QuantCompressorConfig
-from torchao_npu.configs.module_swap_configs.quant_lightning_indexer import (
-    QuantLightningIndexerConfig,
+from torchao_npu.configs.module_swap_configs.deepseek_v4.quant_lightning_indexer import (
+    DeepSeekV4QuantLightningIndexerConfig,
     quant_mode_for_config,
 )
-from torchao_npu.configs.module_swap_configs.quant_v41_lightning_indexer import QuantV41LightningIndexerConfig
-from torchao_npu.configs.module_swap_configs.quant_v41_sparse_attention import QuantV41SparseAttentionConfig
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_compressor import (
+    DeepSeekV41QuantCompressorConfig,
+)
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_lightning_indexer import (
+    DeepSeekV41QuantLightningIndexerConfig,
+)
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_sparse_attention import (
+    DeepSeekV41QuantSparseAttentionConfig,
+)

@@ -5,7 +5,7 @@
 
 """Module-swap configuration for the DeepSeek-V4.1 QLI/QSLI path."""
 
-__all__ = ["QuantV41LightningIndexerConfig"]
+__all__ = ["DeepSeekV41QuantLightningIndexerConfig"]
 
 from dataclasses import dataclass
 from types import MethodType
@@ -17,7 +17,7 @@ from torchao_npu.configs.module_swap import ModuleSwapConfig
 
 
 @dataclass(kw_only=True, slots=True)
-class QuantV41LightningIndexerConfig(ModuleSwapConfig):
+class DeepSeekV41QuantLightningIndexerConfig(ModuleSwapConfig):
     """Install the ds41 MXFP4 QLI/QSLI selector with its SLIKG backward."""
 
 
@@ -30,7 +30,7 @@ def _quantized_forward(
     *,
     candidates_BL1C,
 ):
-    from torchao_npu.quantized_modules.v41_lightning_indexer import QuantV41LightningIndexer
+    from torchao_npu.quantized_modules.deepseek_v4_1.lightning_indexer import QuantV41LightningIndexer
 
     return QuantV41LightningIndexer.forward(
         self,
@@ -42,8 +42,8 @@ def _quantized_forward(
     )
 
 
-@register_quantize_module_handler(QuantV41LightningIndexerConfig)
-def _quant_v41_lightning_indexer_transform(module, config: QuantV41LightningIndexerConfig):
+@register_quantize_module_handler(DeepSeekV41QuantLightningIndexerConfig)
+def _quant_v41_lightning_indexer_transform(module, config: DeepSeekV41QuantLightningIndexerConfig):
     if not hasattr(module, "_torchao_npu_original_forward"):
         module._torchao_npu_original_forward = module.forward
     if config.step == QATStep.PREPARE:

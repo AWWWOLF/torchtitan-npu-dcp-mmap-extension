@@ -8,12 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torchao.quantization.qat import QATStep
-from torchao_npu.configs.module_swap_configs.quant_v41_sparse_attention import (
-    QuantV41SparseAttentionConfig,
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_sparse_attention import (
+    DeepSeekV41QuantSparseAttentionConfig,
     _quant_v41_sparse_attention_transform,
 )
-from torchao_npu.quantized_modules import v41_lightning_indexer as lightning_indexer
-from torchao_npu.quantized_modules import v41_sparse_attention as sparse_attention
+from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer
+from torchao_npu.quantized_modules.deepseek_v4_1 import sparse_attention
 
 
 def _metadata(*, tokens=4, compressed_tokens=2):
@@ -347,7 +347,7 @@ def test_module_swap_forwards_teacher_carrier_and_restores_original(monkeypatch)
         return "quantized"
 
     monkeypatch.setattr(sparse_attention.QuantV41SparseAttention, "forward", quantized_forward)
-    _quant_v41_sparse_attention_transform(host, QuantV41SparseAttentionConfig())
+    _quant_v41_sparse_attention_transform(host, DeepSeekV41QuantSparseAttentionConfig())
     operands = tuple(object() for _ in range(4))
     cmp_k, indices, scores = object(), object(), object()
 
@@ -356,7 +356,7 @@ def test_module_swap_forwards_teacher_carrier_and_restores_original(monkeypatch)
     assert captured["args"] == operands
     assert captured["kwargs"] == {"cmp_k": cmp_k, "topk_indices": indices, "topk_scores": scores}
 
-    _quant_v41_sparse_attention_transform(host, QuantV41SparseAttentionConfig(step=QATStep.CONVERT))
+    _quant_v41_sparse_attention_transform(host, DeepSeekV41QuantSparseAttentionConfig(step=QATStep.CONVERT))
     result = host(*operands, topk_scores=scores)
 
     assert result[0] == "original"

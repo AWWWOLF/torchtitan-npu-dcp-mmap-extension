@@ -5,6 +5,8 @@
 
 """Module-swap configuration for main-KV FP4 fake quantization."""
 
+__all__ = ["DeepSeekV41QuantCompressorConfig"]
+
 from dataclasses import dataclass
 from types import MethodType
 
@@ -15,7 +17,7 @@ from torchao_npu.configs.module_swap import ModuleSwapConfig
 
 
 @dataclass(kw_only=True, slots=True)
-class QuantCompressorConfig(ModuleSwapConfig):
+class DeepSeekV41QuantCompressorConfig(ModuleSwapConfig):
     """Quantize post-RoPE main KV as MXFP4 with BF16 group scales."""
 
     group_size: int = 16
@@ -23,12 +25,12 @@ class QuantCompressorConfig(ModuleSwapConfig):
     def __post_init__(self) -> None:
         ModuleSwapConfig.__post_init__(self)
         if self.group_size not in (16, 32):
-            raise ValueError("QuantCompressorConfig requires group_size=16 or 32")
+            raise ValueError("DeepSeekV41QuantCompressorConfig requires group_size=16 or 32")
 
 
-@register_quantize_module_handler(QuantCompressorConfig)
-def _quant_compressor_transform(module, config: QuantCompressorConfig):
-    from torchao_npu.quantized_modules.compressor import QuantCompressor
+@register_quantize_module_handler(DeepSeekV41QuantCompressorConfig)
+def _quant_compressor_transform(module, config: DeepSeekV41QuantCompressorConfig):
+    from torchao_npu.quantized_modules.deepseek_v4_1.compressor import QuantCompressor
 
     if not hasattr(module, "_torchao_npu_original_forward"):
         module._torchao_npu_original_forward = module.forward

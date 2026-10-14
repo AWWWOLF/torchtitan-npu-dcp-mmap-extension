@@ -5,7 +5,7 @@
 
 """Module-swap configuration for the V4.1 sparse attention quantization path."""
 
-__all__ = ["QuantV41SparseAttentionConfig"]
+__all__ = ["DeepSeekV41QuantSparseAttentionConfig"]
 
 from dataclasses import dataclass
 from types import MethodType
@@ -17,7 +17,7 @@ from torchao_npu.configs.module_swap import ModuleSwapConfig
 
 
 @dataclass(kw_only=True, slots=True)
-class QuantV41SparseAttentionConfig(ModuleSwapConfig):
+class DeepSeekV41QuantSparseAttentionConfig(ModuleSwapConfig):
     """Install FP8 SWA fake quantization; main KV is supplied by QuantCompressor."""
 
 
@@ -33,7 +33,7 @@ def _quantized_forward(
     topk_scores=None,
     **kwargs,
 ):
-    from torchao_npu.quantized_modules.v41_sparse_attention import QuantV41SparseAttention
+    from torchao_npu.quantized_modules.deepseek_v4_1.sparse_attention import QuantV41SparseAttention
 
     # Same argument order as the port this replaces, so the swap stays invisible to the
     # host. Unknown extension keywords remain ignorable, while ``topk_scores`` must keep
@@ -51,8 +51,8 @@ def _quantized_forward(
     )
 
 
-@register_quantize_module_handler(QuantV41SparseAttentionConfig)
-def _quant_v41_sparse_attention_transform(module, config: QuantV41SparseAttentionConfig):
+@register_quantize_module_handler(DeepSeekV41QuantSparseAttentionConfig)
+def _quant_v41_sparse_attention_transform(module, config: DeepSeekV41QuantSparseAttentionConfig):
     if not hasattr(module, "_torchao_npu_original_forward"):
         module._torchao_npu_original_forward = module.forward
     if config.step == QATStep.PREPARE:

@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torchao.quantization.qat import QATStep
-from torchao_npu.configs.module_swap_configs.quant_v41_lightning_indexer import (
-    QuantV41LightningIndexerConfig,
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_lightning_indexer import (
+    DeepSeekV41QuantLightningIndexerConfig,
     _quant_v41_lightning_indexer_transform,
 )
-from torchao_npu.quantized_modules import v41_lightning_indexer as lightning_indexer
+from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer
 
 
 def _metadata(tokens=4, compressed_tokens=2):
@@ -261,14 +261,14 @@ def test_module_swap_installs_and_restores_the_v41_selector_forward(monkeypatch)
         return "quantized"
 
     monkeypatch.setattr(lightning_indexer.QuantV41LightningIndexer, "forward", quantized_forward)
-    _quant_v41_lightning_indexer_transform(host, QuantV41LightningIndexerConfig())
+    _quant_v41_lightning_indexer_transform(host, DeepSeekV41QuantLightningIndexerConfig())
     operands = tuple(object() for _ in range(4))
     candidate = object()
 
     assert host(*operands, candidates_BL1C=candidate) == "quantized"
     assert captured == {"self": host, "args": operands, "candidate": candidate}
 
-    _quant_v41_lightning_indexer_transform(host, QuantV41LightningIndexerConfig(step=QATStep.CONVERT))
+    _quant_v41_lightning_indexer_transform(host, DeepSeekV41QuantLightningIndexerConfig(step=QATStep.CONVERT))
     result = host(*operands, candidates_BL1C=candidate)
 
     assert result[0] == "original"

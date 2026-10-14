@@ -7,20 +7,20 @@
 
 from torchao_npu.configs.module_swap import ModuleSwapConfig
 from torchao_npu.configs.module_swap_configs import (
-    QuantCompressorConfig,
-    QuantLightningIndexerConfig,
-    QuantV41LightningIndexerConfig,
-    QuantV41SparseAttentionConfig,
+    DeepSeekV4QuantLightningIndexerConfig,
+    DeepSeekV41QuantCompressorConfig,
+    DeepSeekV41QuantLightningIndexerConfig,
+    DeepSeekV41QuantSparseAttentionConfig,
     quant_mode_for_config,
 )
 from torchao_npu.configs.param_swap import ParamSwapConfig
 
 __all__ = [
+    "DeepSeekV4QuantLightningIndexerConfig",
+    "DeepSeekV41QuantCompressorConfig",
+    "DeepSeekV41QuantLightningIndexerConfig",
+    "DeepSeekV41QuantSparseAttentionConfig",
     "ModuleSwapConfig",
     "ParamSwapConfig",
-    "QuantCompressorConfig",
-    "QuantLightningIndexerConfig",
-    "QuantV41LightningIndexerConfig",
-    "QuantV41SparseAttentionConfig",
     "quant_mode_for_config",
 ]

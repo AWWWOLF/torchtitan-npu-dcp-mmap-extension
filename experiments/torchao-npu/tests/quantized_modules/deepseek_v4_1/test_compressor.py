@@ -6,7 +6,7 @@
 import torch
 from torchao.quantization.qat import QATStep
 from torchao.quantization.quant_api import quantize_
-from torchao_npu.configs import QuantCompressorConfig
+from torchao_npu.configs import DeepSeekV41QuantCompressorConfig
 
 
 class _CompressorHost(torch.nn.Module):
@@ -29,9 +29,9 @@ def test_quant_compressor_preserves_latent_parameters_and_ste(monkeypatch):
     original_weight = module.weight
     original_keys = tuple(module.state_dict())
     original_forward = module.forward
-    quantize_(module, QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
+    quantize_(module, DeepSeekV41QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
     # Preparing twice must not wrap an already swapped forward recursively.
-    quantize_(module, QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
+    quantize_(module, DeepSeekV41QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
     captured = []
 
     def encode(cache, rows, slots, **kwargs):
@@ -61,7 +61,7 @@ def test_quant_compressor_preserves_latent_parameters_and_ste(monkeypatch):
     assert torch.equal(module.weight.grad, (x.detach() * 4).sum())
 
     reuser = _CompressorHost(is_source=False)
-    quantize_(reuser, QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is reuser)
+    quantize_(reuser, DeepSeekV41QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is reuser)
     shared, shared_latent = reuser(x, positions, main_kv)
     assert shared is main_kv
     assert shared_latent is None
@@ -70,8 +70,12 @@ def test_quant_compressor_preserves_latent_parameters_and_ste(monkeypatch):
 
 def test_quant_compressor_convert_restores_host_forward():
     module = _CompressorHost()
-    quantize_(module, QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
-    quantize_(module, QuantCompressorConfig(step=QATStep.CONVERT), filter_fn=lambda candidate, _: candidate is module)
+    quantize_(module, DeepSeekV41QuantCompressorConfig(), filter_fn=lambda candidate, _: candidate is module)
+    quantize_(
+        module,
+        DeepSeekV41QuantCompressorConfig(step=QATStep.CONVERT),
+        filter_fn=lambda candidate, _: candidate is module,
+    )
     x = torch.ones((1, 1, 32), dtype=torch.bfloat16)
 
     main_kv, latent = module(x, torch.tensor([[3]], dtype=torch.bfloat16))

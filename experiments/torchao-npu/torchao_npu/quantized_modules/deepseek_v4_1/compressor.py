@@ -9,7 +9,9 @@ from collections.abc import Callable
 
 import torch
 
-from torchao_npu.configs.module_swap_configs.quant_compressor import QuantCompressorConfig
+from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_compressor import (
+    DeepSeekV41QuantCompressorConfig,
+)
 from torchao_npu.ops.kv_cache_fake_quant import fake_quantize_mx_bf16
 
 
@@ -17,7 +19,7 @@ class QuantCompressor(torch.nn.Module):
     """Forward behavior installed on the original Compressor instance."""
 
     _torchao_npu_original_forward: Callable[..., tuple[torch.Tensor | None, torch.Tensor | None]]
-    _torchao_npu_module_swap_config: QuantCompressorConfig
+    _torchao_npu_module_swap_config: DeepSeekV41QuantCompressorConfig
 
     def forward(self, x_BLD, positions_BL, cmp_k=None):
         main_kv, latent = self._torchao_npu_original_forward(x_BLD, positions_BL, cmp_k)

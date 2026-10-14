@@ -122,10 +122,14 @@ def test_quantization_converter_keeps_linear_forward(converter_module, quantizat
 
 
 def test_quantization_converter_preserves_li_metadata_replacement(converter_module, quantization_calls):
-    from torchtitan_npu.extensions.adaptor.torchao.converter import _QuantizedLightningIndexerMetadataAdapter
+    from torchtitan_npu.extensions.adaptor.torchao.converter import (
+        _DeepSeekV4QuantizedLightningIndexerMetadataAdapter,
+    )
 
-    source = converter_module.LightningIndexerMetadata.Config(index_n_heads=64, index_head_dim=128, index_topk=512)
-    replacement_type = _QuantizedLightningIndexerMetadataAdapter.Config
+    source = converter_module.DeepSeekV4LightningIndexerMetadata.Config(
+        index_n_heads=64, index_head_dim=128, index_topk=512
+    )
+    replacement_type = _DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config
     converter = converter_module.NpuQuantizeConverter.Config(
         replacement_config_type=replacement_type,
         replacement_kwargs={"quant_mode": 3},
@@ -168,7 +172,7 @@ def test_recipe_converters_select_filters_for_model_type(
 
 
 def test_v41_li_quantization_alone_selects_only_the_qli_qsli_converter(converter_module):
-    from torchao_npu.configs import QuantV41LightningIndexerConfig
+    from torchao_npu.configs import DeepSeekV41QuantLightningIndexerConfig
 
     converters = converter_module._recipe_converters(
         "mix",
@@ -187,7 +191,7 @@ def test_v41_li_quantization_alone_selects_only_the_qli_qsli_converter(converter
         if converter.filter_fn is converter_module._DSV41_CONFIG_FILTERS["lightning_indexer"]
     ]
     assert len(li_converters) == 1
-    assert isinstance(li_converters[0].base_config, QuantV41LightningIndexerConfig)
+    assert isinstance(li_converters[0].base_config, DeepSeekV41QuantLightningIndexerConfig)
     assert not any(
         converter.filter_fn is converter_module._DSV41_CONFIG_FILTERS["sparse_attention"] for converter in converters
     )
@@ -264,7 +268,7 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
 def test_parameter_quantization_skips_li_metadata(converter_module, quantization_calls):
     from torchtitan_npu.extensions.adaptor.torchao.converter import _mxfp8_param_swap
 
-    source = converter_module.LightningIndexerMetadata.Config()
+    source = converter_module.DeepSeekV4LightningIndexerMetadata.Config()
     converter = converter_module.NpuQuantizeConverter.Config(
         base_config=_mxfp8_param_swap(), require_match=False
     ).build()
@@ -341,7 +345,7 @@ def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, conver
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
 def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_module, enabled):
-    from torchao_npu.configs import QuantCompressorConfig, QuantV41SparseAttentionConfig
+    from torchao_npu.configs import DeepSeekV41QuantCompressorConfig, DeepSeekV41QuantSparseAttentionConfig
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
     from torchtitan_npu.models.deepseek_v4_1 import model_registry
@@ -362,12 +366,12 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
         compressor_quant = getattr(compressor, "_torchao_npu_config", None)
         attention_quant = getattr(layer.attention.inner_attention, "_torchao_npu_config", None)
         if enabled and compressor.is_source:
-            assert isinstance(compressor_quant, QuantCompressorConfig)
+            assert isinstance(compressor_quant, DeepSeekV41QuantCompressorConfig)
             assert compressor_quant.group_size == 16
             assert type(compressor)._owner.__name__ == "NpuQuantizedCompressor"
         else:
             assert compressor_quant is None
-        assert isinstance(attention_quant, QuantV41SparseAttentionConfig) is enabled
+        assert isinstance(attention_quant, DeepSeekV41QuantSparseAttentionConfig) is enabled
 
 
 def _source_compressor_layer(spec, ratio):
@@ -405,7 +409,7 @@ def test_v41_teacher_pair_survives_independent_quantization_switches(
     li_enabled,
     sparse_enabled,
 ):
-    from torchao_npu.configs import QuantV41LightningIndexerConfig, QuantV41SparseAttentionConfig
+    from torchao_npu.configs import DeepSeekV41QuantLightningIndexerConfig, DeepSeekV41QuantSparseAttentionConfig
     from torchtitan.config.override import OverrideConfig, apply_overrides
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
@@ -437,12 +441,12 @@ def test_v41_teacher_pair_survives_independent_quantization_switches(
         selector_quant = getattr(selector, "_torchao_npu_config", None)
         attention_quant = getattr(inner_attention, "_torchao_npu_config", None)
 
-        assert isinstance(selector_quant, QuantV41LightningIndexerConfig) is li_enabled
-        assert isinstance(attention_quant, QuantV41SparseAttentionConfig) is sparse_enabled
+        assert isinstance(selector_quant, DeepSeekV41QuantLightningIndexerConfig) is li_enabled
+        assert isinstance(attention_quant, DeepSeekV41QuantSparseAttentionConfig) is sparse_enabled
         if inner_attention.compress_ratio > 0:
             # The trainer discovers instances, not configs, to assign the step denominator.
             selector_module = selector.build()
-            assert isinstance(selector_module, converter_module.V41Selector)
+            assert isinstance(selector_module, converter_module.DeepSeekV41Selector)
             assert selector_module.num_global_queries is None
 
 

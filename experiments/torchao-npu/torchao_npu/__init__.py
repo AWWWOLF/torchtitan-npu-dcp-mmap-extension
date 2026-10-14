@@ -4,21 +4,21 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchao_npu.configs import (
+    DeepSeekV4QuantLightningIndexerConfig,
+    DeepSeekV41QuantCompressorConfig,
+    DeepSeekV41QuantLightningIndexerConfig,
+    DeepSeekV41QuantSparseAttentionConfig,
     ModuleSwapConfig,
     ParamSwapConfig,
-    QuantCompressorConfig,
-    QuantLightningIndexerConfig,
-    QuantV41LightningIndexerConfig,
-    QuantV41SparseAttentionConfig,
 )
 
 __all__ = [
+    "DeepSeekV4QuantLightningIndexerConfig",
+    "DeepSeekV41QuantCompressorConfig",
+    "DeepSeekV41QuantLightningIndexerConfig",
+    "DeepSeekV41QuantSparseAttentionConfig",
     "ModuleSwapConfig",
     "ParamSwapConfig",
-    "QuantCompressorConfig",
-    "QuantLightningIndexerConfig",
-    "QuantV41LightningIndexerConfig",
-    "QuantV41SparseAttentionConfig",
 ]
 
 

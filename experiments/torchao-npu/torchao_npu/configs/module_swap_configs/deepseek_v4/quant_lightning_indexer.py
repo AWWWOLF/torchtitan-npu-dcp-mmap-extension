@@ -5,7 +5,7 @@
 
 """Unified quantized configuration for QuantLightningIndexerV2."""
 
-__all__ = ["QuantLightningIndexerConfig", "quant_mode_for_config"]
+__all__ = ["DeepSeekV4QuantLightningIndexerConfig", "quant_mode_for_config"]
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -43,12 +43,12 @@ def quant_mode_for_config(config: MXQuantizeConfig | HiF8QuantizeConfig | FP8Qua
                 raise ValueError(f"LI quant_mode={quant_mode} requires dynamic quant_mode={dynamic_quant_mode!r}")
             return quant_mode
     if isinstance(config, MXQuantizeConfig):
-        raise ValueError("QuantLightningIndexerConfig does not support this MX element dtype")
+        raise ValueError("DeepSeekV4QuantLightningIndexerConfig does not support this MX element dtype")
     raise TypeError(f"Unsupported LI quantization config: {type(config).__name__}")
 
 
 @dataclass(kw_only=True, slots=True)
-class QuantLightningIndexerConfig(ModuleSwapConfig):
+class DeepSeekV4QuantLightningIndexerConfig(ModuleSwapConfig):
     """Q/K quantization strategy for QuantLightningIndexerV2.
 
     ``quant_mode`` follows the CANN contract: 1=FP8 per-token-head, 3=MXFP8, 4=HiFloat8, and
@@ -81,9 +81,9 @@ class QuantLightningIndexerConfig(ModuleSwapConfig):
             )
 
 
-@register_quantize_module_handler(QuantLightningIndexerConfig)
-def _quant_lightning_indexer_transform(module, config: QuantLightningIndexerConfig):
-    from torchao_npu.quantized_modules.lightning_indexer import quantized_lightning_indexer_forward
+@register_quantize_module_handler(DeepSeekV4QuantLightningIndexerConfig)
+def _quant_lightning_indexer_transform(module, config: DeepSeekV4QuantLightningIndexerConfig):
+    from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer import quantized_lightning_indexer_forward
 
     if not hasattr(module, "_torchao_npu_original_forward"):
         module._torchao_npu_original_forward = module.forward

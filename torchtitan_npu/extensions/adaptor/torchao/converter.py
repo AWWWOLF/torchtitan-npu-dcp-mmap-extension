@@ -26,7 +26,14 @@ import torch
 import tyro
 from torchao.core.config import AOBaseConfig  # noqa: TC002
 from torchao.quantization.quant_api import quantize_
-from torchao_npu.configs import ParamSwapConfig
+from torchao_npu.configs import (
+    DeepSeekV4QuantLightningIndexerConfig,
+    DeepSeekV41QuantCompressorConfig,
+    DeepSeekV41QuantLightningIndexerConfig,
+    DeepSeekV41QuantSparseAttentionConfig,
+    ParamSwapConfig,
+    quant_mode_for_config,
+)
 from torchao_npu.quantization.quant_configs import (
     BlockMXQuantizeConfig,
     FP8QuantizeConfig,
@@ -43,18 +50,21 @@ from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 
 from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerKernelConfig,
-    LightningIndexerMetadata,
+    LightningIndexerKernelConfig as DeepSeekV4LightningIndexerKernelConfig,
 )
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
-from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as V41Compressor
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as V41Selector
+from torchtitan_npu.models.common.metadata_extension import (
+    LightningIndexerMetadata as DeepSeekV4LightningIndexerMetadata,
+)
+from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer as DeepSeekV4LightningIndexer
+from torchtitan_npu.models.deepseek_v4_1.attention import (
+    CompressedSparseInnerAttention2 as DeepSeekV41CompressedSparseInnerAttention2,
+)
+from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as DeepSeekV41Compressor
+from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector
 from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts, _ensure_cann_ops_loaded
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 if TYPE_CHECKING:
-    from torchao_npu.configs import QuantLightningIndexerConfig
     from torchtitan.protocols.model_spec import ModelSpec
 
     from torchtitan_npu.config.configs import (
@@ -115,11 +125,11 @@ _DEFAULT_TARGET_CONFIG_TYPES = (
     Linear.Config,
     BatchedLinear.Config,
     GroupedExperts.Config,
-    LightningIndexer.Config,
-    LightningIndexerMetadata.Config,
-    CompressedSparseInnerAttention2.Config,
-    V41Compressor.Config,
-    V41Selector.Config,
+    DeepSeekV4LightningIndexer.Config,
+    DeepSeekV4LightningIndexerMetadata.Config,
+    DeepSeekV41CompressedSparseInnerAttention2.Config,
+    DeepSeekV41Compressor.Config,
+    DeepSeekV41Selector.Config,
 )
 
 
@@ -259,7 +269,7 @@ class NpuQuantizeConverter(QuantizationConverter):
                 # Metadata is a Configurable provider, not an nn.Module.  It
                 # shares the target set only so the replacement branch can
                 # handle it; parameter quantization must skip it.
-                if isinstance(config, LightningIndexerMetadata.Config):
+                if isinstance(config, DeepSeekV4LightningIndexerMetadata.Config):
                     continue
                 assert self.config.base_config is not None
                 parent_cls = cast("type[Module] | None", type(config)._owner)
@@ -523,7 +533,11 @@ _v41_compressor_fqn_filter = match_config_fqn_suffix(".attention.compressor")
 
 
 def _is_v41_kv_source(config: Module.Config, fqn: str) -> bool:
-    return _v41_compressor_fqn_filter(config, fqn) and isinstance(config, V41Compressor.Config) and config.is_source
+    return (
+        _v41_compressor_fqn_filter(config, fqn)
+        and isinstance(config, DeepSeekV41Compressor.Config)
+        and config.is_source
+    )
 
 
 _DSV41_CONFIG_FILTERS = {
@@ -639,7 +653,9 @@ def _prepare_quant_lightning_indexer_inputs(
     idx_w: torch.Tensor,
     attention_masks,
 ):
-    from torchao_npu.quantized_modules.lightning_indexer import QuantizedLightningIndexerInputs
+    from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer import (
+        QuantizedLightningIndexerInputs as DeepSeekV4QuantizedLightningIndexerInputs,
+    )
 
     ratio = module._torchao_npu_module_swap_config.cmp_ratio
     plan = attention_masks.plans.get(ratio)
@@ -652,7 +668,7 @@ def _prepare_quant_lightning_indexer_inputs(
         key = key[plan.cmp_k_global_gather_indices]
     else:
         key = key[: plan.n_cmp_blocks_host]
-    return QuantizedLightningIndexerInputs(
+    return DeepSeekV4QuantizedLightningIndexerInputs(
         query=idx_q.flatten(0, 1),
         key=key.unsqueeze(1).contiguous(),
         weights=idx_w.flatten(0, 1).float(),
@@ -664,11 +680,11 @@ def _prepare_quant_lightning_indexer_inputs(
     )
 
 
-class _QuantizedLightningIndexerMetadataAdapter(LightningIndexerMetadata):
-    """Bridge TorchTitan metadata to the TorchAO-NPU LI provider."""
+class _DeepSeekV4QuantizedLightningIndexerMetadataAdapter(DeepSeekV4LightningIndexerMetadata):
+    """Bridge TorchTitan metadata to the TorchAO-NPU DeepSeek-V4 LI provider."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(LightningIndexerMetadata.Config):
+    class Config(DeepSeekV4LightningIndexerMetadata.Config):
         index_n_heads: int  # pyrefly: ignore [bad-override]
         index_head_dim: int  # pyrefly: ignore [bad-override]
         index_topk: int  # pyrefly: ignore [bad-override]
@@ -676,15 +692,17 @@ class _QuantizedLightningIndexerMetadataAdapter(LightningIndexerMetadata):
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
-        from torchao_npu.quantized_modules.lightning_indexer_metadata import (
-            QuantizedLightningIndexerMetadata,
-            QuantizedLightningIndexerMetadataConfig,
+        from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata import (
+            QuantizedLightningIndexerMetadata as DeepSeekV4QuantizedLightningIndexerMetadata,
+        )
+        from torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata import (
+            QuantizedLightningIndexerMetadataConfig as DeepSeekV4QuantizedLightningIndexerMetadataConfig,
         )
 
-        cfg = cast("_QuantizedLightningIndexerMetadataAdapter.Config", config)
+        cfg = cast("_DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config", config)
         kernel = cfg.li_kernel_config
-        self._provider = QuantizedLightningIndexerMetadata(
-            QuantizedLightningIndexerMetadataConfig(
+        self._provider = DeepSeekV4QuantizedLightningIndexerMetadata(
+            DeepSeekV4QuantizedLightningIndexerMetadataConfig(
                 index_n_heads=cfg.index_n_heads,
                 index_head_dim=cfg.index_head_dim,
                 index_topk=cfg.index_topk,
@@ -711,14 +729,12 @@ class _QuantizedLightningIndexerMetadataAdapter(LightningIndexerMetadata):
         return metadata
 
 
-def _quant_lightning_indexer(
-    kernel_config: LightningIndexerKernelConfig,
+def _quant_deepseek_v4_lightning_indexer(
+    kernel_config: DeepSeekV4LightningIndexerKernelConfig,
     *,
     li_quantization: LIQuantization,
     dst_type_max: float = 0.0,
-) -> QuantLightningIndexerConfig:
-    from torchao_npu.configs import QuantLightningIndexerConfig, quant_mode_for_config
-
+) -> DeepSeekV4QuantLightningIndexerConfig:
     qk_config: FP8QuantizeConfig | HiF8QuantizeConfig | MXQuantizeConfig
     if li_quantization == "fp8":
         qk_config = FP8QuantizeConfig()
@@ -731,7 +747,7 @@ def _quant_lightning_indexer(
     else:
         raise ValueError("Quantized LI requires mxfp4, mxfp8, fp8, or hif8")
     quant_mode = quant_mode_for_config(qk_config)
-    return QuantLightningIndexerConfig(
+    return DeepSeekV4QuantLightningIndexerConfig(
         layout_q=kernel_config.layout_q,
         layout_k=kernel_config.layout_k,
         mask_mode=kernel_config.mask_mode,
@@ -978,7 +994,7 @@ def _recipe_converters(
     enable_fsdp_prequantize: bool,
     model_compile_enabled: bool,
     li_quantization: LIQuantization | None = None,
-    li_kernel_config: LightningIndexerKernelConfig | None = None,
+    li_kernel_config: DeepSeekV4LightningIndexerKernelConfig | None = None,
     kv_norm_quantization: KVNormQuantizationConfig | None = None,
     prequantize_fqns_by_scope: dict[str, tuple[str, ...]] | None = None,
     enable_hif8_save_quant_codes: bool = False,
@@ -1048,16 +1064,14 @@ def _recipe_converters(
         ]
 
     if li_quantization is not None:
-        li_config: QuantLightningIndexerConfig | QuantV41LightningIndexerConfig
+        li_config: DeepSeekV4QuantLightningIndexerConfig | DeepSeekV41QuantLightningIndexerConfig
         if model_type == "v41":
             if li_quantization != "mxfp4":
                 raise ValueError("DeepSeek-V4.1 QLI/QSLI supports only li_quantization='mxfp4'")
-            from torchao_npu.configs import QuantV41LightningIndexerConfig
-
-            li_config = QuantV41LightningIndexerConfig()
+            li_config = DeepSeekV41QuantLightningIndexerConfig()
         else:
-            li_config = _quant_lightning_indexer(
-                li_kernel_config or LightningIndexerKernelConfig(),
+            li_config = _quant_deepseek_v4_lightning_indexer(
+                li_kernel_config or DeepSeekV4LightningIndexerKernelConfig(),
                 li_quantization=li_quantization,
                 dst_type_max=dst_type_max,
             )
@@ -1074,24 +1088,24 @@ def _recipe_converters(
                     None,
                     filters["lightning_indexer_metadata"],
                     model_compile_enabled=model_compile_enabled,
-                    replacement_config_type=_QuantizedLightningIndexerMetadataAdapter.Config,
-                    replacement_kwargs={"quant_mode": cast("QuantLightningIndexerConfig", li_config).quant_mode},
+                    replacement_config_type=_DeepSeekV4QuantizedLightningIndexerMetadataAdapter.Config,
+                    replacement_kwargs={
+                        "quant_mode": cast("DeepSeekV4QuantLightningIndexerConfig", li_config).quant_mode,
+                    },
                 )
             )
     if enable_sparse_attention_quantization:
         if "sparse_attention" in filters:
-            from torchao_npu.configs import QuantCompressorConfig, QuantV41SparseAttentionConfig
-
             converters.append(
                 _quantization_converter(
-                    QuantCompressorConfig(),
+                    DeepSeekV41QuantCompressorConfig(),
                     filters["compressor"],
                     model_compile_enabled=model_compile_enabled,
                 )
             )
             converters.append(
                 _quantization_converter(
-                    QuantV41SparseAttentionConfig(),
+                    DeepSeekV41QuantSparseAttentionConfig(),
                     filters["sparse_attention"],
                     model_compile_enabled=model_compile_enabled,
                 )
@@ -1116,15 +1130,15 @@ def _recipe_converters(
     return converters
 
 
-def _get_li_kernel_config(model_config) -> LightningIndexerKernelConfig:
+def _get_deepseek_v4_li_kernel_config(model_config) -> DeepSeekV4LightningIndexerKernelConfig:
     metadata_matches = [
         match
-        for match in model_config.traverse(LightningIndexerMetadata.Config)
+        for match in model_config.traverse(DeepSeekV4LightningIndexerMetadata.Config)
         if _DSV4_CONFIG_FILTERS["lightning_indexer_metadata"](match[1], match[0])
     ]
     li_matches = [
         match
-        for match in model_config.traverse(LightningIndexer.Config)
+        for match in model_config.traverse(DeepSeekV4LightningIndexer.Config)
         if _DSV4_CONFIG_FILTERS["lightning_indexer"](match[1], match[0])
     ]
     if len(metadata_matches) != 1:
@@ -1168,7 +1182,7 @@ def apply_quantization_converter(
     model_type = _model_type_for_spec(model_spec)
 
     li_kernel_config = (
-        _get_li_kernel_config(model_spec.model)
+        _get_deepseek_v4_li_kernel_config(model_spec.model)
         if model_type == "v4" and quantization_config.li_quantization is not None
         else None
     )
