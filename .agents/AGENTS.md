@@ -111,6 +111,7 @@ python -m pre_commit run --all-files --show-diff-on-failure
 
 ### 4. 测试与数值验证
 
+- Agent 接到精度对齐请求，或准备创建、更新、提交 PR 时，必须先阅读[精度对齐开发指南](../docs/developer_guides/numerical_alignment.md)，依据对齐目标和变更文件列表确定必要的验证项目，并逐项核对完成情况；允许跳过的项目须说明依据。
 - 新增、修正、重构或 review 测试时，使用 `.agents/skills/developer-tests-review/` 选择「更新测试」或「review测试」 workflow；前者修改并执行相关测试，后者只做静态审查，不修改或执行测试。
 - Python 逻辑改动至少运行相关单元测试；CPU 单测使用 `TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -v --tb=short tests/unit_tests -x`。
 - 涉及分布式、NPU kernel、override、patch 或模型训练行为时，补充对应 NPU 冒烟或集成测试。
@@ -121,6 +122,6 @@ python -m pre_commit run --all-files --show-diff-on-failure
 
 ### 5. PR 与流水线
 
+- 需要精度验证的改动，必须在 PR 描述中提供对应验证记录：比较双方的代码版本及基线来源、运行环境与关键配置、可复现命令、指标和判定结果，以及原始日志或结果文件的可访问链接。未执行或未通过的项目必须明确状态、原因及待完成项，不得写为验证通过；无需精度验证时，须说明开发指南中的跳过依据。
 - PR 描述解释「为什么」而非只写「做了什么」；非简单改动附数值证据，模型变更说明 checkpoint 兼容性。
 - 已安装 `gitcode-pr` skill 时，创建或推送 PR、读取改动与评论使用该 skill，并按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写。标题使用正确的英文类型标签，如 `feat`、`fix`、`refactor`、`docs` 或 `test`；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。
-- 已安装 `gitcode-pipeline` skill 时，用户要求触发或等待 CI 使用该 skill，并根据实际失败日志定位问题。
