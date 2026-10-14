@@ -54,7 +54,6 @@ def _build_model_config():
         num_shared_experts=1,
         router_top_k=2,
         router_score_func="softmax",
-        attn_backend="flex",
         moe_comm_backend="standard",
         non_blocking_capacity_factor=None,
         rope=_build_rope_config(),

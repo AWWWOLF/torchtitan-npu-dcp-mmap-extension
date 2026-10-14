@@ -69,6 +69,11 @@ def _build_dsv3_2_layers(
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
         rope=rope,
+        # Not a knob: every layer's inner attention is replaced below, so whatever this builds
+        # is thrown away.  It is spelled ``varlen`` -- the type the replacement actually is --
+        # only so the intermediate config never carries flex semantics a reader could mistake
+        # for the deployed backend; do not delete it as dead code.
+        attn_backend="varlen",
         **kwargs,
     )
 
@@ -128,7 +133,6 @@ def _build_dsv3_2_layers(
 
 
 def _debugmodel_v3_2(
-    attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
@@ -168,7 +172,6 @@ def _debugmodel_v3_2(
         num_shared_experts=num_shared_experts,
         router_top_k=3,
         router_score_func="softmax",
-        attn_backend=attn_backend,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
@@ -222,7 +225,6 @@ def model_registry(
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     config = deepseekv3_2_configs[flavor](
-        attn_backend="flex",
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         num_mtp_layers=num_mtp_layers,

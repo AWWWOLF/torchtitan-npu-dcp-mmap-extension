@@ -4,7 +4,9 @@
 
 The cases keep the NPU-owned DSV3.2 model separate from the upstream DSV3
 definition.  The RoPE workaround avoids the unsupported complex64 cache gather,
-while the CANN DSA overrides avoid upstream FlexAttention compilation on NPU.
+while the CANN DSA overrides replace the reference sparse core with the fused
+AscendC kernels (the reference core itself is attn-gym's eager path, which the
+NPU does not run in production).
 """
 
 from tests.integration_tests import OverrideDefinitions
