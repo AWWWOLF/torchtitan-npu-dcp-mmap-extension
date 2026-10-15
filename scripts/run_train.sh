@@ -34,6 +34,10 @@ TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 COMM_MODE=${COMM_MODE:-}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-}
 
+time=$(date +%Y%m%d%H%M)
+logfile=${LOG_PREFIX:-${CONFIG}}_${time}.log
+mkdir -p logs
+
 if [[ -n "${COMM_MODE}" ]]; then
     echo "Running with comm_mode=${COMM_MODE}"
     NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" \
@@ -51,5 +55,5 @@ else
     torchrun --nproc_per_node="${NGPU}" --rdzv_backend c10d \
     --rdzv_endpoint="localhost:0" \
     --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 \
-    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@"
+    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@" 2>&1 | tee -a logs/${logfile}
 fi
