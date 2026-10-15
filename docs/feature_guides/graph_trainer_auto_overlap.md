@@ -8,7 +8,7 @@ NPU Auto Overlap 用于 TorchTitan GraphTrainer 的双 chunk MoE 通信掩盖自
 2. 设置 `TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER=0`；
 3. 开启 EP overlap，并选择对应的 Auto Overlap pipeline。
 
-完整配置参考 [`deepseek_v4_flash_8p_cpt_4k_a3_auto_overlap.sh`](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_auto_overlap.sh)。
+完整配置参考 [`deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh`](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh)：该脚本同时设置 EP overlap、两个 Inductor benchmark 环境变量和 NPU auto overlap pipeline。
 
 ## 1. 整体流程
 

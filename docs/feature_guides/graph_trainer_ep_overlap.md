@@ -218,20 +218,14 @@ return (*chunked, *moved), tuple(user for user in full if user not in moved_set)
 
 ## 启用方式
 
-EP overlap 通过 `--compile.ep_overlap.*` 打开。满足前述条件的 GraphTrainer MoE recipe 均通过同一组配置项启用；模型入口、dispatcher、并行配置和算子 override 仍由各模型 recipe 负责。
+EP overlap 通过 `--compile.ep_overlap.*` 打开。满足前述条件的 GraphTrainer MoE recipe 均通过同一组配置项启用；模型入口、dispatcher、并行配置和算子 override 仍由各模型 recipe 负责。当前 A3 GraphTrainer debug 脚本已设置 `seq` 分块、`graph` 策略和 NPU auto overlap pipeline，调用它时无需重复传这些配置项。自动调度机制见 [`graph_trainer_auto_overlap.md`](graph_trainer_auto_overlap.md)。
 
-下面仅给出本文整网验证使用的 DSV4 示例：flash 43layers/16experts、8 卡、EP=8，复用仓内 DSV4 GraphTrainer 入口脚本。
+下面给出当前 DSV4 A3 GraphTrainer 入口脚本的调用示例：flash 43layers/16experts、8 卡、EP=8。此脚本默认启用 NPU auto overlap；下文 2026-09-16 的整网验证对应旧提交和固定调度，不是此命令的验证结果。
 
 ```bash
 NGPU=8 \
 HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
-bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh \
-  --optimizer.name native \
-  --compile.disable_passes cudagraph_pass,annotate_flex_attention_for_regional_inductor_pass,regional_inductor_pass \
-  --compile.ep_overlap.enabled \
-  --compile.ep_overlap.strategy graph \
-  --compile.ep_overlap.chunk_dim seq \
-  --compile.ep_overlap.module_fqn 'layers.*.moe'
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
 ```
 
 `EpOverlapConfig`（`torchtitan/experiments/graph_trainer/configs.py`）字段：
@@ -255,8 +249,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh \
 本节只记录 DSV4 作为验证载体的结果，用于证明通用 EP overlap 能力及临时补丁在这一具体组合上可以完成整网训练。
 
 在同一台机器上按“关闭 EP overlap -> 开启 EP overlap”的顺序各运行 10 step。两组均使用 8 张 Ascend 910、CANN 9.2.0、TorchTitan `v0.3.0`（`086bf6c166ec85c1298eb5596fa9bf95f6a2d840`）和本仓库 HEAD `ec98b86809e024e105958b50c7714666c8c65ff2`。模型为 flash 43 layers / 16 experts，EP=8、DP shard=8、TP/CP/PP=1，local/global batch size 为 1/64，sequence length 为 4096，seed 为 42。
-
-开启组再追加“启用方式”中的四个 `--compile.ep_overlap.*` 参数；关闭组不追加这些参数。
 
 | 指标 | EP overlap 关闭 | EP overlap 开启 |
 | --- | ---: | ---: |
