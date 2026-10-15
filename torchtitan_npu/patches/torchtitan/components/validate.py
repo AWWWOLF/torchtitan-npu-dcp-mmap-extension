@@ -1,16 +1,31 @@
+# Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4116
+# Remove this module (and its activation import in
+# ``torchtitan_npu/patches/torchtitan/__init__.py``) once the pinned
+# ``torchtitan`` dependency carries #4116 natively.
+
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
+"""Backport of upstream's model-owned preprocessing seam onto the validator.
+
+The validator's post-dataloading step is the trainer's step once more (0.3.0
+even says so in a TODO); upstream #4116 answers that by giving the model the
+seam.  This patch makes the validator call ``Decoder.preprocess_inputs``
+instead of duplicating the mask build, the CP shard and the SPMD annotation.
+
+The validator and the trainer therefore share one implementation.  One
+consequence worth stating: the shared seam annotates SPMD types on the
+``spmd_types`` backend, which the validator's 0.3.0 body did not do (it only
+handled ``full_dtensor``) — the trainer did, and upstream's deduplicated
+version does.
+"""
 
 import functools
 import logging
-from typing import Any
 
 from torchtitan.components.validate import Validator
-from torchtitan.distributed import full_dtensor
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +34,18 @@ original_post_dataloading_process = Validator.post_dataloading_process
 
 @functools.wraps(original_post_dataloading_process)
 def patched_post_dataloading_process(self, input_dict, labels, model_parts):
-    """Dispatch to the model's own mask/metadata construction when present
-    (see the trainer patch); other models keep the upstream flow."""
-    build = getattr(model_parts[0], "build_attention_masks", None)
-    if build is not None:
-        inputs = input_dict["input"]
-        extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k != "input"}
-        cp_mesh = self.parallel_dims.get_mesh("cp") if self.parallel_dims.cp_enabled else None
-        inputs, labels, extra_kwargs = build(
-            inputs,
-            labels,
-            extra_kwargs,
-            cp_mesh=cp_mesh,
-            load_balancer_type=self.parallelism.context_parallel_load_balancer,
-        )
-        if self.parallelism.spmd_backend == "full_dtensor":
-            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
-                self.parallel_dims, inputs, labels, extra_kwargs
-            )
-        return inputs, labels, extra_kwargs
-    return original_post_dataloading_process(self, input_dict, labels, model_parts)
+    """Delegate the dataloader-to-forward preprocessing to the model (#4116)."""
+    model = model_parts[0]
+    preprocess_inputs = getattr(model, "preprocess_inputs", None)
+    if preprocess_inputs is None:
+        return original_post_dataloading_process(self, input_dict, labels, model_parts)
+    return preprocess_inputs(
+        input_dict,
+        labels,
+        parallel_dims=self.parallel_dims,
+        device=input_dict["input"].device,
+        parallelism=self.parallelism,
+    )
 
 
 def apply() -> None:

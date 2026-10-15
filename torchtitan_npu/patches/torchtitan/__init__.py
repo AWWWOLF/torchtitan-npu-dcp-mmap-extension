@@ -15,4 +15,7 @@ from .experiments.graph_trainer import (  # noqa: F401
     ep_ready_nodes_dedup,
     ep_shape_live_out,
 )
-from .models.common import moe, rope, token_dispatcher  # noqa: F401
+
+# ``attention_metadata`` carries the backend-owned metadata contract and must
+# be applied before ``decoder`` binds the map builder that reads it.
+from .models.common import attention_metadata, decoder, moe, rope, token_dispatcher  # noqa: F401

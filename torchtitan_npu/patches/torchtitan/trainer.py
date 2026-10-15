@@ -17,8 +17,6 @@ from typing import Any, cast
 
 import torch
 import torchtitan.trainer
-from torchtitan.distributed import full_dtensor
-from torchtitan.distributed.spmd_types import annotate_input_spmd_types
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
@@ -33,45 +31,30 @@ original_pp_forward_backward_step = Trainer.pp_forward_backward_step
 
 @functools.wraps(original_post_dataloading_process)
 def patched_post_dataloading_process(self, input_dict, labels):
-    """Dispatch to the model's own mask/metadata construction when present.
+    """Delegate the dataloader-to-forward preprocessing to the model.
 
-    Models that define ``build_attention_masks`` (e.g. DeepSeek-V4) own the
-    whole per-batch metadata handling — including their own context-parallel
-    sharding and plan derivation — as the single overridable seam replacing
-    the removed ``mask_handler`` pattern.  Other models keep the upstream
-    flow (``get_attention_masks`` + the generic ``prepare_context_parallel_input``)
-    exactly as-is.  The steps after the build (the token accounting and the
-    spmd-input annotation) are replicated here for the custom path.
+    Upstream #4116 gives the model the seam (``Decoder.preprocess_inputs``:
+    mask/metadata build, CP shard, SPMD annotation), so the trainer does not
+    keep its own copy of it — the validator's duplicate disappears with it.
+    A model-level ``build_attention_masks`` override (transitional, the
+    pre-#4116 shape of the same seam) is honored inside ``preprocess_inputs``.
     """
     model = self.model_parts[0]
-    build = getattr(model, "build_attention_masks", None)
-    if build is not None:
-        inputs = input_dict["input"]
-        extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k != "input"}
-        cp_mesh = self.parallel_dims.get_mesh("cp") if self.parallel_dims.cp_enabled else None
-        inputs, labels, extra_kwargs = build(
-            inputs,
-            labels,
-            extra_kwargs,
-            cp_mesh=cp_mesh,
-            load_balancer_type=self.config.parallelism.context_parallel_load_balancer,
-        )
-        # Accumulate after CP sharding so labels.numel() reflects the actual
-        # unique tokens this rank processes (not the full pre-split sequence).
-        self.ntokens_seen += labels.numel()
-        if self.config.parallelism.spmd_backend == "full_dtensor":
-            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
-                self.parallel_dims, inputs, labels, extra_kwargs
-            )
-        elif self.config.parallelism.spmd_backend == "spmd_types":
-            inputs, labels, extra_kwargs = annotate_input_spmd_types(
-                self.parallel_dims,
-                inputs,
-                labels,
-                extra_kwargs,
-            )
-        return inputs, labels, extra_kwargs
-    return original_post_dataloading_process(self, input_dict, labels)
+    preprocess_inputs = getattr(model, "preprocess_inputs", None)
+    if preprocess_inputs is None:
+        return original_post_dataloading_process(self, input_dict, labels)
+    inputs, labels, extra_kwargs = preprocess_inputs(
+        input_dict,
+        labels,
+        parallel_dims=self.parallel_dims,
+        device=self.device,
+        parallelism=self.config.parallelism,
+    )
+    # ``preprocess_inputs`` rejects the full_dtensor input path, so ``labels``
+    # is always a plain local tensor here: ``numel()`` is the post-CP-shard
+    # token count this counter recorded before #4116 moved the step into the model.
+    self.ntokens_seen += labels.numel()
+    return inputs, labels, extra_kwargs
 
 
 def _run_presplit_pipeline_schedule(
