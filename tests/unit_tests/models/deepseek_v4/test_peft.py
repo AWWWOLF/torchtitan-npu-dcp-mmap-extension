@@ -39,6 +39,7 @@ def _make_checkpoint_fixture(tmp_path, save_training_state, checkpoint_format, w
         def __init__(self):
             super().__init__()
             self.base = torch.nn.Parameter(torch.ones(3, 3), requires_grad=False)
+            self.pre_lora_cache = torch.nn.Parameter(torch.full((2,), 11.0), requires_grad=False)
             if trainable_base:
                 self.base.requires_grad_(True)
                 self.frozen_extra = torch.nn.Parameter(torch.full((2,), 7.0), requires_grad=False)
@@ -98,7 +99,7 @@ def _floating_base_state(model):
     return {
         key: value.to_tensor() if hasattr(value, "to_tensor") else value
         for key, value in model.state_dict().items()
-        if "lora_" not in key
+        if key not in {"lora_a", "lora_b"}
     }
 
 
@@ -155,7 +156,7 @@ def _check_periodic_dcp_round_trip(
 
 
 def _load_base_then_adapter(target, restored, checkpoint):
-    initial_adapters = {key: value.clone() for key, value in restored.state_dict().items() if "lora_" in key}
+    initial_adapters = {key: restored.state_dict()[key].clone() for key in ("lora_a", "lora_b")}
     target.dcp_load(restored.state_dict(), target.initial_load_path)
     for key, value in initial_adapters.items():
         torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
@@ -361,12 +362,13 @@ def test_hf_base_load_limits_expert_reassembly_to_one_layer(monkeypatch):
     manager = object.__new__(peft.DeepSeekV4PEFTCheckpointManager)
     state = {name: torch.ones(1) for name in (
         "tok_embeddings.weight", "layers.0.attention.wq_a.weight",
+        "pre_lora_cache.weight",
         "layers.0.moe.routed_experts.inner_experts.w1_EFD",
         "layers.1.moe.routed_experts.inner_experts.w1_EFD",
         "mtp_layers.0.attention.wq_a.weight", "layers.0.attention.wq_a.lora_a.weight",
     )}
     manager.dcp_load(state, "/base", from_hf=True, from_quantized=True)
-    expected = {name for name in state if "lora_" not in name}
+    expected = set(state) - {"layers.0.attention.wq_a.lora_a.weight"}
     assert len(calls) == 4
     assert {name for call in calls for name in call} == expected
     assert sum(len(call) for call in calls) == len(expected)
@@ -410,11 +412,18 @@ def test_peft_metadata_uses_hf_base_and_never_native_checkpoint(monkeypatch, fro
 
 
 def test_adapter_state_selection_keeps_trainable_state_and_routing_buffers():
-    state = {name: torch.ones(1) for name in ("base.weight", "lora_a", "expert_bias_E", "optimizer", "unfrozen")}
+    state = {name: torch.ones(1) for name in (
+        "base.weight", "pre_lora_cache.weight", "lora_a", "layers.0.w13_lora_a",
+        "layers.0.w1_lora_b", "layers.0.w3_lora_b", "layers.0.w2_lora_b",
+        "expert_bias_E", "optimizer", "unfrozen",
+    )}
     selected = peft.select_adapter_only_state(
         state, {"optimizer"}, model_buffer_keys={"expert_bias_E"}, model_trainable_keys={"unfrozen"},
     )
-    assert set(selected) == {"lora_a", "expert_bias_E", "optimizer", "unfrozen"}
+    assert set(selected) == {
+        "lora_a", "layers.0.w13_lora_a", "layers.0.w1_lora_b", "layers.0.w3_lora_b",
+        "layers.0.w2_lora_b", "expert_bias_E", "optimizer", "unfrozen",
+    }
 
 
 def test_resume_rejects_legacy_interleaved_expert_optimizer(tmp_path):

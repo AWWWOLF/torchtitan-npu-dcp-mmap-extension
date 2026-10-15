@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-__all__ = ["DEEPSEEK_V4_LORA_TARGETS", "DeepSeekV4LoRAConverter", "peft_target_modules"]
+__all__ = ["DEEPSEEK_V4_LORA_TARGETS", "DeepSeekV4LoRAConverter", "is_lora_parameter", "peft_target_modules"]
 
 import math
 import re
@@ -39,6 +39,14 @@ from .model import DeepSeekV4Model
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from typing import Protocol
+
+
+_LORA_PARAMETER_PREFIXES = ("lora_", "w13_lora_", "w1_lora_", "w3_lora_", "w2_lora_")
+
+
+def is_lora_parameter(name: str) -> bool:
+    """Identify native adapter parameters by their qualified-name components."""
+    return any(part.startswith(_LORA_PARAMETER_PREFIXES) for part in name.split("."))
 
 
 @dataclass(kw_only=True)
@@ -102,9 +110,7 @@ def _make_lora_adapter_config_cls(parent_config_cls: type) -> type:
             original_filter = policy.params_filter_fn
 
             def base_filter(param, fqn):
-                return not any(part.startswith(("lora_", "w13_lora_", "w2_lora_")) for part in fqn.split(".")) and (
-                    original_filter is None or original_filter(param, fqn)
-                )
+                return not is_lora_parameter(fqn) and (original_filter is None or original_filter(param, fqn))
 
             self._torchao_npu_config = copy(policy)
             self._torchao_npu_config.params_filter_fn = base_filter
@@ -565,7 +571,10 @@ class DeepSeekV4LoRAConverter(LoRAConverter):
             config.rank,
             config.rank_experts,
         )
-        return derive(converted_root, _LoRAModelConfig, lora=replace(config, target_modules=list(targets)))
+        return self.attach_model_config(converted_root, replace(config, target_modules=list(targets)))
+
+    def attach_model_config(self, model_config: Module.Config, lora_config: Config) -> Module.Config:
+        return derive(model_config, _LoRAModelConfig, lora=lora_config)
 
     def _validate_matches(self, matched, grouped_matches):
         config = cast("DeepSeekV4LoRAConverter.Config", self.config)

@@ -42,10 +42,13 @@ python -m tests.integration_tests.run_tests \
 
 ### 1.2 冒烟测试全景矩阵（1~4 卡）
 
-4die 冒烟测试包含 4 个核心 Suite：
+4die 冒烟测试及专项验证包含以下 Suite：
 * **`models`**：DeepSeek-V4、DeepSeek-V3.2 多卡基础训练冒烟与 Loss 对齐校验；
 * **`deepseek_v4_checkpoint`**：DeepSeek-V4 分布式断点续训两阶段比对；
 * **`deepseek_v4_quantized`**：DeepSeek-V4 Block-FP8 量化（需 Ascend 950 芯片）；
+* **`deepseek_v4_1`**：DeepSeek-V4.1 文本和图像 LoRA 训练与 PEFT 导出；同时纳入默认 `models` suite；
+* **`deepseek_v4_1_checkpoint`**：DeepSeek-V4.1 AdamW/Muon 断点续训验证，单独运行；
+* **`deepseek_v4_1_quantized`**：DeepSeek-V4.1 Block-FP8 LoRA 专项验证，需支持的设备和运行时；
 * **`deepseek_v4_1_engram_hf`**：DeepSeek-V4.1 Engram MXFP8 专项校验与 DCP/HF 权重回环测试。
 
 #### 核心用例清单矩阵
@@ -56,6 +59,8 @@ python -m tests.integration_tests.run_tests \
 | **`dsv4_golden_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 | 2 | **是** | 分布式并行环境下的数值 Loss 精确比对 |
 | **`dsv4_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + AdamW NovaSwap | 2 | **动态比对** | 两阶段连续训练 vs 断点恢复训练，逐步比对 Loss 与 Grad Norm |
 | **`dsv4_lora_ep2_fsdp2`** | DeepSeek-V4 LoRA | EP2 + FSDP2，训练 LoRA A/B | 2 | 否 | 校验基座参数冻结、Adapter 权重更新及 PEFT 导出完整性 |
+| **`dsv41_lora_engram_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、AdamW | 2 | 否 | 校验基座与 Engram 冻结、adapter 更新及 PEFT 导出 |
+| **`dsv41_lora_multimodal_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、图像 patch + C4 文本 | 2 | 否 | 校验实际 vision forward、vision/Engram 冻结、adapter 更新及 PEFT 导出 |
 | **`dsv4_muon_swap_ep2_fsdp2`** | DeepSeek-V4 | NPU 融合算子 + DistMuon NovaSwap | 2 | 否 | NPU 融合算子（RMSNorm/RoPE/SparseAttention）与 Swap 路径冒烟 |
 | **`dsv4_anticipatory_recovery`** | DeepSeek-V4 | 1 Rank 原生 Checkpoint 回滚 | 1 | 否 | 一次性扰动训练 Loss，断言 Override 机制与完整恢复周期 |
 | **`dsv4_smla_1rank_aot_eager`** | DeepSeek-V4 | 1 Rank，`aot_eager` 编译 | 1 | 否 | SMLA 算子图在单卡下的编译构图与前反向冒烟 |
@@ -138,6 +143,29 @@ python -m tests.integration_tests.run_tests \
   > export HCCL_NPU_SOCKET_PORT_RANGE="60021-60040"  # 任务 B
   > ```
   > 否则节点间 HCCL 端口绑定冲突会导致初始化死锁或通信超时。
+
+### 1.4 DeepSeek-V4.1 LoRA checkpoint 验证
+
+`deepseek_v4_1_checkpoint` 单独运行 AdamW adapter-only、Muon 完整 DCP 和 Muon adapter-only 恢复用例。
+AdamW 使用固定基座与 adapter-only DCP；Muon adapter-only 保持公共 LoRA 配方的默认保存模式。
+完整模型配置见 [A3/A5 示例入口](../../examples/deepseek_v4_1/readme.md)。
+
+#### Muon adapter-only resume
+
+`dsv41_lora_muon_adapter_only_resume_ep2_fsdp2` 保持公共 LoRA 配方的
+`periodic_save_adapter_only=True`，使用固定基座、Muon、EP2/FSDP2 和确定性模式。
+第一阶段连续训练 10 步并保存 step 5；第二阶段从 step 5 恢复到 step 10。
+两阶段均使用 `training.steps=10`，保持学习率调度一致。
+TensorBoard 中 steps 6–10 的原始 loss 和 grad_norm 必须逐值精确相等。
+每个 rank 在恢复后、首次更新前检查 step 5 的全部 adapter 参数与 optimizer state，
+并在 steps 6–10 每次更新后与连续训练快照做零容差比较，包括 Muon momentum。
+恢复阶段只读基准快照，不覆盖连续训练的参数或状态证据；不更新 golden 文件。
+
+```bash
+python -m tests.integration_tests.run_tests /tmp/v41_muon_adapter_resume \
+  --test_suite deepseek_v4_1_checkpoint \
+  --test_name dsv41_lora_muon_adapter_only_resume_ep2_fsdp2 --ngpu 2
+```
 
 ---
 

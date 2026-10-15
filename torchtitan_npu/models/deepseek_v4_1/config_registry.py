@@ -195,6 +195,17 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             f"layers.{layer_id}.moe.routed_experts.inner_experts.{projection}": expert_sharding
             for projection in routed_expert_projections
         }
+        if getattr(model_config, "lora", None) is not None:
+            from torchtitan_npu.models.deepseek_v4.lora import DEEPSEEK_V4_LORA_TARGETS
+
+            for shardings in (attention_shardings, dense_shardings):
+                for base_key, layout in tuple(shardings.items()):
+                    owner = base_key.removesuffix(".weight")
+                    if owner.removeprefix(f"layers.{layer_id}.") in DEEPSEEK_V4_LORA_TARGETS:
+                        shardings[f"{owner}.lora_a.weight"] = owned
+                        shardings[f"{owner}.lora_b.weight"] = layout
+            for projection in ("w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b"):
+                routed_shardings[f"layers.{layer_id}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
         # Split each layer into three buckets: the routed-expert GEMMs are
         # by far the largest and get a bucket of their own so the
         # Newton-Schulz all-gather peak stays bounded on the 40-layer
@@ -206,6 +217,11 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.dense", patterns=tuple(dense_shardings)))
         bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.routed", patterns=tuple(routed_shardings)))
 
+    lora_pattern = ""
+    if getattr(model_config, "lora", None) is not None:
+        from torchtitan_npu.models.deepseek_v4.config_registry import _lora_muon_pattern
+
+        lora_pattern = _lora_muon_pattern(compute_sharding_by_fqn)
     muon_pattern = (
         r"(?:"
         rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
@@ -214,8 +230,7 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         rf"moe\.routed_experts\.inner_experts\.(?:{'|'.join(routed_expert_projections)})|"
         r"moe\.router\.gate\.weight|"
         r"engram\.gate\.wkv|"
-        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn"
-        r")$"
+        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn" + (f"|{lora_pattern}" if lora_pattern else "") + r")$"
     )
     return MuonOptimizerProfile(
         muon_pattern=muon_pattern,
@@ -230,6 +245,8 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
 
 def _v41_optimizer_config(model_spec: ModelSpec) -> OptimizerConfig:
     adamw = default_adamw(lr=1e-5, eps=1e-6)
+    if getattr(model_spec.model, "lora", None) is not None:
+        return derive(adamw, OptimizerConfig, name="AdamW", _muon_profile=_v41_muon_profile(model_spec))
     has_engram = any(
         getattr(layer, "engram", None) is not None for layer in cast("DeepSeekV41Model.Config", model_spec.model).layers
     )
@@ -272,8 +289,8 @@ def _text_dataloader_config(model_spec: ModelSpec):
     return AlignedHuggingfaceDataloader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
 
 
-def _make_trainer_config(flavor: str) -> TrainerEx.Config:
-    model_spec = model_registry(flavor)
+def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
+    model_spec = model_registry(flavor, converters=converters)
     if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
         raise ValueError("registered V4.1 model does not describe every configured layer")
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
@@ -330,3 +347,29 @@ def deepseek_v4_1_stripped() -> TrainerEx.Config:
     on one card.
     """
     return _make_trainer_config("deepseek_v4_1_stripped")
+
+
+def deepseek_v4_1_flash_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_flash")
+
+
+def deepseek_v4_1_flash_text_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_flash_text")
+
+
+def deepseek_v4_1_debugmodel_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_debugmodel_text")
+
+
+def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
+    from .checkpoint import DeepSeekV41LoRACheckpointManager
+    from .lora import DeepSeekV41LoRAConverter
+
+    config = _make_trainer_config(
+        flavor, converters=[DeepSeekV41LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)]
+    )
+    config.checkpoint = derive(config.checkpoint, DeepSeekV41LoRACheckpointManager.Config)
+    config.checkpoint.enable = True
+    config.checkpoint.last_save_model_only = False
+    config.checkpoint.last_save_in_hf = False
+    return config

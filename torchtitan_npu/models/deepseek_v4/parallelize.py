@@ -26,6 +26,8 @@ from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
 from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
 
+from .lora import is_lora_parameter
+
 if TYPE_CHECKING:
     from torchtitan.config import CompileConfig, ParallelismConfig
     from torchtitan.distributed import ParallelDims
@@ -112,7 +114,7 @@ def parallelize_deepseek_v4(
         )
     if getattr(parallelized_model, "lora_config", None) is not None:
         for name, parameter in parallelized_model.named_parameters():
-            if "lora_" not in name:
+            if not is_lora_parameter(name):
                 parameter.requires_grad_(False)
     return parallelized_model
 

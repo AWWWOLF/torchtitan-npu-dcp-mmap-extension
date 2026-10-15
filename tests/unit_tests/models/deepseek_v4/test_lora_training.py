@@ -6,7 +6,9 @@
 
 import importlib
 import re
+import sys
 from copy import deepcopy
+from types import ModuleType
 
 import pytest
 import torch
@@ -19,7 +21,9 @@ from torchtitan_npu.models.deepseek_v4.config_registry import (
     _dsv4_muon_profile,
     _dsv4_optimizer_config,
 )
-from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter, grouped_lora_class, linear_lora_class
+from torchtitan_npu.models.deepseek_v4.lora import (
+    DeepSeekV4LoRAConverter, grouped_lora_class, is_lora_parameter, linear_lora_class,
+)
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 _LORA_CONVERTER = DeepSeekV4LoRAConverter.Config(rank=4, alpha=8.0, rank_experts=4)
@@ -30,7 +34,7 @@ def _converted_debug_model() -> torch.nn.Module:
     with torch.device("meta"):
         model = spec.model.build()
     for name, parameter in model.named_parameters():
-        parameter.requires_grad_("lora_" in name)
+        parameter.requires_grad_(is_lora_parameter(name))
     return model
 
 
@@ -50,8 +54,8 @@ def test_muon_group_is_non_empty_and_every_member_has_a_compute_layout(monkeypat
     trainable = [canonical_fqn(name) for name, param in model.named_parameters() if param.requires_grad]
     frozen = [canonical_fqn(name) for name, param in model.named_parameters() if not param.requires_grad]
 
-    assert any(name.endswith(".weight") and "lora_" not in name for name in frozen)
-    assert any("lora_" in name for name in trainable)
+    assert any(name.endswith(".weight") and not is_lora_parameter(name) for name in frozen)
+    assert any(is_lora_parameter(name) for name in trainable)
 
     config = _dsv4_optimizer_config(base_spec, lr=1e-4)
     config.name = "Muon"
@@ -78,7 +82,7 @@ def test_muon_group_is_non_empty_and_every_member_has_a_compute_layout(monkeypat
 
     expected_muon = {name for name in trainable if not name.startswith("lm_head.")}
     assert set(muon_fqns) == expected_muon
-    assert all("lora_" in fqn for fqn in muon_fqns)
+    assert all(is_lora_parameter(fqn) for fqn in muon_fqns)
     missing = [fqn for fqn in muon_fqns if fqn not in compute_sharding_by_fqn]
     assert not missing, f"DistMuon parameters without a compute layout: {missing}"
 
@@ -125,6 +129,9 @@ def test_dsv4_muon_policy_resolves_combined_cp_storage_mesh(tmp_path, mesh_axis)
 
 @pytest.fixture
 def ao(monkeypatch):
+    # CPU tests replace the numerical kernels below; isolate only CANN registration.
+    # No torch.ops implementation is supplied, so an unmocked kernel still fails.
+    monkeypatch.setitem(sys.modules, "cann_ops_nn", ModuleType("cann_ops_nn"))
     pytest.importorskip("torchao_npu")
     module = importlib.import_module("torchtitan_npu.extensions.adaptor.torchao.converter")
     monkeypatch.setattr(module, "_ensure_cann_ops_loaded", lambda: None)
@@ -186,7 +193,7 @@ def test_quantization_preserves_adapter_weights_and_gradients(ao, kind, monkeypa
     with torch.no_grad():
         for name, parameter in module.named_parameters():
             parameter.normal_(std=0.1)
-            if "lora_" in name:
+            if is_lora_parameter(name):
                 adapters.append(parameter)
             else:
                 # The model's parallelize hook freezes base weights after construction.
@@ -229,8 +236,31 @@ def test_parameter_filter_is_composed_without_mutating_shared_policy(ao):
     assert all(
         not isinstance(p, wrappers.BaseTrainingWeightWrapperTensor)
         for name, p in module.named_parameters()
-        if "lora_" in name
+        if is_lora_parameter(name)
     )
+
+
+@pytest.mark.parametrize("excluded_base", [None, "w2_EDF"], ids=["all-base-weights", "preserve-base-filter"])
+def test_grouped_quantization_keeps_all_split_adapters_floating(ao, excluded_base):
+    wrappers = importlib.import_module("torchao_npu.wrapper_tensors")
+    policy = _block_fp8_policy(ao)
+
+    def base_filter(_parameter, name):
+        return name != excluded_base
+
+    policy.params_filter_fn = base_filter
+    module = _convert(ao, _lora_config(ao, "grouped"), policy).build()
+    parameters = dict(module.named_parameters())
+    adapters = {"w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b"}
+    bases = {"w1_EFD", "w2_EDF", "w3_EFD"}
+    assert parameters.keys() == adapters | bases
+    for name in adapters:
+        parameter = parameters[name]
+        assert parameter.requires_grad and parameter.is_floating_point()
+        assert not isinstance(parameter, wrappers.BaseTrainingWeightWrapperTensor), name
+    for name in bases:
+        assert isinstance(parameters[name], wrappers.BaseTrainingWeightWrapperTensor) == (name != excluded_base), name
+    assert policy.params_filter_fn is base_filter
 
 
 def test_module_replacement_policy_is_rejected_for_lora(ao):
@@ -261,7 +291,7 @@ def test_registered_quantized_lora_accepts_compile_configuration(ao, recipe):
     config.model_spec.model.update_from_config(config=config)
     with torch.device("meta"), utils.set_default_dtype(torch.bfloat16):
         model = config.model_spec.model.build()
-    adapters = [p for name, p in model.named_parameters() if "lora_" in name]
+    adapters = [p for name, p in model.named_parameters() if is_lora_parameter(name)]
     assert adapters and all(isinstance(p, torch.nn.Parameter) and p.requires_grad for p in adapters)
     assert all(not isinstance(p, wrappers.BaseTrainingWeightWrapperTensor) for p in adapters)
 

@@ -2,6 +2,7 @@
 # All rights reserved.
 #
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -223,4 +224,10 @@ def parallelize_deepseek_v4_1(
         edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
+    if getattr(model, "lora_config", None) is not None:
+        # Keep ordinary V4.1 imports independent of the optional V4 LoRA implementation.
+        from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
+
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(is_lora_parameter(name))
     return model

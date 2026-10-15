@@ -174,6 +174,7 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
         DEEPSEEK_V4_LORA_TARGETS=(),
         DeepSeekV4LoRAConverter=SimpleNamespace(Config=object),
         LoRAOptions=object,
+        is_lora_parameter=lambda _name: False,
         peft_target_modules=lambda targets: targets,
     ))
     monkeypatch.setitem(sys.modules,

@@ -17,7 +17,7 @@ from torchtitan.tools.logging import logger
 
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
-from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter
+from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter, is_lora_parameter
 from torchtitan.distributed.flex_shard.dist_muon import DistMuon
 
 
@@ -88,7 +88,7 @@ class LoRATrainer(TrainerEx):
         state = {
             name: (value.full_tensor() if isinstance(value, DTensor) else value).detach().cpu()
             for name, value in self.model_parts[0].state_dict().items()
-            if "lora_" in name
+            if is_lora_parameter(name)
         }
         expected = self.checkpointer.sd_adapter.to_peft(state)
         checkpoint = Path(self.checkpointer._create_checkpoint_id(self.step))
@@ -139,11 +139,11 @@ class LoRATrainer(TrainerEx):
         parameters = {
             name: value.to_local() if isinstance(value, DTensor) else value for name, value in model.named_parameters()
         }
-        adapters = [value for name, value in parameters.items() if "lora_" in name]
+        adapters = [value for name, value in parameters.items() if is_lora_parameter(name)]
         wrapped = [
             value
             for name, value in parameters.items()
-            if "lora_" not in name and isinstance(value, BaseTrainingWeightWrapperTensor)
+            if not is_lora_parameter(name) and isinstance(value, BaseTrainingWeightWrapperTensor)
         ]
         assert wrapped and all(not value.requires_grad for value in wrapped)
         assert adapters and all(

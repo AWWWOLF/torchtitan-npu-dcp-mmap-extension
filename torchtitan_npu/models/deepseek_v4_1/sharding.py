@@ -36,6 +36,11 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
     "w1_EFD": spmd.S(1),
     "w2_EDF": spmd.S(2),
     "w3_EFD": spmd.S(1),
+    "w13_lora_a": spmd.R,
+    "w1_lora_b": spmd.S(1),
+    "w3_lora_b": spmd.S(1),
+    "w2_lora_a": spmd.S(2),
+    "w2_lora_b": spmd.R,
 }
 
 _replicate_weight = ShardingConfig(

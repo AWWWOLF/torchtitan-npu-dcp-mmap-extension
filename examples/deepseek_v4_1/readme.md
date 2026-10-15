@@ -195,3 +195,7 @@ CPU 测试覆盖两类 seam 的输出/梯度、partial 非连续输入、逐 bat
 ### 验证范围
 
 CPU 单测覆盖模型与融合配置选择、RoPE 输出/梯度等核心行为；不保留专用的 V4.1 两卡手动冒烟 suite。真实训练通过上述 A3/A5 入口执行。历史 A3 的 50 步对照见 PR 845；该证据不代表当前 HEAD 或 A5 新 CANN 已完成重验。
+
+## LoRA
+
+通过 [LoRA 脚本](deepseek_v4_1_flash_lora_4k_a3.sh) 复用 CPT 入口。默认配置为多模态 `deepseek_v4_1_flash_lora`，设置 `CONFIG=deepseek_v4_1_flash_text_lora` 可选择纯文本模型。AdamW/Muon、Engram 冻结、native DCP 恢复和 PEFT 导出/合并方式见 [V4.1 LoRA 指南](../../docs/feature_guides/deepseek_v4_1_lora.md)。

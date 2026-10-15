@@ -22,6 +22,8 @@ from torchtitan.tools.logging import logger
 
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager as NPUCheckpointManager
 
+from .lora import is_lora_parameter
+
 
 def select_adapter_only_state(
     flattened_state: dict[str, Any],
@@ -31,7 +33,7 @@ def select_adapter_only_state(
     model_trainable_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     retained_keys = non_model_keys | (model_buffer_keys or set()) | (model_trainable_keys or set())
-    return {key: value for key, value in flattened_state.items() if key in retained_keys or "lora_" in key}
+    return {key: value for key, value in flattened_state.items() if key in retained_keys or is_lora_parameter(key)}
 
 
 class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
@@ -105,7 +107,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
             # Bound temporary expert reassembly tensors to one transformer layer.
             groups = {}
             for name, value in state_dict.items():
-                if "lora_" in name:
+                if is_lora_parameter(name):
                     continue
                 parts = name.split(".", 2)
                 prefix = ".".join(parts[:2]) if parts[0] in {"layers", "mtp_layers"} else ""
@@ -114,7 +116,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
                 super().dcp_load(groups[prefix], checkpoint_id, from_hf, from_quantized)
             return None
         if checkpoint_id == self.initial_load_path:
-            state_dict = {key: value for key, value in state_dict.items() if "lora_" not in key}
+            state_dict = {key: value for key, value in state_dict.items() if not is_lora_parameter(key)}
         elif not from_hf:
             saved_keys = dcp.FileSystemReader(checkpoint_id).read_metadata().state_dict_metadata.keys()
             if any(key.endswith(".w13_lora_b") for key in saved_keys):
@@ -126,11 +128,11 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
             model_state = self.states[MODEL].state_dict()
             model_buffer_keys = self._model_buffer_keys()
             has_base = all(
-                key in saved_keys for key in model_state if "lora_" not in key and key not in model_buffer_keys
+                key in saved_keys for key in model_state if not is_lora_parameter(key) and key not in model_buffer_keys
             )
-            has_adapters = any("lora_" in key for key in saved_keys)
+            has_adapters = any(is_lora_parameter(key) for key in saved_keys)
             if not has_adapters:
-                state_dict = {key: value for key, value in state_dict.items() if "lora_" not in key}
+                state_dict = {key: value for key, value in state_dict.items() if not is_lora_parameter(key)}
             if has_base or not has_adapters:
                 return super().dcp_load(state_dict, checkpoint_id, from_hf, from_quantized)
             if not self.initial_load_path:
@@ -167,7 +169,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
             name
             for model in self.states[MODEL].model
             for name, parameter in model.named_parameters(remove_duplicate=False)
-            if parameter.requires_grad and "lora_" not in name
+            if parameter.requires_grad and not is_lora_parameter(name)
         )
 
         if dist.is_available() and dist.is_initialized():
@@ -196,7 +198,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         selected = select_adapter_only_state(
             flattened, non_model_keys, model_buffer_keys=self._model_buffer_keys(), model_trainable_keys=trainable_keys
         )
-        if not any("lora_" in key for key in selected):
+        if not any(is_lora_parameter(key) for key in selected):
             raise ValueError("No LoRA adapter tensors were found for interval checkpointing")
         return selected
 
@@ -218,7 +220,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         adapter_state = {}
         for name, value in state_dict.items():
-            if "lora_" not in name:
+            if not is_lora_parameter(name):
                 continue
             # All ranks participate in reconstruction, retaining only one full
             # adapter tensor on device at a time. Rank zero owns the CPU export.

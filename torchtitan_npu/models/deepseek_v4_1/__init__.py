@@ -1008,6 +1008,11 @@ def model_registry(
         validate_converter_order(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
+    state_dict_adapter = DeepSeekV41StateDictAdapter
+    if getattr(config, "lora", None) is not None:
+        from .lora import DeepSeekV41LoRAStateDictAdapter
+
+        state_dict_adapter = DeepSeekV41LoRAStateDictAdapter
     return ModelSpec(
         name="deepseek_v4_1",
         flavor=flavor,
@@ -1015,7 +1020,7 @@ def model_registry(
         parallelize_fn=parallelize_deepseek_v4_1,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,
-        state_dict_adapter=DeepSeekV41StateDictAdapter,
+        state_dict_adapter=state_dict_adapter,
     )
 
 
@@ -1023,6 +1028,8 @@ def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
     """Register the MoE balancing step hook."""
     from torchtitan.components.optimizer import register_moe_load_balancing_hook
 
+    if any(getattr(model, "lora_config", None) is not None for model in model_parts):
+        return
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 

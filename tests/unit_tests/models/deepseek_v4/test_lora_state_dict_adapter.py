@@ -31,9 +31,12 @@ def test_to_hf_omits_local_lora_adapter_parameters(adapter):
     local_state_dict = {
         "layers.0.attention.wq_a.lora_a.weight": torch.ones(2, 4),
         "layers.0.moe.routed_experts.inner_experts.w13_lora_b": torch.ones(2, 4, 2, 2),
+        "pre_lora_cache.weight": torch.full((2,), 7.0),
     }
 
-    assert adapter.to_hf(local_state_dict) == {}
+    converted = adapter.to_hf(local_state_dict)
+    assert set(converted) == {"pre_lora_cache.weight"}
+    torch.testing.assert_close(converted["pre_lora_cache.weight"], local_state_dict["pre_lora_cache.weight"])
 
 
 def test_to_peft_maps_dense_keys_and_rejects_mtp(adapter):
@@ -41,6 +44,7 @@ def test_to_peft_maps_dense_keys_and_rejects_mtp(adapter):
         "lm_head.lora_a.weight": torch.ones(2, 32), "lm_head.lora_b.weight": torch.ones(512, 2),
         "layers.0.attention.wq_a.lora_a.weight": torch.ones(2, 32),
         "layers.0.attention.wq_a.lora_b.weight": torch.ones(16, 2),
+        "pre_lora_cache.weight": torch.full((2,), 7.0),
     }
 
     peft_state_dict = adapter.to_peft(local_state_dict)

@@ -495,6 +495,7 @@ class DeepSeekV41Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         cfg = config
+        self.lora_config = getattr(config, "lora", None)
         self.hc_mult = cfg.hc_mult
         self.compress_ratios = tuple(cfg.compress_ratios)
         self.engram_history_size = max(
