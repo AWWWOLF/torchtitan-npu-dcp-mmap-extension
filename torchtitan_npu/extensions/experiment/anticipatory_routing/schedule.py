@@ -140,6 +140,7 @@ class AnticipatorySchedule:
         self.cache = build_routing_cache(
             engine.trainer.model_parts,
             index_store_dtype=config.index_store_dtype,
+            device=trainer.device,
         )
         self.metrics = trainer.metrics_processor
         self.detector = config.detector.build()
@@ -207,10 +208,14 @@ class AnticipatorySchedule:
         engine.in_step = True
         try:
             step_data = self._prepare_training_data_and_routes(data_iterator)
+            engine.initialize_routing(self.cache, step_data.microbatches[0])
             self._credit_metrics(step_data)
             supplied = SuppliedMicrobatches(step_data.microbatches)
-            with self.cache.replaying(step_data.slots):
+            try:
+                self.cache.begin_training(step_data.slots)
                 yield supplied
+            finally:
+                self.cache.reset()
             supplied.verify_consumed()
             engine.in_step = False
             self.detector.record_optimizer_update()
@@ -324,9 +329,14 @@ class AnticipatorySchedule:
         slots: list[RoutingSlot] = []
         with sl.log_trace_span("anticipatory_prefetch"):
             for microbatch in step_data.microbatches:
+                self.engine.initialize_routing(self.cache, microbatch)
                 slot: RoutingSlot = {}
-                with self.cache.capturing(slot):
+                try:
+                    self.cache.begin_capture(slot)
                     self.engine.forward_only_microbatch(microbatch)
+                    self.cache.save_captured_routes()
+                finally:
+                    self.cache.reset()
                 slots.append(slot)
 
         step_data.slots = slots

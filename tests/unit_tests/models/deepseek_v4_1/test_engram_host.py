@@ -6,6 +6,7 @@
 """Host Engram sparse updates, clipping and checkpoint restoration."""
 
 import copy
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -192,7 +193,13 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     from torchtitan_npu.models.deepseek_v4_1.indexer import FULL
     from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import AscSelector
 
-    model = torch.nn.Module()
+    class RoutingModel(torch.nn.Module):
+        """CPU fixture whose initialization forward visits the real router."""
+
+        def forward(self, input_ids):
+            return self.router((input_ids.float() + 1).unsqueeze(-1))[0]
+
+    model = RoutingModel()
     model.add_module("table", table_config().build())
     model.register_parameter("dense", torch.nn.Parameter(torch.ones(1)))
     with torch.no_grad():
@@ -210,8 +217,10 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         mode=FULL, compress_ratio=1, num_index_heads=1, index_head_dim=4, index_topk=1,
     ).build()
     model.router = AnticipatoryHashRouter.Config(
-        num_experts=2, gate=Linear.Config(in_features=1, out_features=2),
+        num_experts=2, top_k=1, gate=Linear.Config(in_features=1, out_features=2),
     ).build()
+    with torch.no_grad():
+        model.router.gate.weight.copy_(torch.tensor([[1.0], [-1.0]]))
     trainer._indexer_selectors = [model.selector]
     trainer.config = SimpleNamespace(
         training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0, steps=2),
@@ -226,6 +235,13 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     trainer.step = trainer.num_pipeline_parallel_microbatches = 1
     trainer.gradient_accumulation_steps = 2
     trainer.ntokens_seen = 1
+    trainer.train_context = nullcontext
+
+    def preprocess(inputs, labels):
+        trainer.ntokens_seen += labels.numel()
+        return inputs["input"], labels, {}
+
+    trainer.post_dataloading_process = preprocess
     events, metrics = [], []
     trainer.lr_schedulers = SimpleNamespace(get_metrics=lambda: {}, step=lambda: events.append("lr"))
     trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True)
@@ -277,6 +293,9 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         engine = trainer.anticipatory_schedule.engine
         assert engine.last_global_loss == 7.0 and not engine.in_step and not engine.failed
         assert trainer.metrics_processor.ntokens_since_last_log == 3
+        assert trainer.ntokens_seen == 1  # Initialization must not credit training tokens.
+        buffer = model.router._anticipatory_replay_buffer
+        torch.testing.assert_close(buffer.indices, torch.zeros(1, 1, dtype=torch.int64))
     assert events == expected_events
     assert metrics == [(1, 7.0, 7.0, 5.0)]
     torch.testing.assert_close(model.dense.grad, torch.tensor([3 / (5 + 1e-6)]))

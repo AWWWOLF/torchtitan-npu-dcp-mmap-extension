@@ -13,7 +13,7 @@ from torchtitan.tools.logging import logger
 
 from torchtitan_npu.patches.torchtitan.models.common.moe import HashRouter
 
-from .cache import RoutingIndexCache, RoutingMode, resolve_store_dtype
+from .cache import RoutingIndexCache, RoutingReplayBuffer, resolve_store_dtype
 
 OVERRIDE_TARGET = "torchtitan_npu.extensions.experiment.anticipatory_routing.router.anticipatory_router"
 
@@ -27,23 +27,16 @@ class AnticipatoryHashRouter(HashRouter):
 
     def __init__(self, config):
         super().__init__(config)
-        self._anticipatory_cache = None
+        self._anticipatory_cache: RoutingIndexCache | None = None
         self._anticipatory_key = ""
+        self._anticipatory_replay_buffer: RoutingReplayBuffer | None = None
 
     def _select_experts(self, scores):  # pyrefly: ignore [bad-param-name-override]
-        cache = self._anticipatory_cache
-        if cache is None or cache.mode is RoutingMode.OFF:
-            return super()._select_experts(scores)
-        if cache.mode is RoutingMode.REPLAY:
-            cached = cache.replay(self._anticipatory_key)
-            if cached.shape != scores[..., : self.top_k].shape:
-                raise ValueError(f"Cached route shape {cached.shape} does not match scores {scores.shape}")
-            ids = torch.zeros_like(scores[..., : self.top_k], dtype=torch.int64)
-            ids.copy_(cached)
-            return ids
-        ids = super()._select_experts(scores)
-        cache.capture(self._anticipatory_key, ids)
-        return ids
+        live_ids = super()._select_experts(scores)
+        replay = self._anticipatory_replay_buffer
+        if replay is None:
+            return live_ids
+        return replay.select_experts(live_ids)
 
 
 @override(target=HashRouter.Config, exact=True, description="Capture and replay dynamic expert selection")
@@ -65,7 +58,7 @@ def configure_router_override(config):
         config.override.imports.append(OVERRIDE_TARGET)
 
 
-def build_routing_cache(model_parts, *, index_store_dtype):
+def build_routing_cache(model_parts, *, index_store_dtype, device=None):
     """Attach the shared cache to dynamic routers; hash tables need no replay."""
     routers = [
         (f"{i}.{name}", module)
@@ -86,7 +79,13 @@ def build_routing_cache(model_parts, *, index_store_dtype):
     cache = RoutingIndexCache(
         store_dtype=resolve_store_dtype(index_store_dtype, max((r.num_experts for _, r in routers), default=1)),
     )
+    if device is None:
+        device = next(
+            (parameter.device for part in model_parts for parameter in part.parameters()), torch.device("cpu")
+        )
+    cache.create_replay_buffers([key for key, _ in routers], device)
     for key, router in routers:
         router._anticipatory_cache = cache  # pyrefly: ignore [bad-argument-type]
         router._anticipatory_key = key  # pyrefly: ignore [bad-argument-type]
+        router._anticipatory_replay_buffer = cache.replay_buffers.get(key)  # pyrefly: ignore [bad-argument-type]
     return cache

@@ -119,6 +119,24 @@ class AnticipatoryTrainingEngine:
             np.random.set_state(numpy_rng)
             self._reset_fsdp()
 
+    def initialize_routing(self, cache, batch):
+        """Allocate runtime tensors without changing the real training path.
+
+        Reuse the first already-fetched microbatch and the existing isolation.
+        In particular, do not mix eager and compiled FullAC training statistics
+        within the first optimizer step just to initialize these tensors.
+        """
+        if cache.needs_materialization:
+            # This one-time shape discovery is not a recorded queue entry.
+            try:
+                cache.begin_initialization()
+                with torch.compiler.set_stance("force_eager"):
+                    self.forward_only_microbatch(batch)
+            finally:
+                cache.reset()
+            if cache.needs_materialization:
+                raise RuntimeError("The initialization forward did not visit every dynamic router")
+
     @torch.no_grad()
     def forward_only_microbatch(self, batch):
         # Preprocessing is allowed to mutate its input; keep queued data intact.
