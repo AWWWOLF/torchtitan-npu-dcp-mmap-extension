@@ -11,9 +11,15 @@ Numerics verification criterion: a match is only accepted when it is
 *bitwise*, or the residual sits at the fp32 rounding floor of the outputs
 (at most a few ulps of the output scale) — a floating-point artifact, not
 an arithmetic difference.  The compressor and the indexer are bitwise; the
-reference attention core vs the eager golden is ~1 ulp (the golden is
-exact-fp32 by design, so its own f32/f64 delta is zero and the remaining
+reference attention core vs the eager golden stays within 1.8 ulps (the golden
+is exact-fp32 by design, so its own f32/f64 delta is zero and the remaining
 residual is the flex path's fp32 rounding).
+
+Every comparison runs single-threaded (``_reproducible_numerics`` below): the
+pool gradient's backward accumulates duplicate contributions in a
+thread-scheduling dependent order, which makes the residual a sample of a
+distribution rather than a number, and that distribution crosses this file's
+4-ulp budget often enough to flake.
 """
 
 from dataclasses import dataclass
@@ -28,7 +34,43 @@ pytestmark = pytest.mark.usefixtures("dsv4")
 
 DIM, HD, RD = 8, 16, 4
 _GRAD_ULPS = 4
+# Two documents longer than one compression block, with different tails (at
+# ratio 128 neither is a whole number of blocks).
+_GRADIENT_DOCS = (200, 133)
 _EPS32 = 1.1920929e-7  # fp32 machine epsilon
+
+
+@pytest.fixture(autouse=True)
+def _reproducible_numerics():
+    """Pin the intra-op thread count so the rounding-floor residuals are reproducible.
+
+    The core and the golden both differentiate the *same* compressed-KV pool, and
+    both read it through advanced indexing (the golden's ``kv[batch, index, :]``,
+    attn-gym's ``kv[b, h, indices]``).  The pool's rows are read by many query
+    rows, so that gather's backward is an accumulate scatter (ATen lowers it to
+    ``index_put_`` with ``accumulate=True``), and its CPU kernel sums the
+    duplicate contributions in a thread-scheduling dependent order: measured in
+    isolation, ``index_put_(accumulate=True)`` and both advanced-index backwards
+    give different last bits from run to run at 16 threads with a non-uniform
+    upstream gradient.
+
+    So with more than one intra-op thread each consumer drifts against *itself*
+    by up to ~3.5 ulps of ``cmp_k``'s scale, and the core-vs-golden residual
+    wanders between ~2.3 and ~5.2 ulps against this file's 4-ulp budget (an
+    in-process 100-rep loop of the comparison below: median 3.46, max 5.19, 25
+    runs over budget — only ``cmp_k`` moves; ``out``, ``q``, ``swa_k`` and
+    ``sink`` are bitwise constant).  Single-threaded every residual is bitwise
+    reproducible, with measured worsts of 1.8 (out), 1.1 (q), 1.4 (swa_k), 1.2
+    (cmp_k) and 0.0 (sink) ulps.  ``torch.use_deterministic_algorithms(True)``
+    does not help (torch does not call these kernels nondeterministic), and
+    neither does pinning ``MKL_DYNAMIC``/``OMP_NUM_THREADS`` to 16.
+    """
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 # ---------------------------------------------------------------------------
@@ -450,8 +492,8 @@ def test_compressor_numerics_ratio4(inputs):
     (the documented batch-size artifact; the same-size calls are
     deterministic).  ``_assert_rounding_floor`` accepts that — bitwise would
     only hold on shape-invariant kernels; the suite-wide 4-ulp budget keeps
-    a 4x margin over the measured worst (~1 ulp across seeds and thread
-    counts) while still flagging any multi-ulp arithmetic regression.
+    a 2.2x margin over the measured worst (at most 1.8 ulps, single-threaded)
+    while still flagging any multi-ulp arithmetic regression.
     """
     dsv4, md, x, _pos = inputs
     comp4 = build_compressor(dsv4, 4)
@@ -520,9 +562,9 @@ def _assert_rounding_floor(diff, scale, *, ulps: int = 4):
     """The residual must sit at the fp32 rounding floor of the outputs
     (<= ``ulps`` ulps of the output scale) — floating-point error only, not
     arithmetic (an arithmetic difference would exceed it by orders of
-    magnitude).  ``ulps=4`` is the suite-wide budget: measured worsts are
-    ~1 ulp (compressor batching artifact) and ~2.5 ulps (attention core vs
-    golden) across seeds and thread counts."""
+    magnitude).  ``ulps=4`` is the suite-wide budget; the measured worsts are
+    1.8 (attention outputs) and 1.2 (attention gradients) ulps, reproducible
+    because the comparisons run single-threaded."""
     assert scale > 0
     assert diff.max().item() <= ulps * _EPS32 * scale, (diff.max().item(), scale)
 
@@ -626,16 +668,15 @@ def test_attention_numerics_ratio4_zero_blocks(dsv4):
     assert out_s.shape == (1, 8, 3, HD) and torch.isfinite(out_s).all()
 
 
-@pytest.mark.parametrize("ratio", [4, 128])
-def test_attention_gradients_match_the_golden(dsv4, ratio):
-    """Two documents longer than 128 tokens with different tails, differentiated end to end.
+def _gradient_case(dsv4, ratio=4):
+    """The gradient comparison's inputs: one pool, one selection, one draw per consumer.
 
-    The compressed pool is non-empty at both ratios, the golden's own LI auxiliary loss is off
-    so both passes carry the same objective, and the q / swa_k / cmp_k gradients are compared in
-    addition to the outputs (the case above only compared outputs, under ``no_grad``, on a
-    64-token row whose ratio-128 pool is empty)."""
+    One input set is built for both consumers, so any difference in the outputs
+    or the gradients is arithmetic, not a different draw.  Raises if the pool is
+    empty, i.e. if the case stops exercising the compressed path.
+    """
     torch.manual_seed(0)
-    docs = (200, 133)
+    docs = _GRADIENT_DOCS
     md = dsv4.metadata.build_compressed_varlen_metadata(_build_varlen(docs), (4, 128))
     seqlen = sum(docs)
     sink = torch.randn(3)
@@ -656,24 +697,40 @@ def test_attention_gradients_match_the_golden(dsv4, ratio):
             8,
         )
 
-    # One input set: each consumer gets its own differentiable copy of the same tensors, so
-    # any difference in the outputs or the gradients is arithmetic, not a different draw.
     base = (
         torch.randn(1, seqlen, 3, HD),
         torch.randn(1, seqlen, HD),
         pool.detach().clone(),
         sink,
     )
-
     core, golden = _build_attn_pair(dsv4, ratio, 8 if ratio == 4 else 0, indexer_loss_coeff=0.0)
+    return md, sparse, base, core, golden
+
+
+def _consumer_grads(consumer, sparse, md, base):
+    """One differentiated pass; each consumer gets its own differentiable copy."""
+    q, swa_k, cmp_k, attn_sink = (t.detach().clone().requires_grad_() for t in base)
+    out = consumer(q, swa_k, cmp_k, attn_sink=attn_sink, sparse_indices=sparse, attention_masks=md)
+    upstream = torch.linspace(-1, 1, out.numel()).reshape_as(out)
+    (out * upstream).sum().backward()
+    return out, (q.grad, swa_k.grad, cmp_k.grad, attn_sink.grad)
+
+
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_attention_gradients_match_the_golden(dsv4, ratio):
+    """Two documents longer than 128 tokens with different tails, differentiated end to end.
+
+    The compressed pool is non-empty at both ratios, the golden's own LI auxiliary loss is off
+    so both passes carry the same objective, and the q / swa_k / cmp_k gradients are compared in
+    addition to the outputs (the case above only compared outputs, under ``no_grad``, on a
+    64-token row whose ratio-128 pool is empty)."""
+    md, sparse, base, core, golden = _gradient_case(dsv4, ratio)
+    seqlen = base[0].shape[1]
     outs, grads = [], []
     for consumer in (core, golden):
-        q, swa_k, cmp_k, attn_sink = (t.detach().clone().requires_grad_() for t in base)
-        out = consumer(q, swa_k, cmp_k, attn_sink=attn_sink, sparse_indices=sparse, attention_masks=md)
-        upstream = torch.linspace(-1, 1, out.numel()).reshape_as(out)
-        (out * upstream).sum().backward()
+        out, grad = _consumer_grads(consumer, sparse, md, base)
         outs.append(out)
-        grads.append((q.grad, swa_k.grad, cmp_k.grad, attn_sink.grad))
+        grads.append(grad)
 
     core_out, golden_out = outs
     assert core_out.shape == golden_out.shape == (1, seqlen, 3, HD)
@@ -683,6 +740,29 @@ def test_attention_gradients_match_the_golden(dsv4, ratio):
         _assert_rounding_floor(
             (core_grad - golden_grad).abs(), golden_grad.abs().max().item(), ulps=_GRAD_ULPS
         )
+
+
+def test_attention_pool_gradient_is_reproducible(dsv4):
+    """The same consumer, run twice on identical inputs, must give the same pool gradient.
+
+    This is what the single-threaded fixture buys, and the reason it exists: the
+    pool gradient is the backward of the gather that reads the pool, an
+    accumulate scatter whose contributions are summed in a thread-scheduling
+    dependent order, so with more than one intra-op thread even one consumer
+    disagrees with itself by up to ~3.5 ulps of ``cmp_k``'s scale — and the
+    core-vs-golden residual the test above asserts on then wanders between ~2.3
+    and ~5.2 ulps against its 4-ulp budget.  The thread-count assertion keeps
+    this guard deterministic; without it the two runs only *usually* differ.
+    """
+    assert torch.get_num_threads() == 1, "the module fixture must pin the intra-op threads"
+    md, sparse, base, core, _golden = _gradient_case(dsv4)
+    _out, (_q_grad, _swa_k_grad, first, _sink_grad) = _consumer_grads(core, sparse, md, base)
+    _out, (_q_grad, _swa_k_grad, second, _sink_grad) = _consumer_grads(core, sparse, md, base)
+
+    assert torch.equal(first, second), (
+        "the pool gradient must be reproducible; a thread-dependent accumulate "
+        "scatter in its backward makes the rounding-floor comparison above flaky"
+    )
 
 
 def test_reference_consumers_reject_context_parallel_frames(dsv4):
