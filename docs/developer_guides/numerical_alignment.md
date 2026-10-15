@@ -59,6 +59,8 @@ MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_nor
 - 运行一次推理和小算子基线的一次前向计算；
 - 判断推理和训练 logits 是否 `比特一致`。
 
+示例：[DeepSeek-V4 推理前向对比](../../scripts/numerical_alignment/deepseek_v4/README.md)。基线固定为 `transformers==5.13.0`；可选数值补丁存在时默认启用，验收记录必须区分原生与打补丁的 Transformers。
+
 ### 3.2 改动局部精度对比
 
 目的：确认被修改的算子或模块本身没有公式、边界、索引或梯度错误。
