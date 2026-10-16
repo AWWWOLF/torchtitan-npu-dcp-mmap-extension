@@ -27,6 +27,9 @@ export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}"
 export STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}"
 export MULTI_STREAM_MEMORY_RESERVE="${MULTI_STREAM_MEMORY_RESERVE:-1}"
 
+# Set the Inductor backend to AscendC.
+export TORCHINDUCTOR_NPU_BACKEND="${TORCHINDUCTOR_NPU_BACKEND:-ascendc}"
+
 Network_Interface=${Network_Interface:-$(ip -o -4 addr show scope global | awk '$2 != "docker0" {print $2; exit}')}
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${Network_Interface}}"
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-${Network_Interface}}"
