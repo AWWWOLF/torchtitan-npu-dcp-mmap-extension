@@ -127,29 +127,33 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         num_global_tokens_per_local_expert_EP_e: torch.Tensor,
         ep_size: int,
     ) -> tuple[torch.Tensor, list[int], list[int]]:
-        # Patch override: upstream copies input_splits to CPU with
-        # non_blocking=True and relies on the later blocking output_splits
-        # copy to sync the stream. Under torch.compile the scheduler may
-        # hoist the input_splits reads above the blocking copy (no data
-        # dependency between them), so the reads race with the async D2H
-        # copy and return uninitialized memory -- garbage split sizes make
-        # the compiled backward fail with "Split sizes doesn't match total
-        # dim 0 size" at the variable-size data all-to-all. Stack both
-        # split vectors on device and pay one blocking D2H instead of two:
-        # the count-exchange all-to-all had to complete before either read
-        # anyway, so a single stream sync covers both.
+        # Patch override: keep exactly two blocking _to_copy CPU copies
+        # in this method. Upstream's graph_trainer ep_overlap pass tags the
+        # ops launched here (annotate_moe_ep_regions wraps this override)
+        # and structurally validates "exactly two token-count sync CPU
+        # copies" per MoE chunk -- it schedules the region around the pair
+        # and rewrites the first copy to non_blocking while the last one
+        # stays blocking. Merging both copies into one stacked D2H (PR
+        # #1036) left a single tagged copy and crashed GraphTrainer at
+        # graph build time. Each copy also blocks on its own: upstream's
+        # original async input_splits copy races under inductor scheduling
+        # (reads hoisted above the blocking output_splits copy read
+        # uninitialized memory -- "Split sizes doesn't match total dim 0
+        # size" at the variable-size data all-to-all).
         num_global_tokens_per_local_expert_EP_e = torch.ops._c10d_functional.wait_tensor(
             num_global_tokens_per_local_expert_EP_e
         )
         num_global_tokens_per_local_expert_E = num_global_tokens_per_local_expert_EP_e.reshape(-1)
-        splits_2r = torch.stack(
-            (
-                num_local_tokens_per_expert_E.view(ep_size, -1).sum(dim=1),
-                num_global_tokens_per_local_expert_E.view(ep_size, -1).sum(dim=1),
-            )
-        ).to(torch.device("cpu"), non_blocking=False)
-        input_splits_list = splits_2r[0].tolist()
-        output_splits_list = splits_2r[1].tolist()
+        input_splits = (
+            num_local_tokens_per_expert_E.view(ep_size, -1).sum(dim=1).to(torch.device("cpu"), non_blocking=False)
+        )
+        output_splits = (
+            num_global_tokens_per_local_expert_E.view(ep_size, -1)
+            .sum(dim=1)
+            .to(torch.device("cpu"), non_blocking=False)
+        )
+        input_splits_list = input_splits.tolist()
+        output_splits_list = output_splits.tolist()
 
         return (
             num_global_tokens_per_local_expert_E,
