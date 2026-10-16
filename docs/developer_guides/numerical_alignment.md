@@ -59,7 +59,11 @@ MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_nor
 - 运行一次推理和小算子基线的一次前向计算；
 - 判断推理和训练 logits 是否 `比特一致`。
 
-示例：[DeepSeek-V4 推理前向对比](../../scripts/numerical_alignment/deepseek_v4/README.md)。基线固定为 `transformers==5.13.0`；可选数值补丁存在时默认启用，验收记录必须区分原生与打补丁的 Transformers。
+示例：[DeepSeek-V4 推理基线与小算子基线前向对齐方法](../../scripts/numerical_alignment/README.md#步骤三transformers-和-torchtitan-前向对比)。权重准备与转换见同一文档的步骤一、二。
+
+DeepSeek-V4 的 Transformers 基线固定为 `transformers==5.13.0`，默认启用数值对齐补丁。验收记录必须区分原生与打补丁的 Transformers。
+脚本在前向计算前调用 `set_allow_hf32(False)`，关闭 NPU matmul、conv 和 ACLNN 的 HF32。
+Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延后到投影后会改变舍入位置。
 
 ### 3.2 改动局部精度对比
 
@@ -71,7 +75,7 @@ MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_nor
 - 比较小算子基线和被测实现模块输出精度，至少需要满足 `数值近似` 的要求（参考 `logits` 数值近似阈值）；
 - 存在反向时，还需对比梯度。
 
-示例：[局部模块前向和反向精度对比脚本](../../scripts/numerical_alignment/compare_module_example.py)，使用相同输入、权重和上游梯度比较 Torch RMSNorm 与 AscRMSNorm。
+示例：[局部模块前向和反向精度对比方法](../../scripts/numerical_alignment/README.md#局部模块对比)，使用相同输入、权重和上游梯度比较 Torch RMSNorm 与 AscRMSNorm。
 
 ### 3.3 小算子基线 vs 被测实现
 
@@ -83,7 +87,9 @@ MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_nor
 - 分别运行小算子基线和被测实现的前向计算；
 - 判断两种实现的 `logits` 和 `loss` 是否满足对应的精度要求，若被测实现为对小算子路径的修改，需满足 `比特一致`。
 
-示例：[小算子基线和被测实现比较脚本](../../scripts/numerical_alignment/loss_compare.py)。使用 `--baseline-options` / `--test-options` 传入两组 `override.imports`，或使用 `--baseline-env` / `--test-env` 切换 runner 的 override 组。
+示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较 Golden 和融合实现的 `loss`、`grad_norm`。
+
+训练对比默认使用 `seq_len=4096`；其他长度通过 `--seq-len` 统一指定。
 
 ### 3.4 修改前后训练精度对比
 
@@ -95,7 +101,7 @@ MEAN_AE 提供稳定的绝对误差尺度，尤其适用于 `loss` 和 `grad_nor
 - 至少运行 `100` 个训练 step；
 - 声明不改变计算结果时，`loss` 和 `grad_norm` 必须 `比特一致`；涉及计算变化时，需满足 `数值近似`。
 
-示例：[修改前后训练精度比较脚本](../../scripts/numerical_alignment/loss_compare.py)，通过两个 Git ref 指定比较对象，使用 `--steps 100` 运行两侧训练。
+示例：[修改前后训练精度对齐方法](../../scripts/numerical_alignment/README.md#步骤四训练-loss-和-grad_norm-对比)，通过两个 Git ref 指定比较对象，使用 `--steps 100` 运行两侧训练。
 
 ## 4. 验证范围
 

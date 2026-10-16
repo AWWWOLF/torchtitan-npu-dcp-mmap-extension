@@ -12,8 +12,7 @@ from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_sparse_attentio
     DeepSeekV41QuantSparseAttentionConfig,
     _quant_v41_sparse_attention_transform,
 )
-from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer
-from torchao_npu.quantized_modules.deepseek_v4_1 import sparse_attention
+from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer, sparse_attention
 
 
 def _metadata(*, tokens=4, compressed_tokens=2):
