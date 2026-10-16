@@ -103,17 +103,53 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
 
 
 def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
-    return [replace(
-        build_deepseek_v4_checkpoint_resume_test_list()[1],
-        test_name="dsv4_lora_block_fp8_ep2_fsdp2",
-        test_descr="DeepSeek-V4 block-FP8 base and floating LoRA training EP2/FSDP2",
-        env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
-        override_args=[(*GOLDEN_OVERRIDES, "--training.steps=2", "--training.global-batch-size=2",
-                        "--optimizer.name=AdamW", "--parallelism.data-parallel-shard-degree=2",
-                        "--parallelism.expert-parallel-degree=2", "--hf-assets-path=tests/assets/deepseek_v3")],
-        expected_steps=((1, 2),),
-        check_resume=False,
-    )]
+    return [
+        OverrideDefinitions(
+            test_name="dsv4_mxfp4_communication_fsdp2",
+            test_descr="MXFP4 QAT communication, two forward/backward/optimizer steps on A5",
+            env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--training.seq-len=256",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=1",
+                    "--parallelism.fsdp-reshard-after-forward=always",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--extension.quantization.enable-quantized-training",
+                    "--extension.quantization.recipe=all_block_fp8",
+                    "--extension.quantization.enable-mxfp4-qat",
+                    "--extension.quantization.enable-fsdp-prequantize",
+                    "--extension.quantization.fsdp-prequantize-dtype=mxfp4",
+                )
+            ],
+            ngpu=2,
+            use_golden=True,
+            check_loss=False,
+            expected_steps=((1, 2),),
+        ),
+        replace(
+            build_deepseek_v4_checkpoint_resume_test_list()[1],
+            test_name="dsv4_lora_block_fp8_ep2_fsdp2",
+            test_descr="DeepSeek-V4 block-FP8 base and floating LoRA training EP2/FSDP2",
+            env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--optimizer.name=AdamW",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=2",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                )
+            ],
+            expected_steps=((1, 2),),
+            check_resume=False,
+        ),
+    ]
 
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:

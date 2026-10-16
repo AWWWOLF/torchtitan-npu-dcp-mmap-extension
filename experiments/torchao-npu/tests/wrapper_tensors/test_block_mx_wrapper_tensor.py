@@ -193,3 +193,50 @@ def test_to_inference_weight_with_mxfp4_matches_the_training_forward(device):
         f"expected an FP4 inference weight, got {inference_weight.quant_config.elem_dtype}"
     )
     assert torch.equal(y_training, y_inference), "the FP4 inference weight does not reproduce training's forward"
+
+
+@pytest.mark.parametrize("device", target_devices)
+@pytest.mark.parametrize(
+    "shape",
+    [(256, 128), (4, 128, 128)],
+    ids=["matrix_rows", "experts"],
+)
+def test_mxfp4_communication_matches_fp8_payload(device, shape):
+    """Real NPU kernels; simulate rank-order all-gather to isolate the format conversion."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    config = BlockMXQuantizeConfig(
+        fsdp_prequantize=True,
+        fsdp_prequantize_dtype="mxfp4",
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+    weight = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    mesh = SimpleNamespace(size=lambda: 2)
+    wrappers = [
+        BlockMXTrainingWeightWrapperTensor(
+            shard.contiguous(), weight_config=config, activation_config=MXQuantizeConfig()
+        )
+        for shard in weight.chunk(2)
+    ]
+    results = [
+        w.fsdp_pre_all_gather(mesh, weight.shape, weight.stride(), None, SimpleNamespace(param_dtype=torch.bfloat16))
+        for w in wrappers
+    ]
+    gathered = tuple(torch.cat([r[0][i] for r in results]) for i in range(2))
+    output, inner = wrappers[0].fsdp_post_all_gather(gathered, results[0][1], torch.bfloat16)
+    reference = []
+    for w in wrappers:
+        old = BlockMXTrainingWeightWrapperTensor(
+            w._data,
+            weight_config=replace(config, fsdp_prequantize_dtype="fp8"),
+            activation_config=MXQuantizeConfig(),
+        )
+        reference.append(
+            old.fsdp_pre_all_gather(
+                mesh, weight.shape, weight.stride(), None, SimpleNamespace(param_dtype=torch.bfloat16)
+            )[0]
+        )
+    for actual, expected in zip(inner, (torch.cat([r[i] for r in reference]) for i in range(3)), strict=True):
+        torch.testing.assert_close(actual.view(torch.uint8), expected.contiguous().view(torch.uint8), rtol=0, atol=0)
+    assert output.is_contiguous()

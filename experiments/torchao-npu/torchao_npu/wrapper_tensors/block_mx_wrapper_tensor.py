@@ -26,7 +26,12 @@ from torchao_npu.quantization.quant_configs import (
     BlockMXQuantizeConfig,
     MXQuantizeConfig,
 )
-from torchao_npu.quantization.quant_primitives.block_mx import block_mx_quantize
+from torchao_npu.quantization.quant_primitives.block_mx import (
+    block_mx_quantize,
+    from_block_quant_layout,
+    mxfp4_to_block_mx,
+    quantize_mxfp4_payload,
+)
 from torchao_npu.quantization.transform import register_parameter_swap_handler
 from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 from torchao_npu.quantized_tensors.mx_tensor import MXTensor
@@ -52,11 +57,12 @@ from torchao_npu.wrapper_tensors.base_wrapper_tensor import (
 _BLOCK_SIZE = 32
 _SCALE_PACK = 2
 
-# The alignment an FSDP shard's quantized dim (axis=-2) must satisfy for
-# pre-quantize + all-gather to reconstruct the global scales exactly. The
-# guard below is the single enforcement point: the shard-alignment contract
-# depends on the actual FSDP sharding (dp_shard, cp folding, expert meshes),
-# which config-stage validation deliberately does not model.
+# The alignment an FSDP shard's quantized dim must satisfy for pre-quantize +
+# all-gather to reconstruct the global scales exactly. The FP8 block path
+# quantizes axis=-2; the MXFP4 communication path quantizes the stored last
+# axis. The guard below is the single enforcement point: the shard-alignment
+# contract depends on the actual FSDP sharding (dp_shard, cp folding, expert
+# meshes), which config-stage validation deliberately does not model.
 _PREQUANTIZE_SHARD_ALIGNMENT = _BLOCK_SIZE * _SCALE_PACK
 
 
@@ -265,29 +271,30 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         # the tensor rank: 3D expert weights use Shard(0) (expert axis) unless
         # the EFSDP degree exceeds the expert count (extensions/distributed/
         # fsdp.py). The 2-block scale packing alignment (64) is only required
-        # when a sharded dim IS the quantized dim (axis=-2): a shard of the
-        # quantized dim that is 32- but not 64-aligned rounds its own K-dim
-        # scale count up, so the gathered ``B_s2`` has more scale rows than the
+        # when a sharded dim IS the quantized dim: a shard of the quantized dim
+        # that is 32- but not 64-aligned rounds its own scale count up, so the
+        # gathered ``B_s2`` has more scale rows than the
         # global one and the dgrad ``npu_quant_matmul`` meta check fails. When
-        # another dim is sharded (e.g. experts under Shard(0)) and axis=-2 is
-        # left whole, packing cannot misalign; when several dims are sharded at
+        # another dim is sharded (e.g. experts under Shard(0)) and the quantized
+        # dimension is left whole, packing cannot misalign; when several dims are sharded at
         # once (e.g. a 2D mesh splitting both the expert axis and the quantized
         # dim), the guard checks every sharded dim, so a split quantized dim
         # still fails fast.
         shard_shape = tuple(self._data.shape)
+        quantized_dim = -1 if self.weight_config.fsdp_prequantize_dtype == "mxfp4" else -2
         if outer_size is not None:
             dims = len(shard_shape)
             sharded = [d - dims for d in range(dims) if shard_shape[d] != outer_size[d]]
             if not sharded:
                 return False  # Local shape == global shape: nothing to shard.
-            check_quant_dim = -2 in sharded
+            check_quant_dim = quantized_dim in sharded
         else:
             # No outer_size (e.g. unit-test path): assume the quantized dim may
             # be sharded so the alignment guard runs, mirroring a real FSDP run.
             check_quant_dim = True
-        if check_quant_dim and self._data.shape[-2] % _PREQUANTIZE_SHARD_ALIGNMENT != 0:
+        if check_quant_dim and self._data.shape[quantized_dim] % _PREQUANTIZE_SHARD_ALIGNMENT != 0:
             raise ValueError(
-                f"fsdp_prequantize requires the FSDP-sharded quantized dim (axis=-2) of "
+                f"fsdp_prequantize requires the FSDP-sharded quantized dim of "
                 f"local shard {shard_shape} (global {tuple(outer_size) if outer_size is not None else 'unknown'}) "
                 f"to be a multiple of {_PREQUANTIZE_SHARD_ALIGNMENT} (block size {_BLOCK_SIZE} x scale "
                 f"pack {_SCALE_PACK}) per FSDP shard (mesh size {mesh_size}); "
@@ -314,6 +321,8 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         module: nn.Module,
         mp_policy: MixedPrecisionPolicy,
     ):
+        if self.weight_config.fsdp_prequantize and self.weight_config.fsdp_prequantize_dtype == "mxfp4":
+            self._validate_mxfp4_communication(mesh, outer_size)
         if not self._can_prequantize(mesh, outer_size):
             return super().fsdp_pre_all_gather(mesh, outer_size, outer_stride, module, mp_policy)
 
@@ -323,10 +332,26 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         # input, so a FP32 local shard (e.g. optimizer param dtype) must be
         # cast first.
         hp_local = self._data.to(mp_policy.param_dtype)
+        if self.weight_config.fsdp_prequantize_dtype == "mxfp4":
+            # The stored MoE layout is [E, N, K].  The grouped matmul
+            # transposes it to [E, K, N], so MXFP4 QAT quantizes the stored
+            # K dimension (the last axis) before communication.
+            fp4, scale, permutation = quantize_mxfp4_payload(hp_local, self.weight_config, axis=-1)
+            metadata = (
+                "mxfp4_v1",
+                tuple(hp_local.shape),
+                tuple(fp4.shape),
+                tuple(scale.shape),
+                tuple(permutation),
+                mesh.size(),
+            )
+            return (fp4.contiguous().view(-1), scale.contiguous().view(-1)), metadata
+        # QAT quantizes K in the stored [..., N, K] layout, before the
+        # matmul transpose. Direct Block FP8 ignores this axis argument.
         # pyrefly: ignore [missing-attribute]
-        B_q, B_s1, B_s2 = block_mx_quantize(hp_local, config=self.weight_config, axis=-2)
-        # Return the 3 tensors for FSDP to all_gather independently.
-        return (B_q, B_s1, B_s2), ()
+        B_q, B_s1, B_s2 = block_mx_quantize(hp_local, config=self.weight_config, axis=-1)
+        # FSDP flattens each payload with view(-1); QAT may return permuted views.
+        return (B_q.contiguous(), B_s1.contiguous(), B_s2.contiguous()), ()
 
     def fsdp_post_all_gather(
         self,
@@ -336,7 +361,9 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         *,
         out: torch.Tensor | None = None,
     ):
-        # FSDP all-gathered the 3 pre-quantized tensors independently.
+        if metadata and metadata[0] == "mxfp4_v1":
+            return self._post_mxfp4_all_gather(all_gather_outputs, metadata, out)
+        # FSDP reconstructs the three FP8 payload tensors after its grouped collective.
         if len(all_gather_outputs) == 3:
             B_q, B_s1, B_s2 = all_gather_outputs
         else:
@@ -359,6 +386,63 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
             # Training step 1+: write pre-quantized data into the pre-allocated out.
             self._write_prequantized_to_out(out, B_q, B_s1, B_s2)
             return None
+
+    def _validate_mxfp4_communication(self, mesh, outer_size):
+        """Reject unsupported layouts on every rank before entering a collective."""
+        if self.weight_config.mxfp4_fake_quantize_config is None:
+            raise ValueError("MXFP4 FSDP communication requires MXFP4 QAT")
+        if mesh.size() == 1:
+            return
+        if len(outer_size) not in (2, 3):
+            raise ValueError("MXFP4 FSDP communication supports only 2D/3D weights")
+        if outer_size[0] % mesh.size() or tuple(self._data.shape) != (outer_size[0] // mesh.size(), *outer_size[1:]):
+            raise ValueError("MXFP4 FSDP communication requires even Shard(0); Shard(1) is unsupported")
+        config = self.weight_config.mxfp4_fake_quantize_config
+        if config.block_size != 32:
+            raise ValueError("MXFP4 FSDP communication currently requires block_size=32")
+
+    def _post_mxfp4_all_gather(self, outputs, metadata, out):
+        _, local_shape, fp4_shape, scale_shape, permutation, world_size = metadata
+        fp4, scale = outputs
+        # MXFP4 communication quantizes the last stored dimension (K). FSDP
+        # shards the leading dimension, so rank-major payloads are restored by
+        # concatenating that leading dimension for both 2D and 3D weights.
+        fp4 = fp4.view(world_size, *fp4_shape).reshape(world_size * fp4_shape[0], *fp4_shape[1:])
+        scale = scale.view(world_size, *scale_shape).reshape(world_size * scale_shape[0], *scale_shape[1:])
+        q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4, scale, self.weight_config)
+        logical_shape = list(local_shape)
+        logical_shape[0] *= world_size
+        q, s1, s2 = from_block_quant_layout(tuple(logical_shape), list(permutation), q_p, s1_p, s2_p)
+        # FSDP constructs its unsharded parameter with the original contiguous stride.
+        q, s1, s2 = q.contiguous(), s1.contiguous(), s2.contiguous()
+        if out is None:
+            output = type(self)._from_prequantized(
+                q,
+                s1,
+                s2,
+                self.weight_config,
+                self.activation_config,
+                requires_grad=self.requires_grad,  # pyrefly: ignore [missing-attribute]
+            )
+            return output, (q, s1, s2)
+        local = out._local_tensor if isinstance(out, DTensor) else out
+        if not isinstance(local, type(self)):
+            raise RuntimeError("MXFP4 communication requires a BlockMX output wrapper")
+        if not all(hasattr(local, attr) for attr in ("_data", "_scale_s1", "_scale_s2")):
+            raise RuntimeError("MXFP4 communication requires an initialized BlockMX output wrapper")
+        if not all(isinstance(getattr(local, attr), torch.Tensor) for attr in ("_data", "_scale_s1", "_scale_s2")):
+            raise RuntimeError("MXFP4 communication requires tensor payloads on the BlockMX output wrapper")
+
+        # FSDP2 reuses a shallow copy of the unsharded wrapper on subsequent
+        # iterations. Restore the current configs just like the base wrapper
+        # path does, so a reused ``out`` cannot retain stale quantization state.
+        local.weight_config = self.weight_config
+        local.activation_config = self.activation_config
+        tensors = (local._data, local._scale_s1, local._scale_s2)
+        with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(tensors):
+            for target, source in zip(tensors, (q, s1, s2), strict=True):
+                target.copy_(source)
+        return None
 
     def to_inference_weight(self) -> MXTensor:
         """Quantize the master weight into its inference-time :class:`MXTensor`.

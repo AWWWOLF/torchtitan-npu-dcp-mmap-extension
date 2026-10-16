@@ -159,6 +159,12 @@ class QuantizationExtensionConfig:
     """
     dst_type_max: float = 0.0
     enable_fsdp_prequantize: bool = False
+    fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = "fp8"
+    """Routed-expert communication format when FSDP prequantization is enabled.
+
+    MXFP4 requires MXFP4 QAT. Selected dense weights retain FP8 communication
+    under the ``all_block_fp8`` recipe.
+    """
     fsdp_prequantize_fqns: list[str] | None = None
     """FQN suffix patterns that ENABLE FSDP pre-quantize, only meaningful with
     ``enable_fsdp_prequantize=True``. ``None`` (unset) falls back to the recipe
@@ -178,6 +184,8 @@ class QuantizationExtensionConfig:
     list (1-3, cumulative; recipe-independent). Off (0) by default."""
 
     def validate(self) -> None:
+        if self.fsdp_prequantize_dtype not in ("fp8", "mxfp4"):
+            raise ValueError("fsdp_prequantize_dtype must be fp8 or mxfp4")
         if self.li_quantization not in (None, "mxfp4", "mxfp8", "fp8", "hif8"):
             raise ValueError("li_quantization must be None or one of: mxfp4, mxfp8, fp8, hif8")
         if self.enable_fsdp_prequantize and self.fsdp_prequantize_fqns is not None and not self.fsdp_prequantize_fqns:

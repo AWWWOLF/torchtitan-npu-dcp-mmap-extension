@@ -64,6 +64,15 @@ def _mxfp4_fake_quantize_then_block_mx_quantize(
     packed along the last dim, so ``axis`` is permuted there and back.
     """
 
+    fp4_tensor, mxscale, perm_indices = quantize_mxfp4_payload(tensor, config, axis)
+    q_p, s1_p, s2_p = mxfp4_to_block_mx(fp4_tensor, mxscale, config)
+    return from_block_quant_layout(tensor.shape, perm_indices, q_p, s1_p, s2_p)
+
+
+def quantize_mxfp4_payload(
+    tensor: torch.Tensor, config: BlockMXQuantizeConfig, axis: int
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Return packed MXFP4, scales and the permutation into kernel layout."""
     mxfp4_config = config.mxfp4_fake_quantize_config
     assert mxfp4_config is not None, "config.mxfp4_fake_quantize_config must be set, None passed."
 
@@ -85,6 +94,15 @@ def _mxfp4_fake_quantize_then_block_mx_quantize(
         dst_type_max=mxfp4_config.dst_type_max,
     )
 
+    return fp4_tensor, mxscale, perm_indices
+
+
+def mxfp4_to_block_mx(
+    fp4_tensor: torch.Tensor, mxscale: torch.Tensor, config: BlockMXQuantizeConfig
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert kernel-layout MXFP4 into Block FP8 without an intermediate BF16 tensor."""
+    mxfp4_config = config.mxfp4_fake_quantize_config
+    assert mxfp4_config is not None
     q_p, s1_p, s2_p = torch.ops.cann_ops_nn.mx_to_block_mx_quant(
         fp4_tensor,
         mxscale,
@@ -92,7 +110,7 @@ def _mxfp4_fake_quantize_then_block_mx_quantize(
         x_type=mxfp4_config.npu_elem_dtype,
     )
 
-    return _from_block_quant_layout(tensor, perm_indices, q_p, s1_p, s2_p)
+    return q_p, s1_p, s2_p
 
 
 def _direct_block_mx_quantize(
@@ -123,7 +141,7 @@ def _direct_block_mx_quantize(
     # FP4 comes back as uint8 with the last dim halved; relabel it. No-op for FP8.
     q_p = q_p.view(config.elem_dtype)
 
-    return _from_block_quant_layout(tensor, perm_indices, q_p, s1_p, s2_p)
+    return from_block_quant_layout(tensor.shape, perm_indices, q_p, s1_p, s2_p)
 
 
 def _to_block_quant_layout(tensor: torch.Tensor, swap: bool) -> tuple[torch.Tensor, list[int]]:
@@ -139,7 +157,7 @@ def _to_block_quant_layout(tensor: torch.Tensor, swap: bool) -> tuple[torch.Tens
 
     Returns:
         ``(tensor_f, perm_indices)``, the latter to be handed to
-        :func:`_from_block_quant_layout`.
+        :func:`from_block_quant_layout`.
     """
 
     # Leading dims: outermost-first by stride. Quant dims: reversed iff ``swap``.
@@ -153,38 +171,34 @@ def _to_block_quant_layout(tensor: torch.Tensor, swap: bool) -> tuple[torch.Tens
     return tensor_f, perm_indices
 
 
-def _from_block_quant_layout(
-    tensor: torch.Tensor,
+def from_block_quant_layout(
+    shape: tuple[int, ...] | torch.Size,
     perm_indices: list[int],
     q_p: torch.Tensor,
     s1_p: torch.Tensor,
     s2_p: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Invert :func:`_to_block_quant_layout` on a kernel's ``(q, s1, s2)``.
+    """Restore quantized layout using metadata only, without allocating a weight template."""
+    ndim = len(shape)
+    shape_p = [shape[i] for i in perm_indices]
 
-    Takes the ``tensor`` and ``perm_indices`` passed to and returned by it; the
-    swap is read back from ``perm_indices``, so the two share one contract.
-    """
-
-    shape_p = [tensor.shape[i] for i in perm_indices]
-
-    if tensor.ndim > 3:
+    if ndim > 3:
         # ``q_p``'s last dim is halved for FP4, so it is taken from ``q_p`` itself.
         q_p = q_p.reshape(*shape_p[:-1], q_p.shape[-1])
         s1_p = s1_p.reshape(*shape_p[:-2], *s1_p.shape[1:])
         s2_p = s2_p.reshape(*shape_p[:-2], *s2_p.shape[1:])
 
     # Inverse permutation, with the scales' trailing pack dim appended.
-    perm_back_indices = [0] * tensor.ndim
+    perm_back_indices = [0] * ndim
     for j, p in enumerate(perm_indices):
         perm_back_indices[p] = j
 
     q = q_p.permute(perm_back_indices)
-    s1 = s1_p.permute([*perm_back_indices, tensor.ndim])
-    s2 = s2_p.permute([*perm_back_indices, tensor.ndim])
+    s1 = s1_p.permute([*perm_back_indices, ndim])
+    s2 = s2_p.permute([*perm_back_indices, ndim])
 
     # The kernel's s1 is along the permuted -1. If that dim is the original -2,
     # swap so s1 tracks the original -1 and s2 the original -2.
-    if perm_indices[-1] == tensor.ndim - 2:
+    if perm_indices[-1] == ndim - 2:
         s1, s2 = s2, s1
     return q, s1, s2

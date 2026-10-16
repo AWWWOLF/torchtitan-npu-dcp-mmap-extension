@@ -11,6 +11,7 @@ by both training-time wrapper tensors and future PTQ algorithms.
 
 import warnings
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 import torch_npu
@@ -160,8 +161,16 @@ class BlockMXQuantizeConfig(MXQuantizeConfig):
     # weight + scales are all-gathered, so forward/backward reuse the
     # pre-quantized data instead of re-quantizing on the fly.
     fsdp_prequantize: bool = field(default=False, compare=False)
+    fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = field(default="fp8", compare=False)
 
     def __post_init__(self):
+        if self.fsdp_prequantize_dtype not in ("fp8", "mxfp4"):
+            raise ValueError("fsdp_prequantize_dtype must be fp8 or mxfp4")
+        if self.fsdp_prequantize_dtype == "mxfp4" and self.mxfp4_fake_quantize_config is None:
+            raise ValueError(
+                "fsdp_prequantize_dtype='mxfp4' requires mxfp4_fake_quantize_config; "
+                "enable MXFP4 QAT for the selected weight"
+            )
         # Mode invariants first: the branches below rely on mxfp4 mode
         # implying an FP8 ``elem_dtype``.
         if self.mxfp4_fake_quantize_config is not None:

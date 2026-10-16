@@ -772,6 +772,7 @@ def _block_fp8_param_swap(
     enable_mxfp4_qat: bool = False,
     dst_type_max: float = 0.0,
     enable_fsdp_prequantize: bool = False,
+    fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = "fp8",
 ) -> ParamSwapConfig:
     mxfp4_config = None
     if enable_mxfp4_qat:
@@ -783,6 +784,7 @@ def _block_fp8_param_swap(
         weight_config=BlockMXQuantizeConfig(
             mxfp4_fake_quantize_config=mxfp4_config,
             fsdp_prequantize=enable_fsdp_prequantize,
+            fsdp_prequantize_dtype=fsdp_prequantize_dtype,
         ),
         activation_config=MXQuantizeConfig(),
     )
@@ -997,6 +999,7 @@ def _recipe_converters(
     li_kernel_config: DeepSeekV4LightningIndexerKernelConfig | None = None,
     kv_norm_quantization: KVNormQuantizationConfig | None = None,
     prequantize_fqns_by_scope: dict[str, tuple[str, ...]] | None = None,
+    fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = "fp8",
     enable_hif8_save_quant_codes: bool = False,
 ) -> list[QuantizationConverter.Config]:
     converters: list[QuantizationConverter.Config]
@@ -1029,11 +1032,16 @@ def _recipe_converters(
             enable_mxfp4_qat=enable_mxfp4_qat,
             dst_type_max=dst_type_max,
             enable_fsdp_prequantize=enable_fsdp_prequantize,
+            fsdp_prequantize_dtype=fsdp_prequantize_dtype,
         )
         if recipe == "mix":
             dense_config = _mxfp8_param_swap()
         elif recipe == "all_block_fp8":
-            dense_config = _block_fp8_param_swap(enable_fsdp_prequantize=enable_fsdp_prequantize)
+            dense_config = _block_fp8_param_swap(
+                enable_fsdp_prequantize=enable_fsdp_prequantize,
+                # Dense weights retain Block FP8; MXFP4 QAT is expert-only.
+                fsdp_prequantize_dtype="fp8",
+            )
         else:
             raise ValueError(f"recipe must be one of {_SUPPORTED_RECIPES}, got {recipe!r}")
 
@@ -1197,6 +1205,7 @@ def apply_quantization_converter(
         enable_mxfp4_qat=quantization_config.enable_mxfp4_qat,
         dst_type_max=quantization_config.dst_type_max,
         enable_fsdp_prequantize=quantization_config.enable_fsdp_prequantize,
+        fsdp_prequantize_dtype=quantization_config.fsdp_prequantize_dtype,
         model_compile_enabled=model_compile_enabled,
         li_quantization=quantization_config.li_quantization,
         li_kernel_config=li_kernel_config,
@@ -1243,7 +1252,7 @@ def apply_quantization_converter(
     logger.info(
         "Applied TorchAO-NPU recipe=%s, sparse_attention_quantization=%s, mxfp4_qat=%s, "
         "li_quantization=%s, kv_norm_quantization=%s, kv_norm_block_size=%s, "
-        "dst_type_max=%s, enable_fsdp_prequantize=%s",
+        "dst_type_max=%s, enable_fsdp_prequantize=%s, fsdp_prequantize_dtype=%s",
         quantization_config.recipe,
         quantization_config.enable_sparse_attention_quantization,
         quantization_config.enable_mxfp4_qat,
@@ -1252,6 +1261,7 @@ def apply_quantization_converter(
         quantization_config.kv_norm_quantization.block_size,
         quantization_config.dst_type_max,
         quantization_config.enable_fsdp_prequantize,
+        quantization_config.fsdp_prequantize_dtype,
     )
     return replace(model_spec, model=model_config)
 

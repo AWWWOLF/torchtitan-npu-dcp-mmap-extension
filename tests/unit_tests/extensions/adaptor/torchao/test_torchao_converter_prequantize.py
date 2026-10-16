@@ -24,6 +24,7 @@ pytest.importorskip("torchao_npu")
 from torchtitan_npu.config.configs import QuantizationExtensionConfig
 from torchtitan_npu.extensions.adaptor.torchao.converter import (
     _PREQUANTIZE_DEFAULT_FQNS,
+    NpuQuantizedAscGroupedExpertsModule,
     _match_fqn_suffix,
     apply_quantization_converter,
 )
@@ -126,3 +127,49 @@ def test_default_whitelist_covers_every_quantized_projection():
         assert any(_match_fqn_suffix(fqn, pattern) for pattern in all_patterns), (
             f"quantized weight {fqn!r} matches no default whitelist entry; update _PREQUANTIZE_DEFAULT_FQNS"
         )
+
+
+def test_mxfp4_communication_keeps_dense_fp8_and_experts_mxfp4():
+    spec = model_registry("debugmodel", num_mtp_layers=0)
+    config = _quantization_config(
+        enable_mxfp4_qat=True,
+        enable_fsdp_prequantize=True,
+        fsdp_prequantize_dtype="mxfp4",
+    )
+    converted = apply_quantization_converter(spec, config, model_compile_enabled=False)
+    dense_weights = [
+        node._torchao_npu_config.weight_config
+        for _, node, _, _ in converted.model.traverse(Linear.Config)
+        if getattr(node, "_torchao_npu_config", None) is not None
+    ]
+    assert dense_weights
+    for weight in dense_weights:
+        assert weight.fsdp_prequantize
+        assert weight.fsdp_prequantize_dtype == "fp8"
+        assert weight.mxfp4_fake_quantize_config is None
+    experts = list(converted.model.traverse(NpuQuantizedAscGroupedExpertsModule.Config))
+    assert experts
+    for _, node, _, _ in experts:
+        weight = node._torchao_npu_config.weight_config
+        assert weight.fsdp_prequantize
+        assert weight.fsdp_prequantize_dtype == "mxfp4"
+        assert weight.mxfp4_fake_quantize_config is not None
+
+
+def test_mxfp4_communication_config_reaches_only_selected_experts():
+    spec = model_registry("debugmodel", num_mtp_layers=0)
+    config = _quantization_config(
+        enable_mxfp4_qat=True,
+        enable_fsdp_prequantize=True,
+        fsdp_prequantize_dtype="mxfp4",
+        fsdp_prequantize_fqns=[".moe.routed_experts.inner_experts"],
+    )
+    converted = apply_quantization_converter(spec, config, model_compile_enabled=False)
+    experts = list(converted.model.traverse(NpuQuantizedAscGroupedExpertsModule.Config))
+    assert experts
+    for _, node, _, _ in experts:
+        weight = node._torchao_npu_config.weight_config
+        assert weight.fsdp_prequantize
+        assert weight.fsdp_prequantize_dtype == "mxfp4"
+        assert weight.mxfp4_fake_quantize_config is not None
+    assert not any(_collect_flags(converted.model).values())
