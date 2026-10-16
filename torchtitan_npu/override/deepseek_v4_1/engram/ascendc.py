@@ -19,6 +19,8 @@ from torch.profiler import record_function
 
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 
+from .compile import compiled_lookup
+
 _ENGRAM_ALIGNMENT = 128
 _INT32_MAX = torch.iinfo(torch.int32).max
 
@@ -37,13 +39,9 @@ class _EngramFetchSparseOffload(torch.autograd.Function):
     """Accumulate owner-local gradients without exposing CPU weight.grad."""
 
     @staticmethod
-    def forward(ctx, weight, row_ids, buffer, table, keepalive):  # pyrefly: ignore [bad-override]
-        with record_function("engram::fetch"):
-            indices = row_ids.reshape(-1).to(dtype=torch.int32).contiguous()
-            fetched, fetch = buffer.engram_fetch(indices)()
-        ctx.buffer = buffer
+    def forward(ctx, weight, row_ids, table, keepalive):  # pyrefly: ignore [bad-override]
+        fetched, fetch = table._fetch_rows(row_ids)
         ctx.fetch = fetch
-        ctx.row_dim = weight.shape[1]
         ctx.table = table
         ctx.anchor_device = keepalive.device
         ctx.anchor_dtype = keepalive.dtype
@@ -51,12 +49,8 @@ class _EngramFetchSparseOffload(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):  # pyrefly: ignore [bad-override]
-        grad_fetched = grad_output.reshape(-1, ctx.row_dim).float().contiguous()
-        with record_function("engram::fetch_grad"):
-            grad_unique, unique_local_entry = ctx.buffer.engram_fetch_grad(grad_fetched, ctx.fetch)
-        with record_function("engram::sparse_accum"):
-            ctx.table.accumulate_sparse_gradient(unique_local_entry, grad_unique)
-        return None, None, None, None, torch.zeros((), device=ctx.anchor_device, dtype=ctx.anchor_dtype)
+        ctx.table._accumulate_fetch_gradient(grad_output, ctx.fetch)
+        return None, None, None, torch.zeros((), device=ctx.anchor_device, dtype=ctx.anchor_dtype)
 
 
 class HostOffloadEngramTable(HostEngramTable):
@@ -225,16 +219,29 @@ class HostOffloadEngramTable(HostEngramTable):
                 self._fetch_scale(),
             )
 
+    def _lookup_dtype(self) -> torch.dtype:
+        return torch.float32
+
+    def _fetch_rows(self, row_ids: torch.Tensor):
+        buffer = self._require_elastic_buffer(self._fetch_storage(), row_ids.numel(), self._fetch_scale())
+        with record_function("engram::fetch"):
+            indices = row_ids.reshape(-1).to(dtype=torch.int32).contiguous()
+            return buffer.engram_fetch(indices)()
+
+    def _accumulate_fetch_gradient(self, grad_output: torch.Tensor, fetch) -> None:
+        buffer = self._elastic_buffer
+        assert buffer is not None
+        grad_fetched = grad_output.reshape(-1, self.embedding_dim).float().contiguous()
+        with record_function("engram::fetch_grad"):
+            grad_unique, unique_local_entry = buffer.engram_fetch_grad(grad_fetched, fetch)
+        with record_function("engram::sparse_accum"):
+            self.accumulate_sparse_gradient(unique_local_entry, grad_unique)
+
     def _distributed_lookup(self, row_ids_N: torch.Tensor) -> torch.Tensor:
         if torch.compiler.is_compiling():
-            raise RuntimeError("AscendC Host Engram currently supports eager execution only.")
+            return compiled_lookup(self, row_ids_N)
         flat_ids = row_ids_N.reshape(-1)
-        elastic_buffer = self._require_elastic_buffer(
-            self._fetch_storage(),
-            flat_ids.numel(),
-            self._fetch_scale(),
-        )
-        return _EngramFetchSparseOffload.apply(self.weight, flat_ids, elastic_buffer, self, self._grad_keepalive).view(
+        return _EngramFetchSparseOffload.apply(self.weight, flat_ids, self, self._grad_keepalive).view(
             *row_ids_N.shape, self.embedding_dim
         )
 

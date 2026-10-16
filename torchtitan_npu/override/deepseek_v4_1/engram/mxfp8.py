@@ -58,33 +58,6 @@ def _dequantize_mxfp8_rows(values: torch.Tensor, scale: torch.Tensor) -> torch.T
     return (blocks * scale_f32.unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
 
 
-class _EngramMXFP8FetchSparseOffload(torch.autograd.Function):
-    """Dequantize fetched rows and route BF16/FP32 gradients to the master table."""
-
-    @staticmethod
-    def forward(ctx, weight, row_ids, buffer, table, keepalive):  # pyrefly: ignore [bad-override]
-        with record_function("engram::fetch_mxfp8"):
-            indices = row_ids.reshape(-1).to(dtype=torch.int32).contiguous()
-            fetched, fetched_scale, fetch = buffer.engram_fetch(indices)()
-            result = _dequantize_mxfp8_rows(fetched, fetched_scale)
-        ctx.buffer = buffer
-        ctx.fetch = fetch
-        ctx.row_dim = weight.shape[1]
-        ctx.table = table
-        ctx.anchor_device = keepalive.device
-        ctx.anchor_dtype = keepalive.dtype
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_output):  # pyrefly: ignore [bad-override]
-        grad_fetched = grad_output.reshape(-1, ctx.row_dim).float().contiguous()
-        with record_function("engram::fetch_grad"):
-            grad_unique, unique_local_entry = ctx.buffer.engram_fetch_grad(grad_fetched, ctx.fetch)
-        with record_function("engram::sparse_accum"):
-            ctx.table.accumulate_sparse_gradient(unique_local_entry, grad_unique)
-        return None, None, None, None, torch.zeros((), device=ctx.anchor_device, dtype=ctx.anchor_dtype)
-
-
 class MXFP8HostOffloadEngramTable(HostOffloadEngramTable):
     """Fetch MXFP8 rows while SparseAdam updates an FP32 Host master table."""
 
@@ -163,19 +136,16 @@ class MXFP8HostOffloadEngramTable(HostOffloadEngramTable):
         """Requantize the rows selected by the Host sparse optimizer step."""
         self._refresh_quantized_storage(row_ids)
 
-    def _distributed_lookup(self, row_ids_N: torch.Tensor) -> torch.Tensor:
-        if torch.compiler.is_compiling():
-            raise RuntimeError("MXFP8 AscendC Host Engram currently supports eager execution only.")
-        flat_ids = row_ids_N.reshape(-1)
+    def _lookup_dtype(self) -> torch.dtype:
+        return torch.bfloat16
+
+    def _fetch_rows(self, row_ids: torch.Tensor):
         storage, scale = self._require_quantized_storage()
-        elastic_buffer = self._require_elastic_buffer(storage, flat_ids.numel(), scale)
-        return _EngramMXFP8FetchSparseOffload.apply(
-            self.weight,
-            flat_ids,
-            elastic_buffer,
-            self,
-            self._grad_keepalive,
-        ).view(*row_ids_N.shape, self.embedding_dim)
+        buffer = self._require_elastic_buffer(storage, row_ids.numel(), scale)
+        with record_function("engram::fetch_mxfp8"):
+            indices = row_ids.reshape(-1).to(dtype=torch.int32).contiguous()
+            fetched, fetched_scale, fetch = buffer.engram_fetch(indices)()
+            return _dequantize_mxfp8_rows(fetched, fetched_scale), fetch
 
 
 __all__ = ["MXFP8HostOffloadEngramTable"]
