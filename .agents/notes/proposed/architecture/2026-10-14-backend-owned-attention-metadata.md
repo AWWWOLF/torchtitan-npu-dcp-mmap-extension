@@ -22,8 +22,8 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 
 1. `metadata_extension.py` 不存在；无模型定义 `build_attention_masks`，也无 `metadata_extension` /
    `lightning_indexer_metadata` 字段；
-2. per-batch metadata 由 backend config 构建（每 microbatch 每 backend 一次、同几何共享），CP 下由 metadata 自己的
-   `prepare_cp_metadata` 产出 rank-local 副本（V4/V4.1 的记录在 CP 后**重建**）；
+2. per-batch metadata 由 backend config 构建（每 microbatch 每 backend 一次、同几何共享），CP 下由 **backend 类**自己的
+   `prepare_cp_metadata` 产出 rank-local 副本（几何由 `cp_shard_context` 发布）（V4/V4.1 的记录在 CP 后**重建**）；
 3. `.ci/architecture_import_baseline.json` 的两条 `extensions → models.common.metadata_extension` 债务边消失
    （activation order 不动）；
 4. torchao 量化 LI 与 cv_parallel 的分块 metadata 走同一接缝选中，不再有 `model._metadata_extension` 这类反手接线。
@@ -33,7 +33,8 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 ### A. 回移接缝（纯 patch 层，本 PR）
 
 - `attention_metadata.py`（新）：`build_attention_metadata` 默认实现、`attention_metadata_key`、`AttentionMetadataMap`、
-  `prepare_cp_attention_metadata`、#4897 的 `VarlenAttentionMetadata` 别名（挂到 `torchtitan.models.common.attention`）。
+  `prepare_cp_metadata_map`（逐 entry 调用 backend 类 hook）、`CPInnerAttention`、`cp_shard_context`、
+  #4897 的 `VarlenAttentionMetadata` 别名（挂到 `torchtitan.models.common.attention`）。
 - `decoder.py`（新）：`_get_attention_metadata`（每 microbatch 一次、按 key 去重）、`preprocess_inputs`（#4116 等价物：
   建 map → CP shard → SPMD 注解；`full_dtensor` 输入路径上游已删，此处显式拒绝）、`_cp_shard`（#4617 落点：切分后把 map
   变 rank-local，用**切分前**的 positions 与 permutation）。
@@ -86,23 +87,19 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 - 迁移期两套路径并存：有 builder 的栈走 map（`extra_kwargs["attention_metadata"]`），其余仍单 mask；`Decoder.forward`
   两者都接，0.3.0 的 `get_attention_masks` 保留到最后一步。
 
-## CP 落点与尚未收敛的设计债务
+## CP 边：`patches/torchtitan/distributed/context_parallel.py` 的退出逻辑
 
 CP 变换落在模型的 `Decoder._cp_shard`（与上游同名同职责；0.3.0 无 `ParallelismContext` / `shard_tensors`，内部用 pinned
 的 `prepare_context_parallel_input`），在**切分之后**执行，拿到**切分前**的 positions 与 permutation——rank-local 副本
-只能由全局几何推导。
+只能由全局几何推导。这个文件里只有一半与 metadata 接缝相关，另一半是 NPU 运行时改写，两者退出条件不同：
 
-1. `prepare_cp_metadata` 暂挂 **metadata 对象**（鸭子类型），上游挂 **CP backend 类**；map 的 geometry-key 机制当前
-   **无使用者**（三栈按类建键）——两者需一起改，属升级时的机械收敛。
-2. `preprocess_inputs` 的 `build_attention_masks` 过渡分支：三栈迁完后删除。
-3. `context_parallel_load_balancer` 是字符串 + `ptrr_mask_key`；上游 #5071 已对象化为 `HeadTailCPLoadBalancer.Config`，
-   升级时 7 处 launcher 跟着迁。
+| 文件内容 | 性质 | 退出条件 |
+| --- | --- | --- |
+| `_varlen_from_masks` + `patched_cp_shard` | pinned `cp_shard` 不处理 varlen mask | **qwen3.5 迁到接缝之后**。三个 DeepSeek 栈不再往 `extra_kwargs` 放 `attention_masks`（V3.2+asc+CP 下该函数已等价于 `original_cp_shard`，只做输入切分，rank-local metadata 由 `_cp_shard` → `prepare_cp_metadata_map` → 各栈 **backend 类**的 `prepare_cp_metadata` 产生），只剩 qwen3.5 的兜底 `get_attention_masks()` 产出 `VarlenMetadata`，由 varlen 分支改写成 `CPVarlenMetadata` 供它的掩码适配器读 `k_global_gather_indices` |
+| `apply()` 里的 `_compiled_create_block_mask` eager 改写 | **NPU 运行时约束**：torch CP helper 内部惰性 `torch.compile(create_block_mask)`（`torch/distributed/tensor/experimental/_context_parallel/_attention.py`）会起 worker 进程、无法再初始化 NPU，「CP + BlockMask」路径必须换成 eager | 搬到 **`patches/torch_npu/`**（它改的是 torch 内部符号，不属于 torchtitan 的 CP 语义补丁；`extensions/torchtitan/eager_flex.py` 里那份改写的是另一个同名符号 `torchtitan.models.common.attention._compiled_create_block_mask`，两者不重复），或等 torch/torch_npu 不再用 worker 进程建 mask |
 
-### varlen CP 的退出路径（`patched_cp_shard` 的 varlen 分支 + `varlen_cp.py`）
+两个条件都满足后该文件整体删除。`varlen_cp.py` 的 `CPVarlenMetadata`/`from_global` **不随之删**：三栈的 map 路径仍用它
+构造 rank-local varlen，它随上游 #5071（`HeadTailCPVarlenMetadata`）或「把 V4.1 的 CP 方案推广到 V3.2/V4」一起退场。
 
-- 上游 **#5071** 的 `HeadTailCPVarlenMetadata`（`from_global`，与本仓 `CPVarlenMetadata` 同构）+
-  `KVAllGatherVarlenInnerAttention`：合入后改用上游类型并删 `varlen_cp.py` 与 varlen 分支。
-- 或把 **V4.1 的 CP 方案**（连续 slab、无均衡、内核自带跨 rank 交换）推广到 V3.2/V4：同样可删 `varlen_cp.py`，但要改
-  内核调用与 metadata 契约（V3.2 吃 rank-local 段偏移 + `k_global_gather_indices`，V4.1 走 send/recv 交换）。
-- 删除前核对 **qwen3.5**（masks→`QwenCPMetadata` 的转换在 parallelize 钩子、晚于 `cp_shard`）；其 eager block-mask
-  workaround 与 varlen 无关，需留新家；该路径**参与数值**，须配 NPU 对齐验证（CP=2 与 CP=1 逐步 loss/grad_norm 一致）。
+qwen3.5 那一步的核对点：它的 inner attention 要声明 `build_attention_metadata`（+ 需要的 geometry key），并把 rank-local
+转换从 forward 的掩码适配器挪进自己的 `prepare_cp_metadata`。这条路径**参与数值**，删前须做 NPU CP=1/CP=2 对齐。

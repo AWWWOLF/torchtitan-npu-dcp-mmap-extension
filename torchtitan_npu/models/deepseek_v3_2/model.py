@@ -13,15 +13,14 @@ import torch
 import torch.nn.functional as F
 from attn_gym.sparse import gather_attn
 from attn_gym.sparse.indexer import lightning_indexer
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     VarlenAttention,
     VarlenMetadata,
+    create_varlen_metadata_for_document,
 )
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import (
@@ -34,8 +33,8 @@ from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
-from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import CPInnerAttention
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -43,6 +42,35 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 # the rank-local segments the context-parallel transform derives from them.  They are not
 # related by inheritance, but they carry the same two offset tensors.
 AttentionMetadata = VarlenMetadata | CPVarlenMetadata
+
+_REFERENCE_CP_UNSUPPORTED = (
+    "the DeepSeek-V3.2 reference core is not context-parallel: attn-gym's indexer "
+    "selects a query's prefix of its own document, while a CP rank holds a "
+    "document's middle and needs the kernels' end-aligned causal range. Use the "
+    "AscendC override (override.deepseek_v3_2.sparse_attn.asc) under context "
+    "parallel."
+)
+
+
+class ReferenceVarlenMetadata(VarlenMetadata):
+    """The reference core's global packed layout, which context parallel cannot shard.
+
+    The refusal itself belongs to the backend that owns this layout
+    (``SparseInnerAttention.prepare_cp_metadata``, upstream #4617): a stack that
+    cannot be sharded must say so while the rank-local metadata is being
+    prepared, or the layer would silently attend to a global layout it does not
+    hold.
+    """
+
+
+def build_reference_varlen_metadata(positions: torch.Tensor) -> ReferenceVarlenMetadata:
+    """The packed document layout both DeepSeek-V3.2 attention cores read.
+
+    Together with :class:`ReferenceVarlenMetadata` this is the whole metadata
+    contract of the reference core; the AscendC core reads the same documents
+    and wraps the result, so the two backends' builders share this one call.
+    """
+    return ReferenceVarlenMetadata(*create_varlen_metadata_for_document(positions))
 
 
 @functools.cache
@@ -282,7 +310,7 @@ class SparseIndexerLoss(AuxLoss):
         return self.inject(kl.sum(), carrier=carrier)
 
 
-class SparseInnerAttention(VarlenAttention):
+class SparseInnerAttention(VarlenAttention, CPInnerAttention):
     """Sparse attention core for DSA, with separated nope/rope support.
 
     The core is two attn-gym calls: :func:`lightning_indexer` picks the slots and
@@ -306,10 +334,38 @@ class SparseInnerAttention(VarlenAttention):
     AscendC kernels instead -- ``override.deepseek_v3_2.sparse_attn.asc``.
     """
 
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        """Refuse context parallel while the rank-local metadata is prepared.
+
+        attn-gym's indexer selects a query's prefix of its own document, while a
+        CP rank holds a document's middle; the kernels need their end-aligned
+        causal range, which this core cannot express.
+        """
+        del attention_metadata, permutation
+        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
+
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
         index_topk: int
         indexer_loss: SparseIndexerLoss.Config = field(default_factory=SparseIndexerLoss.Config)
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> ReferenceVarlenMetadata:
+            """The packed document layout the reference core reads.
+
+            Upstream #4897 makes the attention backend own this construction, so
+            the decoder builds it once per microbatch and every layer of this
+            geometry shares it.
+            """
+            del padding_mask, max_num_documents, max_context_length
+            return build_reference_varlen_metadata(positions)
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -330,13 +386,7 @@ class SparseInnerAttention(VarlenAttention):
         scale: float,
     ) -> torch.Tensor:
         if isinstance(attention_masks, CPVarlenMetadata):
-            raise ValueError(
-                "the DeepSeek-V3.2 reference core is not context-parallel: attn-gym's indexer "
-                "selects a query's prefix of its own document, while a CP rank holds a "
-                "document's middle and needs the kernels' end-aligned causal range. Use the "
-                "AscendC override (override.deepseek_v3_2.sparse_attn.asc) under context "
-                "parallel."
-            )
+            raise ValueError(_REFERENCE_CP_UNSUPPORTED)
         q_BLNH = torch.cat([q_nope_BLNH, q_rope_BLNH], dim=-1)
         k_BL1H = torch.cat([k_nope_BL1H, k_rope_BL1H], dim=-1)
 
@@ -521,12 +571,15 @@ class DeepSeekV32Model(DeepSeekV3Model):
     """DeepSeek-V3.2 model based on DeepSeek V3.
 
     The model replaces MLA with DSA and applies V3.2-specific sharding.
+
+    The model carries no metadata seam of its own: its attention backends build
+    the per-microbatch metadata (``SparseInnerAttention.Config``, or the
+    AscendC override's ``AscSparseInnerAttention.Config``), and the decoder
+    builds and dispatches it as upstream #4897 does.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV3Model.Config):
-        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
                 seq_len = config.training.seq_len
@@ -545,44 +598,3 @@ class DeepSeekV32Model(DeepSeekV3Model):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self._metadata_extension = config.metadata_extension.build()
-
-    def build_attention_masks(
-        self,
-        inputs,
-        labels,
-        extra_kwargs,
-        *,
-        cp_mesh: DeviceMesh | None = None,
-        load_balancer_type: str | None = None,
-    ):
-        """The model-owned per-batch metadata construction (the single
-        overridable mask-handling seam).
-
-        The core mask comes from the varlen-typed inner attention's packed
-        documents and the generic ``prepare_context_parallel_input`` shards it
-        when context parallel is on; the ``metadata_extension`` then converts it
-        for the backend (the AscendC TND conversion)."""
-        positions = extra_kwargs.get("positions")
-        masks = super().get_attention_masks(positions=positions)
-        if cp_mesh is not None:
-            # ``prepare_context_parallel_input`` shards ``attention_masks``
-            # only when the key is already present (it never adds it), so the
-            # built masks must be handed over before the CP shard call.
-            extra_kwargs["attention_masks"] = masks
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
-                inputs,
-                labels,
-                extra_kwargs,
-                cp_mesh,
-                inputs.device,
-                load_balancer_type,
-            )
-            masks = extra_kwargs["attention_masks"]
-        if self._metadata_extension is not None:
-            masks = self._metadata_extension(masks)
-        extra_kwargs["attention_masks"] = masks
-        return inputs, labels, extra_kwargs

@@ -81,17 +81,20 @@ torchtitan_npu/override/<scope>/<target>/
   `ops` 对接后端算子」的主接入方式。
 - `torch.library.custom_op` 使用仓库 namespace，例如
   `torchtitan_npu::npu_moe_token_unpermute`；CANN 原生算子保留其 vendor namespace。
-- 算子需要的 TND 或其他 vendor metadata 应由独立的 metadata extension 预计算，再传给
-  replacement。不要把模型公共 metadata 改成只适用于某个后端的类型。
+- 算子需要的 TND 或其他 vendor metadata 由该 attention backend 自己的
+  `Config.build_attention_metadata` 预计算：decoder 每个 microbatch 只构建一次，同几何的层共享
+  同一份（upstream PR #4897 的接缝）。metadata 要把模型公共 metadata 包在里面，而不是把公共
+  metadata 改成只适用于某个后端的类型。
 
 当前实现示例：
 
-- DeepSeek-V3.2 在 `sparse_attn.asc_metadata` 中提取 TND 序列长度，在
-  `sparse_attn.asc` 中调用 `torch_npu.npu_lightning_indexer` 和
-  `torch_npu.npu_sparse_flash_attention`。
+- DeepSeek-V3.2 的 `AscSparseInnerAttention.Config.build_attention_metadata` 把公共的 varlen
+  layout 包成 `AscVarlenMetadata` 并读出 TND 需要的 host 序列长度；`sparse_attn.asc` 调用
+  `torch_npu.npu_lightning_indexer` 和 `torch_npu.npu_sparse_flash_attention`。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 生成 CANN `*_metadata`，
   `sparse_attn.asc` 桥接 LightningIndexer/SparseFlashMLA 的正反向；`sparse_attn.pypto` 用
-  PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。
+  PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。（V4/V4.1 尚未迁移到 backend-owned
+  接缝，仍由 `metadata_extension` 预计算。）
 - MoE token dispatcher 的 `npu_moe_token_unpermute` 与 `npu_moe_re_routing` 在
   `torchtitan_npu/ops/ascendc/` 中以 `torch.library.custom_op` 做编译兼容封装，并提供 Fake 和
   Autograd；
@@ -167,8 +170,8 @@ python -m torchtitan_npu.train \
 
 多个 override 是否能同时启用取决于实际声明的配置节点，而不是模块路径是否不同：
 
-- DeepSeek-V3.2 的 `sparse_attn.asc_metadata` 和 `sparse_attn.asc` 分别替换 metadata
-  extension 与 attention；DSA 融合路径需要成对启用。
+- DeepSeek-V3.2 只需启用 `sparse_attn.asc`：attention 与它自己的 TND metadata 同属一个
+  backend，metadata 由被替换的 config 直接构建，不再有单独的 metadata 入口。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 必须与 `sparse_attn.asc` 或 `sparse_attn.pypto` 配套；
   `sparse_attn.asc`、`sparse_attn.pypto`、`sparse_attn.golden` 声明同一 attention target，
   三者只能选一个。`golden` 是数值参考，不是融合性能路径。

@@ -58,7 +58,16 @@ def test_dsv32_default_config_disables_mtp():
 
 
 def test_dsv3_mtp_uses_community_implementation():
-    assert _community_mtp.MTPDecoder.forward.__module__ == "torchtitan.models.deepseek_v3.mtp"
+    # ``MTPDecoder.forward`` is the one community method this repository
+    # patches: the pinned 0.3.0 decoder has no per-layer attention-metadata
+    # dispatch, so the backported forward (upstream PR #4897) lives in
+    # ``torchtitan_npu/patches/torchtitan/models/deepseek_v3/mtp.py`` and goes
+    # away with the pin bump.  Anything else here would be a local MTP
+    # implementation, which is what this test rules out.
+    assert _community_mtp.MTPDecoder.forward.__module__ in (
+        "torchtitan.models.deepseek_v3.mtp",
+        "torchtitan_npu.patches.torchtitan.models.deepseek_v3.mtp",
+    )
     assert _community_mtp.MTPLoss.__call__.__module__ == "torchtitan.models.deepseek_v3.mtp"
 
 

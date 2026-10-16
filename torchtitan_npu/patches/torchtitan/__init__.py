@@ -17,5 +17,7 @@ from .experiments.graph_trainer import (  # noqa: F401
 )
 
 # ``attention_metadata`` carries the backend-owned metadata contract and must
-# be applied before ``decoder`` binds the map builder that reads it.
+# be applied before ``decoder`` binds the map builder that reads it, and before
+# ``mtp`` dispatches that map per layer.
 from .models.common import attention_metadata, decoder, moe, rope, token_dispatcher  # noqa: F401
+from .models.deepseek_v3 import mtp  # noqa: F401

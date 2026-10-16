@@ -327,13 +327,13 @@ checkpoint 特性。完整的数据流、支持范围和限制见
 
 | 入口 | Target | Replacement |
 | --- | --- | --- |
-| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscVarlenMetadataExtension.Config` |
 | `sparse_attn.asc` | `SparseInnerAttention.Config` | `AscSparseInnerAttention.Config` |
 
-TND 稀疏注意力需要同时启用 metadata 扩展和注意力内核：
+TND 稀疏注意力只需要 `sparse_attn.asc`：注意力内核与它消费的 TND metadata 同属一个
+backend，metadata 由被替换的 `AscSparseInnerAttention.Config.build_attention_metadata`
+直接构建（upstream PR #4897 的 backend-owned 接缝），不再有单独的 metadata 入口。
 
 ```text
-torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc_metadata
 torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 ```
 

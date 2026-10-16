@@ -54,7 +54,8 @@
       ".models.common.decoder",
       ".models.common.moe",
       ".models.common.rope",
-      ".models.common.token_dispatcher"
+      ".models.common.token_dispatcher",
+      ".models.deepseek_v3.mtp"
     ]
   }
 }

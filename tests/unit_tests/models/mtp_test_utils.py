@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from types import SimpleNamespace
+
 import torch
 
 BATCH_SIZE = 1
@@ -11,6 +13,15 @@ SEQ_LEN = 128
 VOCAB_SIZE = 64
 _DOCUMENT_LEN = SEQ_LEN // 2
 PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMENT_LEN)]).unsqueeze(0)
+
+# ``preprocess_inputs`` (the seam under test) takes the parallelism context;
+# these models run a single process with no CP and the default SPMD backend.
+_NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
+_NO_SPMD = SimpleNamespace(
+    spmd_backend="partial_dtensor",
+    context_parallel_load_balancer="headtail",
+    context_parallel_ptrr_mask_key=None,
+)
 
 
 def build_cpu_model(config):
@@ -20,14 +31,33 @@ def build_cpu_model(config):
     return model.train()
 
 
+def preprocess(model, tokens, labels, positions):
+    """Run the model's own input preprocessing, whatever seam it uses.
+
+    Migrated stacks hand back an ``attention_metadata`` map, the others the
+    pinned single ``attention_masks``; the forward takes either.
+    """
+    inputs, labels, extra_kwargs = model.preprocess_inputs(
+        {"input": tokens, "positions": positions},
+        labels,
+        parallel_dims=_NO_CP_DIMS,
+        device=tokens.device,
+        parallelism=_NO_SPMD,
+    )
+    assert "attention_masks" in extra_kwargs or "attention_metadata" in extra_kwargs, (
+        "expected the model to build attention metadata"
+    )
+    return inputs, labels, extra_kwargs
+
+
 def assert_packed_mtp_training(model) -> None:
     from torchtitan.models.deepseek_v3.mtp import MTPLoss
 
     tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
-    tokens, labels, extra_kwargs = model.build_attention_masks(tokens, labels, {"positions": positions})
-    output = model(tokens, positions, extra_kwargs["attention_masks"])
+    tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
+    output = model(tokens, **extra_kwargs)
 
     if not isinstance(output, list):
         raise AssertionError(f"Expected MTP outputs as a list, got {type(output).__name__}.")

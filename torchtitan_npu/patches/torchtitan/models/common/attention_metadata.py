@@ -46,14 +46,20 @@ ported onto this seam:
   configuration"): the DeepSeek stacks run several geometries of one backend
   class.  The default key is still the backend class, so a stack that does not
   override it behaves exactly like upstream.
-- **the CP transform is read off the metadata object** rather than being a
-  static method on the attention class (upstream #4617), because here the map
-  key is not necessarily the class.  ``prepare_cp_attention_metadata`` is the
-  single call site; the backend-side name stays ``prepare_cp_metadata``.
+- **the transform reads its geometry from a published context**.  Upstream's
+  ``prepare_cp_metadata(metadata, *, permutation)`` is a static method on the
+  backend class and takes the permutation alone, because the mesh and the load
+  balancer are ambient in its ``ParallelismContext``; here the same signature
+  reads :func:`cp_shard_context`, which ``Decoder._cp_shard`` publishes around
+  the call.  Hook ownership and signature are therefore already upstream's: the
+  pin bump deletes the context and its readers, not the transform.
 """
 
 from collections.abc import Hashable, Mapping
-from typing import Any
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 import torchtitan.models.common.attention
@@ -64,8 +70,8 @@ from torchtitan.protocols.module import Module
 __all__ = [
     "AttentionMetadata",
     "AttentionMetadataMap",
+    "CPInnerAttention",
     "VarlenAttentionMetadata",
-    "prepare_cp_attention_metadata",
 ]
 
 # ``#4897`` renamed ``VarlenMetadata`` to ``VarlenAttentionMetadata``.  The
@@ -128,36 +134,99 @@ def _attention_wrapper_metadata_key(self) -> Hashable:
     return self.inner_attention.attention_metadata_key
 
 
-def prepare_cp_attention_metadata(
+class CPInnerAttention:
+    """The CP hook carrier (upstream #4617's ``CPInnerAttention``).
+
+    Upstream declares this next to its inner-attention base: the backend class
+    owns ``prepare_cp_metadata``, and ``Decoder._cp_shard`` transforms a map
+    entry by asking the class its key names.  Here it is a bare mixin, because
+    the pinned version's CP-capable cores share no base (V3.2's is a
+    ``VarlenAttention``, V4's a plain ``Module``); the subclasses are unchanged
+    otherwise, so the pin bump keeps the classes and swaps the base.
+
+    A backend that mixes this in and cannot shard its metadata raises from its
+    own transform; one that does not mix it in passes through untouched.
+    """
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata: Any, *, permutation: torch.Tensor | None) -> Any:
+        raise NotImplementedError(
+            f"{type(attention_metadata).__name__}'s backend mixes in CPInnerAttention "
+            "without implementing prepare_cp_metadata"
+        )
+
+
+@dataclass(frozen=True)
+class CPShardContext:
+    """What a backend's CP transform reads here (upstream: ``ParallelismContext``).
+
+    Upstream's ``prepare_cp_metadata`` takes the permutation alone because the
+    mesh and the load balancer are ambient in the ``ParallelismContext`` its
+    model is called with.  0.3.0 has neither, so ``Decoder._cp_shard`` publishes
+    the three things its pinned CP entry cannot recover -- the mesh it sharded
+    with, the load-balancer type it sharded by, and the *pre-shard* positions
+    the rank-local copy is derived from -- for the duration of the transform.
+    """
+
+    cp_mesh: Any
+    load_balancer_type: str | None
+    positions: torch.Tensor | None
+
+
+_CP_SHARD_CONTEXT: ContextVar[CPShardContext | None] = ContextVar(
+    "torchtitan_npu_cp_shard_context",
+    default=None,
+)
+
+
+def cp_shard_context() -> CPShardContext:
+    """The context ``Decoder._cp_shard`` published for this transform."""
+    context = _CP_SHARD_CONTEXT.get()
+    if context is None:
+        raise RuntimeError("prepare_cp_metadata reads the pinned shard context, which only Decoder._cp_shard publishes")
+    return context
+
+
+@contextmanager
+def cp_shard_context_set(
+    *,
+    cp_mesh: Any,
+    load_balancer_type: str | None,
+    positions: torch.Tensor | None,
+):
+    """Publish the pinned shard context around one metadata transform."""
+    token = _CP_SHARD_CONTEXT.set(CPShardContext(cp_mesh, load_balancer_type, positions))
+    try:
+        yield
+    finally:
+        _CP_SHARD_CONTEXT.reset(token)
+
+
+def prepare_cp_metadata_map(
     attention_metadata: AttentionMetadataMap,
     *,
     permutation: torch.Tensor | None,
-    cp_mesh: Any = None,
-    load_balancer_type: str | None = None,
-    positions: torch.Tensor | None = None,
 ) -> dict[Hashable, Any]:
     """Rank-local metadata for context parallel (upstream #4617's CP half).
 
-    Every entry whose metadata defines ``prepare_cp_metadata`` is transformed;
-    the others pass through unchanged (the Ulysses case, where metadata stays
-    global).  Upstream calls the backend class' static method per map entry
-    with the permutation alone, because the mesh is ambient there; 0.3.0 hands
-    the mesh, the load-balancer type and this rank's positions along as well,
-    and an implementation reads whichever of them it needs.
+    Upstream's loop, per map entry: a key that carries the CP hook is rebuilt by
+    that backend class' ``prepare_cp_metadata``, and every other entry passes
+    through unchanged (the Ulysses case, where metadata stays global).  A
+    backend that cannot be sharded raises from its own transform rather than
+    letting a layer read a layout its rank does not hold.
+
+    The transform is handed the permutation alone, as upstream does; the pinned
+    version has no ambient parallelism context, so the mesh, the load-balancer
+    type and the pre-shard positions come from :func:`cp_shard_context`, which
+    ``Decoder._cp_shard`` publishes around this call.
     """
     prepared: dict[Hashable, Any] = {}
     for key, metadata in attention_metadata.items():
-        prepare = getattr(metadata, "prepare_cp_metadata", None)
-        prepared[key] = (
-            metadata
-            if prepare is None
-            else prepare(
-                permutation=permutation,
-                cp_mesh=cp_mesh,
-                load_balancer_type=load_balancer_type,
-                positions=positions,
-            )
-        )
+        if isinstance(key, type) and issubclass(key, CPInnerAttention):
+            backend = cast("type[CPInnerAttention]", key)
+            prepared[key] = backend.prepare_cp_metadata(metadata, permutation=permutation)
+        else:
+            prepared[key] = metadata
     return prepared
 
 
@@ -169,13 +238,13 @@ def apply() -> None:
     attention.VarlenAttentionMetadata = VarlenAttentionMetadata  # pyrefly: ignore [missing-attribute]
     attention.AttentionMetadata = AttentionMetadata  # pyrefly: ignore [missing-attribute]
     attention.AttentionMetadataMap = AttentionMetadataMap  # pyrefly: ignore [missing-attribute]
-    attention.prepare_cp_attention_metadata = prepare_cp_attention_metadata  # pyrefly: ignore [missing-attribute]
+    attention.CPInnerAttention = CPInnerAttention  # pyrefly: ignore [missing-attribute]
     if hasattr(attention, "__all__"):
         for name in (
             "VarlenAttentionMetadata",
             "AttentionMetadata",
             "AttentionMetadataMap",
-            "prepare_cp_attention_metadata",
+            "CPInnerAttention",
         ):
             if name not in attention.__all__:
                 attention.__all__.append(name)

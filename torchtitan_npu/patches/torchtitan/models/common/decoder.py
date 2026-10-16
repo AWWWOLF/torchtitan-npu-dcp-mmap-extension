@@ -55,7 +55,8 @@ from torchtitan.models.common.decoder import Decoder
 
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
-    prepare_cp_attention_metadata,
+    cp_shard_context_set,
+    prepare_cp_metadata_map,
 )
 
 __all__ = ["apply"]
@@ -190,13 +191,17 @@ def _cp_shard(
     )
 
     if attention_metadata:
-        extra_kwargs["attention_metadata"] = prepare_cp_attention_metadata(
-            attention_metadata,
-            permutation=permutation,
+        # Upstream's loop, with the pinned stand-in for its ambient parallelism
+        # context published around it (see ``attention_metadata``).
+        with cp_shard_context_set(
             cp_mesh=cp_mesh,
             load_balancer_type=load_balancer_type,
             positions=positions,
-        )
+        ):
+            extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(
+                attention_metadata,
+                permutation=permutation,
+            )
     return inputs, labels, extra_kwargs
 
 

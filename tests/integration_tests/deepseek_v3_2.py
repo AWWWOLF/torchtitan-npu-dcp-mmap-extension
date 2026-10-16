@@ -13,7 +13,6 @@ from tests.integration_tests import OverrideDefinitions
 
 _DSA_OVERRIDES = (
     "torchtitan_npu.override.common.rope.workaround,"
-    "torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc_metadata,"
     "torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc"
 )
 

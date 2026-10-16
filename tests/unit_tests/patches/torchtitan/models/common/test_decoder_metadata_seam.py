@@ -24,6 +24,10 @@ from torchtitan.protocols.module import Module
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
 from torchtitan_npu.patches.torchtitan.models.common import decoder as decoder_patch
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
+    CPInnerAttention,
+    cp_shard_context,
+)
 from torchtitan_npu.patches.torchtitan.trainer import patched_post_dataloading_process
 
 _TOKENS = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
@@ -87,18 +91,40 @@ class _Layer(BaseAttention):
         return x
 
 
-class _Metadata:
-    """Metadata double that records how the seam prepared it."""
+class _CPBackend(CPInnerAttention, Module):
+    """Inner-attention double that owns the transform on its class (upstream #4617)."""
 
-    def __init__(self, events: list, refuse: bool = False) -> None:
-        self.events, self.refuse, self.context = events, refuse, []
+    calls: list = []
+    events: list = []
 
-    def prepare_cp_metadata(self, *, permutation, **context):
-        self.events.append("prepare")
-        if self.refuse:
-            raise RuntimeError("this backend cannot be sharded for CP")
-        self.context.append({"permutation": permutation, **context})
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        record: object | None = None
+
+        def build_attention_metadata(self, positions, **kwargs):
+            del positions, kwargs
+            return self.record
+
+    def __init__(self, config) -> None:
+        super().__init__()
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        _CPBackend.events.append("prepare")
+        _CPBackend.calls.append((attention_metadata, permutation, cp_shard_context()))
         return "rank-local"
+
+
+class _RefusingBackend(_CPBackend):
+    """A CP backend whose transform refuses this rank's copy (the V3.2 reference core's shape)."""
+
+    events: list = []
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        del attention_metadata, permutation
+        _RefusingBackend.events.append("prepare")
+        raise RuntimeError("this backend cannot be sharded for CP")
 
 
 def _layer(record=None, builds=None, geometry=None) -> _Layer.Config:
@@ -229,20 +255,28 @@ def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
 def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     """The map is prepared after the shard, from the row the shard started from; no map is left alone."""
     events: list = []
-    metadata, untouched = _Metadata(events), object()
+    _CPBackend.calls, _CPBackend.events = [], events
+    record, untouched = object(), object()
     positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
-    inputs, labels, out = _shard(monkeypatch, events, {"k": metadata, "untouched": untouched}, positions)
+    inputs, labels, out = _shard(monkeypatch, events, {_CPBackend: record, "untouched": untouched}, positions)
 
     assert events == ["shard", "prepare"]  # this rank's rows exist first
-    assert out["attention_metadata"]["k"] == "rank-local" and out["attention_metadata"]["untouched"] is untouched
+    assert out["attention_metadata"][_CPBackend] == "rank-local"
+    assert out["attention_metadata"]["untouched"] is untouched  # a key without the hook passes through
     assert out["positions"].shape[-1] == inputs.shape[-1] == _SHARD_LEN and labels.shape[-1] == _SEQ_LEN
-    context = metadata.context[0]
-    assert context["permutation"].tolist() == _HEADTAIL_PERMUTATION and context["positions"] is positions
-    assert context["cp_mesh"] is _MESH and context["load_balancer_type"] == "headtail"
+    # The transform is the backend class' own static method, handed the permutation
+    # alone (upstream #4617).
+    handed, permutation, context = _CPBackend.calls[0]
+    assert handed is record
+    assert permutation.tolist() == _HEADTAIL_PERMUTATION
+    # The pinned stand-in for upstream's ambient parallelism context carries what the
+    # permutation alone cannot: the mesh, the balancer and the *pre-shard* row.
+    assert context.cp_mesh is _MESH and context.load_balancer_type == "headtail"
+    assert context.positions is positions
     # Only the headtail balancer shards by a permutation the seam can re-derive.
-    plain = _Metadata(events)
-    _shard(monkeypatch, events, {"k": plain}, positions, load_balancer_type=None)
-    assert plain.context[0]["permutation"] is None and plain.context[0]["load_balancer_type"] is None
+    _CPBackend.calls, _CPBackend.events = [], events
+    _shard(monkeypatch, events, {_CPBackend: record}, positions, load_balancer_type=None)
+    assert _CPBackend.calls[0][1] is None and _CPBackend.calls[0][2].load_balancer_type is None
 
     plain_events: list = []
     _, _, plain_out = _shard(monkeypatch, plain_events)  # no map: the pinned shard runs alone
@@ -252,7 +286,8 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
 def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):
     """A backend that cannot prepare rank-local metadata fails the step."""
     events: list = []
+    _RefusingBackend.events = events
     with pytest.raises(RuntimeError, match="cannot be sharded for CP"):
-        _shard(monkeypatch, events, {"k": _Metadata(events, refuse=True)})
+        _shard(monkeypatch, events, {_RefusingBackend: object()})
 
     assert events == ["shard", "prepare"]
