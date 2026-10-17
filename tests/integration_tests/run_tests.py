@@ -32,6 +32,8 @@ from tests.integration_tests.deepseek_v4 import (
 )
 from tests.integration_tests.deepseek_v4_1 import (
     build_deepseek_v4_1_checkpoint_test_list,
+    build_deepseek_v4_1_fused_test_list,
+    build_deepseek_v4_1_golden_test_list,
     build_deepseek_v4_1_quantized_test_list,
     build_deepseek_v4_1_test_list,
 )
@@ -49,9 +51,19 @@ from tests.integration_tests.qwen3_5 import build_qwen3_5_test_list
 def build_models_test_list() -> list[OverrideDefinitions]:
     """Return the model integration cases for the default smoke suite."""
 
+    # The DeepSeek-V4.1 golden case is back in the default suite alongside the
+    # V4.1 LoRA cases (build_deepseek_v4_1_test_list). The V4 checkpoint-resume
+    # and EMA groups stay out: run in the A3 CI pool they fail inside the HCCL
+    # scatter AI-CPU kernel during `dcp.save`
+    # (soName=libscatter_aicpu_kernel.so, funcName=HcclLaunchAicpuKernelA3 ->
+    # "ACL stream synchronize failed, error code:507018"), which is why !812
+    # pulled them out. Both remain available through the dedicated
+    # `deepseek_v4_checkpoint` and `ema` suites until the runtime supports that
+    # checkpoint path.
     return (
         build_deepseek_v4_test_list()
         + build_deepseek_v4_1_test_list()
+        + build_deepseek_v4_1_golden_test_list()
         + build_deepseek_v3_2_test_list()
         + build_qwen3_5_test_list()
     )
@@ -77,6 +89,8 @@ _TEST_SUITES_FUNCTION = {
     "deepseek_v4": build_deepseek_v4_test_list,
     "deepseek_v4_1": build_deepseek_v4_1_test_list,
     "deepseek_v4_1_checkpoint": build_deepseek_v4_1_checkpoint_test_list,
+    "deepseek_v4_1_fused": build_deepseek_v4_1_fused_test_list,
+    "deepseek_v4_1_golden": build_deepseek_v4_1_golden_test_list,
     "deepseek_v4_1_quantized": build_deepseek_v4_1_quantized_test_list,
     "deepseek_v4_checkpoint": build_deepseek_v4_checkpoint_resume_test_list,
     "deepseek_v4_quantized": build_deepseek_v4_quantized_test_list,
