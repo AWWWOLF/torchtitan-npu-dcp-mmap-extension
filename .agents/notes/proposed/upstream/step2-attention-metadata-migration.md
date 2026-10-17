@@ -28,9 +28,10 @@
 - 顺带修掉随本步失效的引用：`tests/integration_tests/deepseek_v3_2.py` 的 override 列表、`torchtitan_npu/override/README.md` 的 V3.2 表、`docs/feature_guides/fused_ops.md`、`docs/feature_guides/deepseek_v4_cp.md`。
 
 ### 2b. V4.1
-- `models/deepseek_v4_1/model.py`：`DeepSeekV41Metadata` 增 `records: Mapping[Geometry, V41Records]`；`KernelFrame` 组装搬进 `AscV41SparseAttention.Config.build_attention_metadata`；`prepare_cp_metadata` 承担现在的 `_sharded_attention_masks`（含 engram halo、`exchange.positions_q`）。
-- `override/deepseek_v4_1/sparse_attn/ascendc.py`：删 `AscV41MetadataExtension`；record 由该 core 的 config 构建（SMLA + SMLAG + **LI + SLIG**，一并纳入预计算），消费者 `_asc_v41_record` → `metadata.record_for(geometry)`，miss 直接 raise（`allow_inline` 只留给测试）。
-- `override/deepseek_v4_1/lightning_indexer/ascendc.py`：`_LightningIndexerTND` 的 fwd/bwd 改读 records（LI 与 SLIG 各一条）。
+- `models/deepseek_v4_1/model.py`：`DeepSeekV41Metadata` 增 `cu_seq_k`（后端按自己的 `compress_ratio` 折好的池化轴，`build_row_attention_metadata` 随之下线、改由后端直接调 `create_varlen_metadata_for_document`）；`KernelFrame` 组装搬进 `AscV41SparseAttention.Config.build_attention_metadata`；`prepare_cp_metadata` 承担现在的 `_sharded_attention_masks`（含 engram halo、`exchange.positions_q`）。
+- `override/deepseek_v4_1/metadata.py`（新）：`KernelFrame` / `AicpuGeometry` / `AicpuMetadata`，三者都注册为 pytree 节点。
+- `override/deepseek_v4_1/sparse_attn/ascendc.py`：删 `AscV41MetadataExtension`；record 由该 core 的 config 构建（SMLA + SMLAG + **LI + SLIG**，一并纳入预计算），落在 `AscV41Metadata` 的 `aicpu_metadata` 字段上（`geometry` + 四个算子输出），消费者的 `_asc_v41_record` 查表改为直接读字段（`attention_metadata.aicpu_metadata.sparse_attn` 等）：一条 entry 就是一个几何，没有 miss 可 raise；几何是该 config 的**必填**字段（无默认值），默认值只在 override factory 上。
+- `override/deepseek_v4_1/lightning_indexer/ascendc.py`：`_LightningIndexerTND` 的 fwd/bwd 改读 records（LI 与 SLIG 各一条），`AscV41IndexerRecords` 与 `build_indexer_records` 换成 `build_indexer_metadata` + `kernel_options`。
 - 删除模型里构造期 warn-once 与 `reads_asc_metadata` ClassVar（几何来自同一份配置后不再需要）。
 - 验证：`tests/unit_tests/override/deepseek_v4_1/test_asc_metadata_reuse.py`、`test_lightning_indexer_fused.py`、`tests/unit_tests/models/deepseek_v4_1/`。
 

@@ -17,6 +17,7 @@ from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 
 from scripts.lora.merge_adapter import merge
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models import deepseek_v4_1 as registry
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
@@ -117,8 +118,8 @@ def test_lora_training_freezes_engram_and_native_dcp_resumes(tiny_registry, monk
     positions = torch.arange(16).reshape(1, -1)
 
     def forward(target):
-        _, _, kwargs = target.build_attention_masks(tokens, tokens, {"positions": positions})
-        return target(tokens, **kwargs)
+        tokens_in, _, kwargs = preprocess(target, tokens, tokens, positions)
+        return target(tokens_in, **kwargs)
 
     with torch.no_grad():
         torch.testing.assert_close(forward(model), forward(base), rtol=0, atol=0)
@@ -206,8 +207,9 @@ def test_multimodal_lora_updates_adapters_with_frozen_vision_and_engram(tiny_reg
     )
 
     def forward(target):
-        _, _, kwargs = target.build_attention_masks(tokens, tokens, dict(inputs))
-        return target(tokens, **kwargs)
+        modality = {name: value for name, value in inputs.items() if name != "positions"}
+        tokens_in, _, kwargs = preprocess(target, tokens, tokens, inputs["positions"], **modality)
+        return target(tokens_in, **kwargs)
 
     frozen = {n: p.detach().clone() for n, p in model.named_parameters() if not p.requires_grad}
     assert any(n.startswith("vision_encoder.") for n in frozen)
@@ -255,8 +257,8 @@ def test_v41_adapter_only_resume_restores_engram_and_next_step(tiny_registry, mo
 
     def train_step(model, optimizers):
         optimizers.zero_grad()
-        _, _, kwargs = model.build_attention_masks(tokens, tokens, {"positions": tokens})
-        loss = model(tokens, **kwargs).square().mean()
+        tokens_in, _, kwargs = preprocess(model, tokens, tokens, tokens)
+        loss = model(tokens_in, **kwargs).square().mean()
         loss.backward()
         optimizers.step()
         return loss.detach()
@@ -381,12 +383,12 @@ def test_peft_merge_reloads_with_frozen_engram(tiny_registry, monkeypatch, tmp_p
     tokens = torch.arange(16).reshape(1, -1)
     positions = torch.arange(16).reshape(1, -1)
     with torch.no_grad():
-        _, _, kwargs = model.build_attention_masks(tokens, tokens, {"positions": positions})
-        expected = model(tokens, **kwargs)
-        _, _, kwargs = merged_model.build_attention_masks(tokens, tokens, {"positions": positions})
-        actual = merged_model(tokens, **kwargs)
-        _, _, kwargs = frozen_base.build_attention_masks(tokens, tokens, {"positions": positions})
-        unchanged = frozen_base(tokens, **kwargs)
+        tokens_in, _, kwargs = preprocess(model, tokens, tokens, positions)
+        expected = model(tokens_in, **kwargs)
+        tokens_in, _, kwargs = preprocess(merged_model, tokens, tokens, positions)
+        actual = merged_model(tokens_in, **kwargs)
+        tokens_in, _, kwargs = preprocess(frozen_base, tokens, tokens, positions)
+        unchanged = frozen_base(tokens_in, **kwargs)
     assert not torch.allclose(expected, unchanged, rtol=1e-4, atol=1e-6)
     assert (actual - expected).abs().max() < (unchanged - expected).abs().max()
     # Routed-expert GEMMs use BF16; merge rounds their base weights once.

@@ -11,10 +11,11 @@ Those slots must score exactly ``-inf`` and must carry neither a value nor a gra
 later change could hand a query another document's entry.
 """
 
-from types import SimpleNamespace
+from itertools import pairwise
 
 import torch
 
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
 
 # Three documents of 4, 8 and 2 tokens; at ratio 2 they pool 2, 4 and 1 entries.
@@ -46,11 +47,19 @@ EXPECTED_LOCALS = [
 
 
 def _masks():
-    pool = torch.tensor(POOL, dtype=torch.int32)
-    return SimpleNamespace(
-        q=SimpleNamespace(cu_seqlens=torch.tensor(BOUNDS, dtype=torch.int32)),
-        frame_for=lambda ratio: SimpleNamespace(cu_seqlens=pool),
-    )
+    """The row's own metadata, which is all the reference selector reads.
+
+    The pool's grid is this layer's ratio applied to those boundaries, so the selector needs
+    no separate frame: ``POOL`` stays a test-side statement of what the grid should be.  The
+    backend that built the row folded that same grid into ``cu_seq_k``, which is pinned here
+    to be the selector's own division -- one set of boundaries, however it is read.
+    """
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(BOUNDS)]).unsqueeze(0)
+    config = CompressedSparseInnerAttention2.Config(window_size=8, softmax_scale=0.5, compress_ratio=2)
+    metadata = config.build_attention_metadata(positions)
+    torch.testing.assert_close(metadata.cu_seq_k, metadata.cu_seq_q // 2, rtol=0, atol=0)
+    assert metadata.cu_seq_k.tolist() == POOL
+    return metadata
 
 
 def _selector():
@@ -91,9 +100,7 @@ def test_unused_slots_are_minus_one_and_score_minus_inf():
     values, idx_k, idx_q, weights = _inputs()
     indices, scores, _ = _selector()(idx_q, idx_k, weights, _masks(), candidates_BL1C=None)
 
-    torch.testing.assert_close(
-        indices[0], torch.tensor(EXPECTED_LOCALS, dtype=indices.dtype), rtol=0, atol=0
-    )
+    torch.testing.assert_close(indices[0], torch.tensor(EXPECTED_LOCALS, dtype=indices.dtype), rtol=0, atol=0)
 
     expected = torch.full((BOUNDS[-1], TOPK), -torch.inf)
     for position, slots in enumerate(EXPECTED_LOCALS):
@@ -116,9 +123,7 @@ def test_gradient_reaches_only_the_selected_entries_of_the_own_document():
     weights = weights.clone().requires_grad_(True)
 
     indices, scores, _ = _selector()(idx_q, idx_k, weights, _masks(), candidates_BL1C=None)
-    torch.testing.assert_close(
-        indices[0, 3], torch.tensor([1, 0, -1], dtype=indices.dtype), rtol=0, atol=0
-    )
+    torch.testing.assert_close(indices[0, 3], torch.tensor([1, 0, -1], dtype=indices.dtype), rtol=0, atol=0)
 
     scores.sum().backward()
     touched = idx_k.grad.abs().sum(dim=(0, 2)) > 0

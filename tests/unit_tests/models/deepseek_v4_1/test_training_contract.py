@@ -11,6 +11,7 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 from torchtitan.distributed.activation_checkpoint import FullAC
 
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
 
@@ -77,6 +78,9 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
         image_feature_indices=indices,
         token_types=token_types,
     )
+    # The modality tensors are dataloader keys the model's forward consumes, so they ride
+    # through the seam exactly as the trainer hands them over.
+    modality = {key: value for key, value in inputs.items() if key != "positions"}
     expected_mask = token_types >= 0
     route_calls = []
 
@@ -98,9 +102,9 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
                 engram_handles.append(layer.engram.register_forward_hook(capture_engram, with_kwargs=True))
     handle = checkpointed.layers["0"].moe.router.register_forward_hook(capture_route, with_kwargs=True)
     try:
-        _, _, kwargs = model.build_attention_masks(tokens, tokens, dict(inputs))
+        _, _, kwargs = preprocess(model, tokens, tokens, inputs["positions"], **modality)
         expected = model(tokens, **kwargs)
-        _, _, kwargs = checkpointed.build_attention_masks(tokens, tokens, dict(inputs))
+        _, _, kwargs = preprocess(checkpointed, tokens, tokens, inputs["positions"], **modality)
         actual = checkpointed(tokens, **kwargs)
         assert route_calls[0][0] is not None
         torch.testing.assert_close(route_calls[0][0], expected_mask)
@@ -128,7 +132,8 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
             for hook in engram_handles:
                 hook.remove()
         route_calls.clear()
-        _, _, kwargs = checkpointed.build_attention_masks(tokens, tokens, {"positions": inputs["positions"]})
+        # A batch with no modality keys at all: the same stack, and no ``image_mask``.
+        _, _, kwargs = preprocess(checkpointed, tokens, tokens, inputs["positions"])
         checkpointed(tokens, **kwargs)
         assert route_calls[0][0] is None
     finally:

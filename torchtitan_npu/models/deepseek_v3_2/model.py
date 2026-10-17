@@ -34,7 +34,6 @@ from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import CPInnerAttention
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -55,12 +54,22 @@ _REFERENCE_CP_UNSUPPORTED = (
 class ReferenceVarlenMetadata(VarlenMetadata):
     """The reference core's global packed layout, which context parallel cannot shard.
 
-    The refusal itself belongs to the backend that owns this layout
-    (``SparseInnerAttention.prepare_cp_metadata``, upstream #4617): a stack that
-    cannot be sharded must say so while the rank-local metadata is being
-    prepared, or the layer would silently attend to a global layout it does not
-    hold.
+    The refusal lives here, beside the layout it refuses (upstream #4617's hook, hosted
+    by the metadata rather than by the backend): a stack that cannot be sharded must say
+    so while the rank-local metadata is being prepared, or the layer would silently
+    attend to a global layout it does not hold.
     """
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        """Refuse context parallel while the rank-local metadata is prepared.
+
+        attn-gym's indexer selects a query's prefix of its own document, while a CP rank
+        holds a document's middle; the kernels need their end-aligned causal range, which
+        this core cannot express.
+        """
+        del attention_metadata, permutation
+        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
 
 
 def build_reference_varlen_metadata(positions: torch.Tensor) -> ReferenceVarlenMetadata:
@@ -310,7 +319,7 @@ class SparseIndexerLoss(AuxLoss):
         return self.inject(kl.sum(), carrier=carrier)
 
 
-class SparseInnerAttention(VarlenAttention, CPInnerAttention):
+class SparseInnerAttention(VarlenAttention):
     """Sparse attention core for DSA, with separated nope/rope support.
 
     The core is two attn-gym calls: :func:`lightning_indexer` picks the slots and
@@ -333,17 +342,6 @@ class SparseInnerAttention(VarlenAttention, CPInnerAttention):
     (one 2048/2048/128-head layer measured 26.75 GiB on 910C).  Training runs the fused
     AscendC kernels instead -- ``override.deepseek_v3_2.sparse_attn.asc``.
     """
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """Refuse context parallel while the rank-local metadata is prepared.
-
-        attn-gym's indexer selects a query's prefix of its own document, while a
-        CP rank holds a document's middle; the kernels need their end-aligned
-        causal range, which this core cannot express.
-        """
-        del attention_metadata, permutation
-        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
 
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):

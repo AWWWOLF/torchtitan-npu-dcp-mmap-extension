@@ -155,7 +155,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | 行为名称 | 与计算后端无关的能力，例如 `optimizer.virtual` |
 
 同一 target family 中存在多个同类实现时，在 variant 后增加对象或职责限定，例如
-`rope.asc_complex`、`rope.asc_cossin` 和 `sparse_attn.asc_metadata`。不要添加
+`rope.asc_complex`、`rope.asc_cossin` 和 `sparse_attn.golden`。不要添加
 `_override` 后缀，也不要使用无法说明实现边界的 `ascend` 等泛化名称。
 
 Replacement 类采用「variant + target」命名，并保留标准缩写的大小写：
@@ -430,9 +430,8 @@ runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | SMLA 前后向；`topk_scores` 作为教师边 |
-| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscV41MetadataExtension.Config` | 在 mask 构建边界预计算 SMLA 元数据，**须与 `sparse_attn.asc` 同开才有收益**（单独启用仅白做预计算，模型构造期会对无消费者的组合告警）；`sparse_attn.asc` 逐层查表复用（miss 回退 inline）；QAT 入口不启用——torchao_npu 的量化注意力未消费记录 |
-| `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向 |
+| `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | SMLA 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 SMLA 与 indexer 元数据（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；记录几何是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状 |
+| `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
 | `engram.host_offload` | `HostEngramTable.Config`（精确匹配） | `HostOffloadEngramTable.Config` | CANN EngramFetch/EngramFetchGrad |
@@ -450,6 +449,37 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 只替换单个阶段，`HcPost` 的 kernel 调用因此要求显式的 `[B, T, D]` 流；`engram` 下的两个
 入口都要求 `num_max_tokens_per_rank`，取值需覆盖该次运行的最大 batch。启用方式见
 [V4.1 独立训练基线](../../examples/deepseek_v4_1/readme.md)。
+
+#### `sparse_attn.asc` 的记录几何是 override 的参数
+
+SMLA 与 indexer 的 metadata 都是 AI_CPU 算子，只依赖本次 forward 的 frames 与静态几何，
+所以它们在 `build_attention_metadata`（每 microbatch 一次的 eager 边界）里预计算，随 map entry
+下发、全层共享。这份几何**不在参考 config 上**：参考核只读整行的 document 边界，以及后端在
+同一处按自己的 `compress_ratio` 折好的 `cu_seq_k`（池化轴），因此 kernel 几何属于端口，由
+override 参数声明：
+
+```text
+# 默认值就是已发布的 V4.1-Flash 形状，Flash 配方不需要写参数
+torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc
+# 其他宽度（debug / 自研 config）在这里声明五个数
+torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc={"num_heads":8,"head_dim":64,"index_topk":32,"index_num_heads":8,"index_head_dim":32}
+```
+
+参数默认值为 `num_heads=64, head_dim=512, index_topk=512, index_num_heads=32, index_head_dim=128`，
+即 V4.1-Flash 的发布形状；端口自己的 config 顶层则是**必填、无默认值**，所以一层一定会读到
+按它自己那五个数构建的记录。**没有 inline 回退**：记录是内核 metadata 的唯一来源，因此
+
+- 端口 config 上的五个数是必需的，缺一个就 `TypeError`，不存在「依赖默认值静默按发布形状构建」
+  的情况，也不会在层里补一次 AI_CPU 调用；
+- 记录挂在 entry 的 `aicpu_metadata` 字段上（`sparse_attn` / `sparse_attn_grad` /
+  `lightning_indexer` / `lightning_indexer_kl_loss_grad`），消费者直接读字段：一条 entry 就是
+  一个几何，没有按 topk 或按几何查表的步骤，因而不存在「查不到」这类运行期错误；
+- 默认值与 config 字段的对应由 `tests/unit_tests/override/deepseek_v4_1/test_fused_geometry.py`
+  对着模型自己的取值核对（debug flavor 与默认形状不同，因此它的配方必须显式声明）。
+
+每个 `(port, compress_ratio)` 是 map 里的一个 entry，所以一个 40 层、三个几何的栈只建三份
+记录（不是四十份），也不需要任何一层知道整个栈的 ratio 表；CP 下由该 entry 自己的
+`prepare_cp_metadata` 按 rank-local frames 重建记录。
 
 #### indexer 只在两个 override 同开时学习
 

@@ -10,22 +10,22 @@ from dataclasses import dataclass
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry, KernelFrame
 
 _LAYOUT = "TND"
 _MASK_MODE = 3  # right-down causal: entry j is complete for query t iff j < (t+1)//ratio
 
 
-def _kernel_options(attention_masks, ratio):
-    """The kernel options, read off the metadata's frames.
+def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame):
+    """The kernel options, read off this geometry's own frames.
 
     Both the metadata call and the main call take these, and they must agree
     option-for-option; reading one source is what makes that structural rather than a
     convention two call sites have to keep in step.
     """
-    compressed = attention_masks.frame_for(ratio)
     return dict(
-        cu_seqlens_q=attention_masks.q.cu_seqlens,
-        cu_seqlens_k=compressed.cu_seqlens,
+        cu_seqlens_q=q.cu_seqlens,
+        cu_seqlens_k=cmp_k.cu_seqlens,
         # The per-sequence lengths actually addressed -- how an operator is told to read a prefix
         # of its operand.  Under context parallelism they carry the whole query movement:
         # ``seqused_q`` is this rank's chunk and ``seqused_k`` its reach into the gathered keys, so
@@ -33,9 +33,9 @@ def _kernel_options(attention_masks, ratio):
         # operator this selector can pick takes the pair -- the BF16 indexer and SLIKG -- and at
         # ``cp_size = 1`` each equals the corresponding boundary difference, so passing them is a
         # no-op there rather than a second code path.
-        seqused_q=attention_masks.q.seqused,
-        seqused_k=compressed.seqused,
-        cmp_residual_k=compressed.residual,
+        seqused_q=q.seqused,
+        seqused_k=cmp_k.seqused,
+        cmp_residual_k=cmp_k.residual,
         layout_q=_LAYOUT,
         layout_k=_LAYOUT,
         mask_mode=_MASK_MODE,
@@ -43,21 +43,34 @@ def _kernel_options(attention_masks, ratio):
     )
 
 
-def _kernel_geometry(num_heads, head_dim, topk):
-    """The geometry the non-quantized metadata ops are built with.
+def build_indexer_metadata(
+    *,
+    ratio: int,
+    q: KernelFrame,
+    cmp_k: KernelFrame,
+    geometry: AicpuGeometry,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The selector's two AI_CPU metadata tensors for this geometry.
 
-    ``max_seqlen_q``/``max_seqlen_k`` are pinned to ``None`` because the BF16
-    ``lightning_indexer_metadata`` takes them as optional ints; SLIKG's metadata op has the
-    same pair and the same reading.  Passing them makes the call independent of whatever
-    default the operator ships with.
+    ``max_seqlen_q``/``max_seqlen_k`` are pinned to ``None`` because both the BF16
+    ``lightning_indexer_metadata`` and SLIKG's take them as optional ints; passing them makes the
+    call independent of whatever default the operator ships with.
     """
-    return dict(
-        num_heads_q=num_heads,
+    options = kernel_options(ratio=ratio, q=q, cmp_k=cmp_k)
+    geometry_kwargs = dict(
+        num_heads_q=geometry.index_num_heads,
         num_heads_k=1,
-        head_dim=head_dim,
-        topk=topk,
+        head_dim=geometry.index_head_dim,
+        topk=geometry.index_topk,
         max_seqlen_q=None,
         max_seqlen_k=None,
+    )
+    return (
+        torch.ops.cann_ops_transformer.lightning_indexer_metadata(**geometry_kwargs, **options),
+        torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
+            **geometry_kwargs,
+            **options,
+        ),
     )
 
 
@@ -78,18 +91,16 @@ class _LightningIndexerTND(torch.autograd.Function):
         idx_w,
         topk,
         ratio,
-        attention_masks,
+        attention_metadata,
         num_global_queries,
     ):
         # These arrive with the batch axis already squeezed off by the caller: an
         # autograd.Function's backward must return one gradient per input *in the shape it
         # was handed*, so the kernels' ``[T, H, D]`` layout has to be established outside
         # this node rather than inside it.
-        options = _kernel_options(attention_masks, ratio)
-        li_metadata = torch.ops.cann_ops_transformer.lightning_indexer_metadata(
-            **_kernel_geometry(idx_q.shape[1], idx_q.shape[2], topk),
-            **options,
-        )
+        options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
+        # The record is read instead of re-running the AI_CPU operator per layer.
+        li_metadata = attention_metadata.aicpu_metadata.lightning_indexer
         topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
             idx_q,
             idx_k,
@@ -129,11 +140,11 @@ class _LightningIndexerTND(torch.autograd.Function):
         topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
         ctx.topk, ctx.ratio = topk, ratio
-        # The mask is a dataclass, so ``save_for_backward`` cannot take it; it is a
+        # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
         # context attribute instead.  That is not extra retention: it holds the same
         # boundary tensors the graph already keeps for the backward, and the node -- and
         # with it this reference -- is released when that backward has run.
-        ctx.attention_masks = attention_masks
+        ctx.attention_metadata = attention_metadata
         return topk_indices, topk_scores
 
     @staticmethod
@@ -155,11 +166,9 @@ class _LightningIndexerTND(torch.autograd.Function):
         # SMLAG injects raw teacher weights outside the main loss's normalization.
         # Scaling p scales SLIKG's Z * softmax(I) - p by the same factor.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
-        options = _kernel_options(ctx.attention_masks, ctx.ratio)
-        slig_metadata = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
-            **_kernel_geometry(idx_q.shape[1], idx_q.shape[2], ctx.topk),
-            **options,
-        )
+        options = kernel_options(ratio=ctx.ratio, q=ctx.attention_metadata.q, cmp_k=ctx.attention_metadata.cmp_k)
+        # Rides the same record as the forward, so the backward skips its AI_CPU call too.
+        slig_metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer_kl_loss_grad
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,
@@ -179,7 +188,7 @@ class _LightningIndexerTND(torch.autograd.Function):
             dw,
             None,  # topk
             None,  # ratio
-            None,  # attention_masks
+            None,  # attention_metadata
             None,  # num_global_queries
         )
 
@@ -208,7 +217,7 @@ class AscSelector(Selector):
         idx_q_BLHiDi: torch.Tensor,
         idx_k_BNDi: torch.Tensor,
         weights_BLHi: torch.Tensor,
-        attention_masks,
+        attention_metadata,
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -221,7 +230,7 @@ class AscSelector(Selector):
             weights_BLHi.squeeze(0).float(),
             topk,
             self.compress_ratio,
-            attention_masks,
+            attention_metadata,
             self.num_global_queries,
         )
         # Two layout translations and nothing else: ``_LightningIndexerTND`` already

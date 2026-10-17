@@ -256,7 +256,7 @@ class Selector(Module):
         idx_q_BLHiDi: torch.Tensor,
         idx_k_BNDi: torch.Tensor,
         weights_BLHi: torch.Tensor,
-        attention_masks: DeepSeekV41Metadata,
+        attention_metadata: DeepSeekV41Metadata,
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -279,13 +279,15 @@ class Selector(Module):
         indices, ``-1`` for an unused slot, and ``-inf`` for that slot in the scores.
         """
         num_cmp = idx_k_BNDi.size(1)
-        compressed = attention_masks.frame_for(self.compress_ratio)
-        assert compressed is not None, (
+        assert self.compress_ratio > 0, (
             "A selector reads its compressed pool's frame, which only a layer that pools "
             f"owns, so compress_ratio must be positive (got {self.compress_ratio})."
         )
-        cu_seqlens = attention_masks.q.cu_seqlens
-        cu_seqlens_k = compressed.cu_seqlens
+        # Both grids come with the metadata: the backend that owns this layer's ratio folded the
+        # pool's at build time, so the selector reads a boundary set instead of dividing the row's
+        # own -- and it is the same grid the fused port's kernels are handed.
+        cu_seqlens = attention_metadata.cu_seq_q
+        cu_seqlens_k = attention_metadata.cu_seq_k
         visible_LN, newest_L1, newest_valid_L1, pool_start_L1 = _selection_mask(
             cu_seqlens,
             cu_seqlens_k,
@@ -419,7 +421,7 @@ class HierarchicalIndexer(Module):
         x: torch.Tensor,
         qr: torch.Tensor,
         positions: torch.Tensor,
-        attention_masks: DeepSeekV41Metadata,
+        attention_metadata: DeepSeekV41Metadata,
         *,
         latent: torch.Tensor | None = None,
         idx_k: torch.Tensor | None = None,
@@ -442,8 +444,8 @@ class HierarchicalIndexer(Module):
             x: Hidden states of shape ``[B, L, D]``.
             qr: Query LoRA latent of shape ``[B, L, Q]``.
             positions: Position ids of shape ``[B, L]``.
-            attention_masks: The forward's varlen metadata; the indexer reads the packed
-                frames, which say which pool entries a query's own document contributed.
+            attention_metadata: The forward's varlen metadata; the indexer reads the row's
+                boundaries, which say which pool entries a query's own document contributed.
             latent: The compressor's pre-RoPE latent; a Full Mode layer projects its keys
                 from it.
             idx_k: The shared index keys, rescored by a Reindex Mode layer.
@@ -488,7 +490,7 @@ class HierarchicalIndexer(Module):
         # copy of those rows, so the two are not the same list of positions.
         idx_q = self.rope(
             self.wq_b(qr).unflatten(-1, (self.num_index_heads, self.index_head_dim)),
-            positions=attention_masks.positions_q,
+            positions=attention_metadata.positions_q,
         )
         # Scaled by the index softmax scale and the head count, as in the reference: the
         # per-head scores are averaged rather than summed.
@@ -498,7 +500,7 @@ class HierarchicalIndexer(Module):
             idx_q,
             idx_k,
             weights,
-            attention_masks,
+            attention_metadata,
             candidates_BL1C=candidates,
         )
         return idx_k, topk_indices, topk_scores, candidates

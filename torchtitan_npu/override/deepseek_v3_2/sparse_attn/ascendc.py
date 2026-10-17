@@ -29,7 +29,6 @@ from torchtitan_npu.models.deepseek_v3_2.model import (
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
-    CPInnerAttention,
     cp_shard_context,
 )
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
@@ -220,42 +219,8 @@ class AscSparseIndexerLoss(SparseIndexerLoss):
         return self.inject(dummy, carrier=carrier)
 
 
-class AscSparseInnerAttention(VarlenAttention, CPInnerAttention):
+class AscSparseInnerAttention(VarlenAttention):
     """Sparse attention using AscendC fused ops (MLA-absorb mode)."""
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """This rank's copy of the packed layout (upstream #4617's CP half).
-
-        The global documents are re-cut for the load-balancer permutation, so the
-        host length lists are re-read from the rank-local offsets: the TND kernels
-        receive exactly the segments this rank runs.
-
-        The balancer is rebuilt here rather than received, because 0.3.0's CP entry
-        takes its *type* and builds the object internally; anything but ``headtail``
-        means that entry sharded with no permutation, so this derivation passes no
-        balancer either and stays in step with the shard.  An unusable type never
-        reaches here: the pinned entry rejects it first (``ptrr`` included, since
-        the map path hands it no masks).
-        """
-        del permutation
-        context = cp_shard_context()
-        if context.cp_mesh is None or context.positions is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        batch_size, seq_len = context.positions.shape
-        return AscVarlenMetadata.from_varlen(
-            CPVarlenMetadata.from_global(
-                attention_metadata.varlen_meta,
-                context.cp_mesh,
-                batch_size,
-                seq_len,
-                load_balancer=(
-                    _HeadTailLoadBalancer(seq_len, context.cp_mesh.size(0), context.cp_mesh.device_type)
-                    if context.load_balancer_type == "headtail"
-                    else None
-                ),
-            )
-        )
 
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
@@ -391,6 +356,40 @@ class AscVarlenMetadata:
     varlen_meta: VarlenMetadata | CPVarlenMetadata
     actual_seq_qlen: list[int]
     actual_seq_klen: list[int]
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        """This rank's copy of the packed layout (upstream #4617's CP half).
+
+        The global documents are re-cut for the load-balancer permutation, so the host
+        length lists are re-read from the rank-local offsets: the TND kernels receive
+        exactly the segments this rank runs.  The hook lives here, on the layout it
+        rebuilds, rather than on the backend that produced it.
+
+        The balancer is rebuilt here rather than received, because 0.3.0's CP entry takes
+        its *type* and builds the object internally; anything but ``headtail`` means that
+        entry sharded with no permutation, so this derivation passes no balancer either and
+        stays in step with the shard.  An unusable type never reaches here: the pinned entry
+        rejects it first (``ptrr`` included, since the map path hands it no masks).
+        """
+        del permutation
+        context = cp_shard_context()
+        if context.cp_mesh is None or context.positions is None:
+            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
+        batch_size, seq_len = context.positions.shape
+        return AscVarlenMetadata.from_varlen(
+            CPVarlenMetadata.from_global(
+                attention_metadata.varlen_meta,
+                context.cp_mesh,
+                batch_size,
+                seq_len,
+                load_balancer=(
+                    _HeadTailLoadBalancer(seq_len, context.cp_mesh.size(0), context.cp_mesh.device_type)
+                    if context.load_balancer_type == "headtail"
+                    else None
+                ),
+            )
+        )
 
     @classmethod
     def from_varlen(cls, varlen_meta: VarlenMetadata | CPVarlenMetadata) -> AscVarlenMetadata:

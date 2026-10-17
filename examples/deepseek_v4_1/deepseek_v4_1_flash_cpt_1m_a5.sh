@@ -166,7 +166,6 @@ NPU_OPS_OVERRIDES=(
     torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn \
     torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post \
     torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
-    torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc_metadata \
     torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc
 )
 

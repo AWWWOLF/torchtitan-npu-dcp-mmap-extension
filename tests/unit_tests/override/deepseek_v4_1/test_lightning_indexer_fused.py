@@ -28,13 +28,24 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 from torchtitan.config import derive
 
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import layer_metadata, preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     AscSelector,
 )
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import build_fused_metadata
 
 _TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)]).unsqueeze(0)
 _POSITIONS = torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0)
+
+# The tiny debug layer's own geometry, at the widths ``_tiny_model`` builds it with.  The port's
+# records are sized from the override's arguments and it has no inline operator path, so every
+# fused layer a test drives and the metadata that layer reads must state the *same* numbers: the
+# lookup and the record's guard compare them, and a mismatch is an error rather than a fallback.
+_TINY_GEOMETRY = dict(num_heads=2, head_dim=8, index_topk=32, index_num_heads=2, index_head_dim=4)
+_TINY_LAYER_GEOMETRY = AicpuGeometry(window_size=128, **_TINY_GEOMETRY)
 
 
 # ---------------------------------------------------------------------------
@@ -42,31 +53,23 @@ _POSITIONS = torch.cat([torch.arange(64), torch.arange(64)]).unsqueeze(0)
 # ---------------------------------------------------------------------------
 
 
-def _metadata(bounds: list[int], *, compress_ratios: tuple[int, ...] = (1, 2)):
-    """Build the model's varlen metadata for a packed row of these document boundaries.
+def _metadata(bounds: list[int], *, ratio: int = 2, geometry: AicpuGeometry | None = None):
+    """Build one geometry's fused metadata for a packed row of these document boundaries.
 
-    The positions that produce the boundaries are rebuilt here, so the metadata always
-    comes from the model's own builder; one ``arange`` per document is what a packed
-    loader emits.
+    The positions that produce the boundaries are rebuilt here, so the metadata always comes from
+    the same builders the attention configs call; one ``arange`` per document is what a packed
+    loader emits.  The row comes from the reference backend's builder at this entry's ratio --
+    ``cu_seq_k`` is folded there -- and the entry adds this geometry's frames and records, which
+    is what the fused selector and core read.  The default geometry is the tiny layer's own, which
+    is what the fused stacks below are built with; a test that drives another shape states it.
     """
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
-
-    from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
-
-    class _ModelOwner:
-        """A stand-in for the model, as ``get_attention_masks`` sees it.
-
-        The hook is a method, so it reaches for the frame builders on ``self``; they are taken from
-        the model class rather than restated here, so a change to the frame algebra cannot leave the
-        two disagreeing.
-        """
-
-        _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_metadata = DeepSeekV41Model._row_metadata
-
-    owner = _ModelOwner()
-    owner.compress_ratios = compress_ratios
-    return DeepSeekV41Model.get_attention_masks(owner, positions)
+    reference = CompressedSparseInnerAttention2.Config(window_size=128, softmax_scale=0.5, compress_ratio=ratio)
+    return build_fused_metadata(
+        reference.build_attention_metadata(positions),
+        ratio=ratio,
+        geometry=_TINY_LAYER_GEOMETRY if geometry is None else geometry,
+    )
 
 
 def _fake_li_metadata(*args, **kwargs):
@@ -245,7 +248,11 @@ def _tiny_model(monkeypatch, *, fused: bool):
             if layer.attention.inner_attention.compress_ratio == 0:
                 continue
             layer.attention.indexer.selector = derive(layer.attention.indexer.selector, AscSelector.Config)
-            layer.attention.inner_attention = derive(layer.attention.inner_attention, AscV41SparseAttention.Config)
+            # State the geometry the way the recipe's override arguments do: this stack runs the
+            # tiny widths, and the records its metadata builder produces are sized from these.
+            layer.attention.inner_attention = derive(
+                layer.attention.inner_attention, AscV41SparseAttention.Config, **_TINY_GEOMETRY
+            )
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config)
     for module in model.modules():
@@ -255,7 +262,7 @@ def _tiny_model(monkeypatch, *, fused: bool):
 
 
 def _run_forward_backward(model):
-    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     output = model(_TOKENS, **kwargs)
     output.sum().backward()
     return output
@@ -265,8 +272,10 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     """Per-layer parity: same valid index sets, same scores, kernel-shaped outputs."""
     eager = _tiny_model(monkeypatch, fused=False)
     fused = _tiny_model(monkeypatch, fused=True)
-    _, _, kwargs = eager.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
-    metadata = kwargs["attention_masks"]
+    preprocess(eager, _TOKENS, _TOKENS, _POSITIONS)
+    # The reference selector reads that row; the fused one reads the entry its own port built
+    # for the same row, which is what carries the frames and the records the kernels take.
+    metadata = _metadata([0, _POSITIONS.shape[-1]], ratio=2)
 
     eager_indexer = eager.layers["2"].attention.indexer.selector
     fused_indexer = fused.layers["2"].attention.indexer.selector
@@ -439,9 +448,10 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
         return torch.zeros(8, dtype=torch.int32, device=device)
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer", fake_kernel)
-    monkeypatch.setattr(li, "_kernel_options", lambda *a, **k: {})
-    monkeypatch.setattr(li, "_kernel_geometry", lambda *a, **k: {})
+    # Both of the selector's AI_CPU records are faked: this test is about the device their
+    # consumer lands on, not about the operators that produce them.
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", fake_metadata)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad_metadata", fake_metadata)
 
     original = li._LightningIndexerTND.forward
 
@@ -459,7 +469,7 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
         torch.zeros(1, 8, heads, head_dim, dtype=torch.bfloat16, device=device),
         torch.zeros(1, 4, head_dim, dtype=torch.bfloat16, device=device),
         torch.zeros(1, 8, heads, dtype=torch.float32, device=device),
-        _metadata([0, 8], compress_ratios=(1,)),
+        _metadata([0, 8], ratio=1),
         candidates_BL1C=None,
     )
 
@@ -558,8 +568,8 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer", unsorted_fake)
     model = _tiny_model(monkeypatch, fused=True)
-    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
-    metadata = kwargs["attention_masks"]
+    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
+    metadata = layer_metadata(model.layers["2"], kwargs)
 
     selector = model.layers["2"].attention.indexer.selector
     # requires_grad on the operands, as in a real layer: an autograd Function only gives
@@ -686,7 +696,9 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
             if fused_selector:
                 layer.attention.indexer.selector = derive(layer.attention.indexer.selector, AscSelector.Config)
             if fused_core:
-                layer.attention.inner_attention = derive(layer.attention.inner_attention, AscV41SparseAttention.Config)
+                layer.attention.inner_attention = derive(
+                    layer.attention.inner_attention, AscV41SparseAttention.Config, **_TINY_GEOMETRY
+                )
         return cfg
 
     with torch.random.fork_rng(devices=[]):
@@ -753,7 +765,7 @@ def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch
     k = torch.rand(1, 4, selector.index_head_dim, generator=generator, requires_grad=True)
     w = torch.rand(1, 8, selector.num_index_heads, generator=generator, requires_grad=True)
     selector.num_global_queries = torch.tensor(32.0)
-    indices, scores, _ = selector(q, k, w, _metadata([0, 8], compress_ratios=(2,)), candidates_BL1C=None)
+    indices, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
     teacher = (indices >= 0).float() * 0.25
     # A later forward's denominator must not change this graph's backward.
     selector.num_global_queries = torch.tensor(64.0)
@@ -775,6 +787,6 @@ def test_indexer_backward_requires_global_query_count(monkeypatch):
     q = torch.ones(1, 8, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
     k = torch.ones(1, 4, selector.index_head_dim, requires_grad=True)
     w = torch.ones(1, 8, selector.num_index_heads, requires_grad=True)
-    _, scores, _ = selector(q, k, w, _metadata([0, 8], compress_ratios=(2,)), candidates_BL1C=None)
+    _, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
     with pytest.raises(RuntimeError, match=r"Set Selector\.num_global_queries"):
         scores.backward(torch.ones_like(scores))

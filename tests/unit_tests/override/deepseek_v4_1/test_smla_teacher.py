@@ -69,8 +69,21 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
         )
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
-    attn = build_cpu_model(ascendc.AscV41SparseAttention.Config(window_size=2, softmax_scale=0.5, compress_ratio=1))
-    metadata = v41_metadata(torch.arange(4))
+    config = ascendc.AscV41SparseAttention.Config(
+        window_size=2,
+        softmax_scale=0.5,
+        compress_ratio=1,
+        num_heads=1,
+        head_dim=4,
+        index_topk=3,
+        index_num_heads=1,
+        index_head_dim=4,
+    )
+    attn = build_cpu_model(config)
+    # Two documents of two tokens: whole pooling groups, which is the only shape the backend's
+    # frames are built for.  The metadata comes from this layer's own config, which is what a run
+    # does: the records are sized by the config's geometry, and the lookup compares them back.
+    metadata = v41_metadata([0, 2, 4], port=config)
     # The real carrier is FP32: the fused selector emits the kernel's FP32 relaxed scores,
     # which is what lets the port forward SMLAG's FP32 mass without converting it.  An
     # unused slot holds whatever the kernel wrote there (``-inf`` from the reference
@@ -144,9 +157,17 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
         return args[0].clone(), torch.zeros(1, 4, 1)
 
     monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
-    attention = build_cpu_model(
-        ascendc.AscV41SparseAttention.Config(window_size=2, softmax_scale=0.5, compress_ratio=ratio)
+    config = ascendc.AscV41SparseAttention.Config(
+        window_size=2,
+        softmax_scale=0.5,
+        compress_ratio=ratio,
+        num_heads=1,
+        head_dim=4,
+        index_topk=3,
+        index_num_heads=1,
+        index_head_dim=4,
     )
+    attention = build_cpu_model(config)
     attention.train(training)
     q = torch.zeros(1, 4, 1, 4, dtype=torch.bfloat16)
     # The port pairs the pool and its selection: one without the other is a contract
@@ -157,13 +178,13 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
         q,
         q.squeeze(2),
         torch.zeros(1),
-        v41_metadata([0, 4]),
+        v41_metadata([0, 4], port=config),
         cmp_k=shared,
         topk_indices=indices,
         topk_scores=torch.ones(1, 4, 1, requires_grad=True),
     )
     torch.testing.assert_close(out, q)
-    # The apply args are (q, swa_k, cmp_k, topk_indices, sinks, attention_masks,
+    # The apply args are (q, swa_k, cmp_k, topk_indices, sinks, attention_metadata,
     # softmax_scale, ratio, window_size, topk_scores, wants_teacher): the teacher travels
     # as the carrier's gradient, so no carrier means this layer carries none.  The boundary
     # tensors are no longer arguments -- they are read off the mask at position 5.

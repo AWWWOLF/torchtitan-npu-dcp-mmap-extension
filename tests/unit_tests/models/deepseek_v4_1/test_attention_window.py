@@ -12,22 +12,29 @@ reference, and another document's keys cannot reach the query.
 """
 
 from itertools import pairwise
-from types import SimpleNamespace
 
 import pytest
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1 import attention
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 
 
 def _window_metadata(bounds: list[int]):
-    """Only ``q.cu_seqlens`` is read on the window-only branch.
+    """The row's own metadata, which is all the window-only branch reads.
 
-    The core reaches for ``frame_for(compress_ratio)`` only when a compressed KV is present,
-    so a window-only core needs no frame algebra -- which is what makes this stand-in honest
-    and keeps the test about the branch under test.
+    A window-only layer is ``compress_ratio = 0``, and the backend that builds the row folds
+    ``cu_seq_k`` there to the row's own boundaries: the core addresses the row with these
+    offsets and never reaches for a pooled axis, so this is the whole contract it consumes.
     """
-    return SimpleNamespace(q=SimpleNamespace(cu_seqlens=torch.tensor(bounds, dtype=torch.int32)))
+    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
+    # Only the row matters here: the builder reads the positions, not this geometry.
+    config = CompressedSparseInnerAttention2.Config(window_size=8, softmax_scale=0.5, compress_ratio=0)
+    metadata = config.build_attention_metadata(positions)
+    # The window-only geometry has no pool, so its key grid is the row's own -- the property
+    # that makes passing both offsets to ``gather_attn`` a no-op here.
+    torch.testing.assert_close(metadata.cu_seq_k, metadata.cu_seq_q, rtol=0, atol=0)
+    return metadata
 
 
 def _dense_window_reference(q, kv, sink, bounds, window, scale):
@@ -59,7 +66,9 @@ def test_window_only_layer_matches_an_explicit_reference(window):
     sink = torch.randn(heads)
 
     core = attention.CompressedSparseInnerAttention2.Config(
-        window_size=window, softmax_scale=scale, compress_ratio=0
+        window_size=window,
+        softmax_scale=scale,
+        compress_ratio=0,
     ).build()
     # ``cmp_k``/``topk_indices`` are a pair; omitting both is the window-only layer.
     out = core(q, kv, sink, metadata, cmp_k=None, topk_indices=None)
@@ -78,7 +87,9 @@ def test_window_only_layer_does_not_leak_across_documents():
     sink = torch.randn(heads)
 
     core = attention.CompressedSparseInnerAttention2.Config(
-        window_size=window, softmax_scale=scale, compress_ratio=0
+        window_size=window,
+        softmax_scale=scale,
+        compress_ratio=0,
     ).build()
     out = core(q, kv, sink, metadata, cmp_k=None, topk_indices=None)
 

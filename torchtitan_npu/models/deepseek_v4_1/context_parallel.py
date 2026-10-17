@@ -32,22 +32,11 @@ import torch
 from torch.distributed._functional_collectives import all_to_all_single
 from torchtitan.protocols.module import Module
 
-__all__ = ["ExchangeMetadata", "QueryExchange", "cp_plan", "document_bounds"]
-
-
-def document_bounds(positions: torch.Tensor) -> torch.Tensor:
-    """The packed row's document boundaries, ``[n_documents + 1]`` (int32).
-
-    Positions restart at 0 at every packed segment start, so the boundaries are the row's
-    start plus every reset after it, then the row's end.  ``positions == 0`` marks the row
-    start as well, so the resets are the markers past index 0 -- taking them all would put
-    index 0 in the array twice and turn a single-document row into one document per token.
-    """
-    flat = positions.reshape(-1)
-    resets = (flat == 0).nonzero().flatten()[1:]
-    zeros = torch.zeros(1, dtype=torch.int32, device=flat.device)
-    total = torch.tensor([flat.numel()], dtype=torch.int32, device=flat.device)
-    return torch.cat((zeros, resets.to(torch.int32), total))
+__all__ = [
+    "ExchangeMetadata",
+    "QueryExchange",
+    "cp_plan",
+]
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

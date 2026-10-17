@@ -18,44 +18,73 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as selector_ascendc
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as core_ascendc
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
+    build_fused_metadata,
+    shard_asc_v41_metadata,
+)
 
 # Only the frames are under test, so any window does.
 _WINDOW = 128
+# One geometry per entry: a ratio is what the *entry* is built for, so a test states the one
+# it exercises instead of a stack-wide table.
+_RATIO = 2
+# The port's record geometry, at the small widths these tests run.  Only the frames are read
+# here, but a build always produces the records, so the numbers are stated rather than omitted.
+_GEOMETRY = dict(num_heads=2, head_dim=4, index_topk=8, index_num_heads=4, index_head_dim=4)
 
 
-class _Model:
-    """The model's metadata builders, without the rest of the model.
+def _row(positions: torch.Tensor, ratio: int):
+    """The row a fused entry starts from, built by the reference core's own config.
 
-    The ports are handed the metadata, not the model, so grafting the builders is enough; the
-    boundaries the tests want are rebuilt as positions, exactly as the hook would see them.
+    ``cu_seq_k`` is that config's ratio applied to the row, so the entry's ratio has to be the
+    row's here -- the fused entry never folds a grid its own backend did not produce.
     """
-
-    compress_ratios = (0, 2, 1)
-    # The hook is a method, so a stand-in presents the pieces it reaches for; they are taken from
-    # the model itself, and ``_frame`` as a staticmethod -- a plain assignment would make it an
-    # instance method here.
-    get_attention_masks = DeepSeekV41Model.get_attention_masks
-    _row_metadata = DeepSeekV41Model._row_metadata
-    _sharded_attention_masks = DeepSeekV41Model._sharded_attention_masks
-    _frame = staticmethod(DeepSeekV41Model._frame)
+    config = CompressedSparseInnerAttention2.Config(window_size=_WINDOW, softmax_scale=0.5, compress_ratio=ratio)
+    return config.build_attention_metadata(positions)
 
 
-def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0):
+def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _RATIO):
+    """One geometry's frames, or this rank's after the CP re-cut.
+
+    This is what a fused port's ``AscV41Metadata.prepare_cp_metadata`` runs -- the seam's hook
+    delegates to the same function -- and the frames it returns are the ones the operators grid,
+    so the tests below read them through the same option builder the kernels are called with.
+    """
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
-    owner = _Model()
+    entry = build_fused_metadata(
+        _row(positions, ratio),
+        ratio=ratio,
+        geometry=AicpuGeometry(window_size=_WINDOW, **_GEOMETRY),
+    )
     if cp_size == 1:
-        return owner.get_attention_masks(positions)
-    slab = positions.numel() // cp_size
-    lo = cp_rank * slab
-    return owner._sharded_attention_masks(
-        owner._row_metadata(positions),
-        positions[:, lo : lo + slab],
+        return entry
+    return shard_asc_v41_metadata(
+        entry,
         cp_size=cp_size,
         cp_rank=cp_rank,
+        batch_size=1,
+        seq_len=positions.shape[-1] // cp_size,
     )
+
+
+def _core_options(metadata, ratio: int = _RATIO):
+    """The options the SMLA kernels are called with, read off the entry's own frames."""
+    return core_ascendc.kernel_options(
+        ratio=ratio,
+        q=metadata.q,
+        swa_k=metadata.swa_k,
+        cmp_k=metadata.cmp_k,
+        window_size=_WINDOW,
+    )
+
+
+def _selector_options(metadata, ratio: int = _RATIO):
+    """The same, for the selector's two operators: its queries and the pool grid they address."""
+    return selector_ascendc.kernel_options(ratio=ratio, q=metadata.q, cmp_k=metadata.cmp_k)
 
 
 def _lengths(bounds: list[int], dtype=torch.int32) -> torch.Tensor:
@@ -66,7 +95,7 @@ def _lengths(bounds: list[int], dtype=torch.int32) -> torch.Tensor:
 @pytest.mark.parametrize("bounds", [[0, 8, 24], [0, 8, 32, 40]], ids=["two-docs", "three-docs"])
 def test_one_degree_passes_the_boundary_differences(bounds, ratio):
     """At one degree every per-sequence length is the boundary difference, so they are no-ops."""
-    options = core_ascendc._kernel_options(_masks(bounds), ratio, _WINDOW)
+    options = _core_options(_masks(bounds, ratio=ratio), ratio)
     lengths = _lengths(bounds)
     assert torch.equal(options["cu_seqlens_q"], torch.tensor(bounds, dtype=torch.int32))
     assert torch.equal(options["seqused_q"], lengths)
@@ -94,7 +123,7 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     row = torch.tensor(bounds, dtype=torch.int32)
     chunk = _lengths(bounds) // cp_size
     reach = (cp_rank + 1) * chunk
-    options = core_ascendc._kernel_options(_masks(bounds, cp_size, cp_rank), ratio, _WINDOW)
+    options = _core_options(_masks(bounds, cp_size, cp_rank, ratio=ratio), ratio)
 
     assert torch.equal(options["cu_seqlens_q"], (row // cp_size).to(torch.int32))
     assert torch.equal(options["cu_seqlens_ori_kv"], row)
@@ -102,6 +131,8 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     assert torch.equal(options["seqused_ori_kv"], reach)
     assert torch.equal(options["seqused_ori_kv"] - options["seqused_q"], cp_rank * chunk)
     assert torch.equal(options["seqused_cmp_kv"], reach // ratio)
+    # The pool grid is the row's own, folded by the backend that built the entry: it is the same
+    # boundaries at every rank because the KV streams stay the whole row.
     assert torch.equal(options["cu_seqlens_cmp_kv"], (row // ratio).to(torch.int32))
 
 
@@ -111,14 +142,13 @@ def test_the_selector_gets_the_same_chunk_and_reach(cp_size, cp_rank):
 
     Without these two lengths a rank would score its chunks against the whole row and spend its
     top-k on blocks it may not read.  They sit in the same option dict as the boundaries, because
-    every operator this selector can pick takes the same pair -- the bf16 V2 indexer at
-    ``legacy=True`` and the quantized pair otherwise -- so one builder serves all of them.
+    every operator this selector can pick takes the same pair.
     """
     bounds = [0, 16, 48]
     row = torch.tensor(bounds, dtype=torch.int32)
     chunk = _lengths(bounds) // cp_size
     masks = _masks(bounds, cp_size, cp_rank)
-    options = selector_ascendc._kernel_options(masks, 2)
+    options = _selector_options(masks)
 
     assert torch.equal(options["cu_seqlens_q"], (row // cp_size).to(torch.int32))
     assert torch.equal(options["cu_seqlens_k"], (row // 2).to(torch.int32))

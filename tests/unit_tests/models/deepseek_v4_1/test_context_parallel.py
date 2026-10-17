@@ -16,19 +16,30 @@ forward hands to ``all_to_all_single`` -- because a plan is what this file is ab
 module's own call into the collective is a thin wrapper over them.
 """
 
+from itertools import pairwise
+
 import pytest
 import torch
 
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.context_parallel import (
     ExchangeMetadata,
     QueryExchange,
     cp_plan,
-    document_bounds,
 )
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata, DeepSeekV41Model
+from torchtitan_npu.models.deepseek_v4_1.model import (
+    DeepSeekV41Metadata,
+    DeepSeekV41Model,
+)
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
+    build_fused_metadata,
+    shard_asc_v41_metadata,
+)
 
-# Two ratios keep the alignment arithmetic small while still exercising the lcm.
-_RATIOS = (0, 2, 1)
+# One geometry per entry, so the frame tests state the ratio they exercise; the alignment the
+# launcher pads to is ``cp_size * this ratio`` per entry (the stack-wide lcm is the dataloader's).
+_RATIO = 2
 
 
 def _positions(*documents: int) -> torch.Tensor:
@@ -41,6 +52,43 @@ def _positions(*documents: int) -> torch.Tensor:
 
 def _bounds(cu: list[int]) -> torch.Tensor:
     return torch.tensor(cu, dtype=torch.int32)
+
+
+# The port's record geometry, at the widths these CPU tests run.  Only the frames are read
+# here, but a build always produces the records, so the numbers are stated rather than omitted.
+_GEOMETRY = AicpuGeometry(window_size=8, num_heads=2, head_dim=4, index_topk=4, index_num_heads=4, index_head_dim=4)
+
+
+def _row(positions: torch.Tensor, *, ratio: int = _RATIO) -> DeepSeekV41Metadata:
+    """The row's own metadata, from the builder every V4.1 attention backend calls.
+
+    ``cu_seq_k`` is the backend's own ratio applied to the row's boundaries, so the row is built
+    at the ratio of the entry that consumes it -- the fold happens once, where the ratio is known,
+    and no consumer divides a boundary set it was handed.
+    """
+    config = CompressedSparseInnerAttention2.Config(window_size=8, softmax_scale=0.5, compress_ratio=ratio)
+    return config.build_attention_metadata(positions)
+
+
+def _masks(positions: torch.Tensor, cp_size: int = 1, cp_rank: int = 0) -> DeepSeekV41Metadata:
+    """The row's frames, or this rank's after the backend's CP transform.
+
+    ``seq_len`` is the **slab** width, which is what the framework hands every rank; the
+    transform is given the pre-shard row because that is the geometry it derives the slab
+    from.
+    """
+    # The records a build always produces are incidental here -- these tests read the frames --
+    # so the geometry is a stated small layer rather than an omitted one.
+    entry = build_fused_metadata(_row(positions), ratio=_RATIO, geometry=_GEOMETRY)
+    if cp_size == 1:
+        return entry
+    return shard_asc_v41_metadata(
+        entry,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        batch_size=1,
+        seq_len=positions.numel() // cp_size,
+    )
 
 
 def _oracle_splits(cu: list[int], cp_size: int, seq_len: int) -> torch.Tensor:
@@ -58,7 +106,7 @@ def _oracle_splits(cu: list[int], cp_size: int, seq_len: int) -> torch.Tensor:
 def _oracle_held_rows(cu: list[int], cp_size: int, rank: int) -> list[int]:
     """Rank ``rank``'s rows: chunk ``rank`` of every document, in document order."""
     rows: list[int] = []
-    for start, end in zip(cu[:-1], cu[1:]):
+    for start, end in pairwise(cu):
         chunk = (end - start) // cp_size
         rows += range(start + rank * chunk, start + (rank + 1) * chunk)
     return rows
@@ -86,7 +134,11 @@ _CASES = [
 def test_the_bounds_are_read_off_the_row():
     """The boundaries come from the position resets, which is where every frame starts."""
     for cu, _ in _CASES:
-        assert document_bounds(_positions(*[e - s for s, e in zip(cu[:-1], cu[1:])])).tolist() == list(cu)
+        row = _row(_positions(*[e - s for s, e in pairwise(cu)]))
+        assert row.cu_seq_q.tolist() == list(cu)
+        # The pool grid is the same backend's ratio applied once: the row carries it too, so the
+        # reference core and every fused port address one set of boundaries.
+        assert row.cu_seq_k.tolist() == [bound // _RATIO for bound in cu]
 
 
 @pytest.mark.parametrize("cu, cp_size", _CASES)
@@ -131,11 +183,14 @@ def test_the_movement_is_a_permutation_of_the_slab(cu, cp_size):
         assert int(span.max()) <= 2
 
 
-@pytest.mark.parametrize("cu, cp_size, why", [
-    ((0, 24, 32), 16, "a length that is not a multiple of cp_size"),
-    ((0, 22, 32), 4, "a length that is not a multiple of cp_size"),
-    ((0, 32, 32, 32), 8, "a zero-length document"),
-])
+@pytest.mark.parametrize(
+    "cu, cp_size, why",
+    [
+        ((0, 24, 32), 16, "a length that is not a multiple of cp_size"),
+        ((0, 22, 32), 4, "a length that is not a multiple of cp_size"),
+        ((0, 32, 32, 32), 8, "a zero-length document"),
+    ],
+)
 def test_the_plan_rejects_a_row_it_cannot_grid(cu, cp_size, why):
     """A row the launcher should never have produced fails here rather than downstream.
 
@@ -150,23 +205,21 @@ def test_the_plan_rejects_a_row_it_cannot_grid(cu, cp_size, why):
     "documents, cp_size",
     [((48, 20), 4), ((16, 12), 4), ((32, 24), 8)],
     ids=[
-        "20 is not a multiple of cp_size * lcm(2, 1) = 8",
+        "20 is not a multiple of cp_size * ratio = 8",
         "12 is not a multiple of 8",
-        "24 is not a multiple of cp_size * 2 = 16",
+        "24 is not a multiple of cp_size * ratio = 16",
     ],
 )
 def test_the_sharded_path_checks_the_launcher_contract(documents, cp_size):
     """A row the launcher should never have produced fails here, per document.
 
-    ``cp_size * lcm(ratios > 1)`` is the alignment the launcher pads to; without it a chunk is
-    ragged (rows land in the wrong place) and a compressed prefix is a partial group (the kernels
-    grid an axis the pooling did not produce).  Both failures are silent downstream, so the check
-    is a precondition rather than a diagnostic.
+    ``cp_size * compress_ratio`` is the alignment one entry is padded to (the stack-wide lcm is
+    the dataloader's); without it a chunk is ragged (rows land in the wrong place) and a compressed
+    prefix is a partial group (the kernels grid an axis the pooling did not produce).  Both failures
+    are silent downstream, so the check is a precondition rather than a diagnostic.
     """
-    positions = _positions(*documents)
-    owner = _HookOwner()
     with pytest.raises(ValueError, match="document alignment"):
-        owner.masks(positions, cp_size, cp_size - 1)
+        _masks(_positions(*documents), cp_size, cp_size - 1)
 
 
 def test_the_exchange_carries_the_movement_and_the_positions():
@@ -233,10 +286,7 @@ def _emulate(tensors: list[torch.Tensor], plans: list[ExchangeMetadata], *, inve
     outs = []
     for rank in range(size):
         received = torch.cat(
-            [
-                presents[source][offsets[source][rank] : offsets[source][rank + 1]]
-                for source in range(size)
-            ]
+            [presents[source][offsets[source][rank] : offsets[source][rank + 1]] for source in range(size)]
         )
         if inverse:
             slab = torch.empty((sum(splits[rank][0]), *received.shape[1:]), dtype=received.dtype)
@@ -258,19 +308,17 @@ def test_the_frames_say_the_queries_are_the_chunks_and_the_kv_streams_are_the_ro
     for cu, cp_size in _CASES:
         chunk = (torch.tensor(cu[1:]) - torch.tensor(cu[:-1])) // cp_size
         for rank in range(cp_size):
-            masks = _HookOwner().masks(_positions(*[e - s for s, e in zip(cu[:-1], cu[1:])]), cp_size, rank)
+            masks = _masks(_positions(*[e - s for s, e in pairwise(cu)]), cp_size, rank)
             assert masks.exchange is not None
             assert masks.q.cu_seqlens.tolist() == (torch.tensor(cu) // cp_size).tolist()
             assert masks.q.seqused.tolist() == chunk.tolist()
             assert masks.swa_k.cu_seqlens.tolist() == list(cu)
             assert masks.swa_k.seqused.tolist() == ((rank + 1) * chunk).tolist()
-            for ratio, frame in masks.cmp_k.items():
-                assert frame.cu_seqlens.tolist() == (torch.tensor(cu) // ratio).tolist()
-                assert frame.seqused.tolist() == (((rank + 1) * chunk) // ratio).tolist()
-                if ratio == 1:
-                    assert frame.residual is None
-                else:
-                    assert frame.residual.tolist() == [0] * (len(cu) - 1)
+            frame = masks.cmp_k
+            assert frame is not None and masks.ratio == _RATIO
+            assert frame.cu_seqlens.tolist() == (torch.tensor(cu) // _RATIO).tolist()
+            assert frame.seqused.tolist() == (((rank + 1) * chunk) // _RATIO).tolist()
+            assert frame.residual.tolist() == [0] * (len(cu) - 1)
             # ``positions_q`` rides shaped like the input, so the oracle is compared flat.
             assert masks.positions_q.reshape(-1).tolist() == _oracle_positions(list(cu), cp_size, rank)
 
@@ -282,95 +330,60 @@ def test_the_unsharded_forward_is_unchanged():
     *is* the document -- so the unsharded path is the same derivation rather than a branch, and
     the metadata it builds is the one geometry both the torch-native and the fused paths read.
     """
-    masks = _HookOwner().masks(_positions(8, 16), 1, 0)
+    masks = _masks(_positions(8, 16))
     assert masks.exchange is None
     torch.testing.assert_close(masks.positions_q, _positions(8, 16))
     assert masks.q.cu_seqlens.tolist() == [0, 8, 24]
     assert masks.q.seqused.tolist() == [8, 16]
     assert masks.swa_k.cu_seqlens.tolist() == [0, 8, 24]
     assert masks.swa_k.seqused.tolist() == [8, 16]
-    assert sorted(masks.cmp_k) == [1, 2]
-    assert masks.cmp_k[1].seqused.tolist() == [8, 16]
-    assert masks.cmp_k[2].seqused.tolist() == [4, 8]
-    assert masks.cmp_k[2].cu_seqlens.tolist() == [0, 4, 12]
+    assert masks.cmp_k is not None and masks.ratio == _RATIO
+    assert masks.cmp_k.seqused.tolist() == [4, 8]
+    assert masks.cmp_k.cu_seqlens.tolist() == [0, 4, 12]
 
 
-def test_the_hook_attaches_the_plan_and_slices_the_inputs():
-    """``build_attention_masks`` derives the plan from the **global** row, then shards.
+def test_the_cp_transform_carries_the_plan_and_recuts_the_frames():
+    """The transform is handed the **global** row and returns this rank's chunks.
 
-    The plan cannot be derived from the slab, and the frames cannot either, so this is the one
-    place both the whole row and the mesh meet: the inputs it returns are the slab in plain
-    rank order, the positions it forwards describe that slab, and the metadata carries the
-    plan those rows were addressed by.
+    The plan cannot be derived from the slab and the frames cannot either, so this is the one
+    place both the whole row and the rank meet: the split vectors say where this rank's rows
+    go, and the frames address the chunks those rows become.  The input slice itself is the
+    framework's -- one even ``Shard(1)`` slab per rank when no load balancer is configured --
+    which is why the transform is handed the shard *width* rather than the tensor.
     """
     row = _positions(8, 16)
-    tokens = torch.zeros_like(row)
     for cp_size in (2, 4):
         for cp_rank in range(cp_size):
-            extra = {"positions": row.clone()}
-            inputs, _, extra = _HookOwner().build_attention_masks(
-                tokens, tokens, extra, cp_mesh=_Mesh(cp_size, cp_rank)
-            )
             slab = row.numel() // cp_size
-            torch.testing.assert_close(extra["positions"], row[..., cp_rank * slab : (cp_rank + 1) * slab])
-            assert inputs.shape[-1] == slab
-            masks = extra["attention_masks"]
-            assert masks.exchange is not None
+            masks = _masks(row, cp_size, cp_rank)
             plan = masks.exchange
+            assert plan is not None
             assert list(plan.send_split) == _oracle_splits([0, 8, 24], cp_size, slab)[cp_rank].tolist()
             assert sum(plan.recv_split) == slab
             assert sorted(plan.send_index.tolist()) == list(range(slab))
+            # The carried positions ride shaped like the input, so no consumer reshapes.
+            torch.testing.assert_close(masks.positions_q, plan.positions_q.reshape(1, slab))
+            assert masks.q.seqused.tolist() == [8 // cp_size, 16 // cp_size]
+            assert masks.swa_k.seqused.tolist() == [(cp_rank + 1) * 8 // cp_size, (cp_rank + 1) * 16 // cp_size]
+
+
+def test_the_transform_rejects_a_slab_the_row_does_not_grid():
+    """A shard width the documents do not add up to means the frames describe another row.
+
+    The launcher's cut is even, so the chunks sum to the slab by construction; anything else
+    means the metadata came from a different row than the inputs were sliced from, and the
+    kernels would grid it silently.
+    """
+    with pytest.raises(ValueError, match="not the chunks' total"):
+        shard_asc_v41_metadata(
+            build_fused_metadata(_row(_positions(8, 16)), ratio=_RATIO, geometry=_GEOMETRY),
+            cp_size=2,
+            cp_rank=0,
+            batch_size=2,
+            seq_len=12,
+        )
 
 
 def test_the_model_takes_a_context_parallel_degree():
     """The text stack admits CP; the layout above is what it was waiting for."""
     assert DeepSeekV41Model.Config.accepts_context_parallel is True
-
-
-class _HookOwner:
-    """The model's metadata builders, without the rest of the model.
-
-    ``_frame`` and the hook have to stay staticmethods/methods when they are grafted on, or
-    ``self`` becomes their first argument.
-    """
-
-    compress_ratios = _RATIOS
-    engram_history_size = 0
-    # The model's mask post-process seam: a stand-in bypasses ``__init__``, so it
-    # states the pre-extension answer -- none, the masks pass through untouched.
-    _metadata_extension = None
-    # The hook is a method, so a stand-in presents the pieces it reaches for: the frame builders,
-    # taken from the model itself, and the sharded half.  ``_frame`` is a staticmethod there, so it
-    # is grafted as one -- a plain assignment would make it an instance method here.
-    get_attention_masks = DeepSeekV41Model.get_attention_masks
-    _row_metadata = DeepSeekV41Model._row_metadata
-    _sharded_attention_masks = DeepSeekV41Model._sharded_attention_masks
-    build_attention_masks = DeepSeekV41Model.build_attention_masks
-    _frame = staticmethod(DeepSeekV41Model._frame)
-
-    def masks(self, positions, cp_size: int = 1, cp_rank: int = 0) -> DeepSeekV41Metadata:
-        """The hook's two paths, without the slicing: the row's metadata, or the sharded one."""
-        if cp_size == 1:
-            return self.get_attention_masks(positions)
-        slab = positions.numel() // cp_size
-        lo = cp_rank * slab
-        return self._sharded_attention_masks(
-            self._row_metadata(positions),
-            positions[..., lo : lo + slab],
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-        )
-
-
-class _Mesh:
-    """The two ``cp_mesh`` methods the hook reads, without a real process group."""
-
-    def __init__(self, size: int, rank: int):
-        self._size = size
-        self._rank = rank
-
-    def size(self) -> int:
-        return self._size
-
-    def get_local_rank(self) -> int:
-        return self._rank

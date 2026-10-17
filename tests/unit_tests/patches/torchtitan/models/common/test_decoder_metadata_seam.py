@@ -25,7 +25,6 @@ from torchtitan.protocols.module import Module
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
 from torchtitan_npu.patches.torchtitan.models.common import decoder as decoder_patch
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
-    CPInnerAttention,
     cp_shard_context,
 )
 from torchtitan_npu.patches.torchtitan.trainer import patched_post_dataloading_process
@@ -91,8 +90,28 @@ class _Layer(BaseAttention):
         return x
 
 
-class _CPBackend(CPInnerAttention, Module):
-    """Inner-attention double that owns the transform on its class (upstream #4617)."""
+class _CPMetadata:
+    """Metadata double that owns the transform (upstream #4617's hook, on the rebuilt object)."""
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        _CPBackend.events.append("prepare")
+        _CPBackend.calls.append((attention_metadata, permutation, cp_shard_context()))
+        return "rank-local"
+
+
+class _RefusingMetadata:
+    """A CP metadata whose transform refuses this rank's copy (the V3.2 reference core's shape)."""
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        del attention_metadata, permutation
+        _RefusingBackend.events.append("prepare")
+        raise RuntimeError("this backend cannot be sharded for CP")
+
+
+class _CPBackend(Module):
+    """Inner-attention double whose built metadata is the one that shards itself."""
 
     calls: list = []
     events: list = []
@@ -108,23 +127,22 @@ class _CPBackend(CPInnerAttention, Module):
     def __init__(self, config) -> None:
         super().__init__()
 
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        _CPBackend.events.append("prepare")
-        _CPBackend.calls.append((attention_metadata, permutation, cp_shard_context()))
-        return "rank-local"
-
 
 class _RefusingBackend(_CPBackend):
-    """A CP backend whose transform refuses this rank's copy (the V3.2 reference core's shape)."""
+    """Same, for the refusal: the metadata it builds is the one that raises."""
+
+    events: list = []
+
+
+class _LegacyBackend(_CPBackend):
+    """Doubles that still host the transform on their class, as upstream does: inert here."""
 
     events: list = []
 
     @staticmethod
     def prepare_cp_metadata(attention_metadata, *, permutation):
-        del attention_metadata, permutation
-        _RefusingBackend.events.append("prepare")
-        raise RuntimeError("this backend cannot be sharded for CP")
+        _LegacyBackend.events.append("prepare")
+        return "rank-local"
 
 
 def _layer(record=None, builds=None, geometry=None) -> _Layer.Config:
@@ -132,18 +150,25 @@ def _layer(record=None, builds=None, geometry=None) -> _Layer.Config:
 
 
 def _model(layers) -> Decoder:
-    return Decoder(Decoder.Config(
-        dim=8, vocab_size=16, layers=layers,
-        tok_embeddings=Embedding.Config(num_embeddings=16, embedding_dim=8),
-        norm=RMSNorm.Config(normalized_shape=8),
-        lm_head=Linear.Config(in_features=8, out_features=16),
-    ))
+    return Decoder(
+        Decoder.Config(
+            dim=8,
+            vocab_size=16,
+            layers=layers,
+            tok_embeddings=Embedding.Config(num_embeddings=16, embedding_dim=8),
+            norm=RMSNorm.Config(normalized_shape=8),
+            lm_head=Linear.Config(in_features=8, out_features=16),
+        )
+    )
 
 
 def _preprocess(model, parallel_dims=_NO_CP, parallelism=_NO_SPMD):
     return model.preprocess_inputs(
-        {"input": _TOKENS, "positions": _POSITIONS}, _TOKENS,
-        parallel_dims=parallel_dims, device=_TOKENS.device, parallelism=parallelism,
+        {"input": _TOKENS, "positions": _POSITIONS},
+        _TOKENS,
+        parallel_dims=parallel_dims,
+        device=_TOKENS.device,
+        parallelism=parallelism,
     )
 
 
@@ -160,20 +185,29 @@ def _shard(monkeypatch, events: list, entries=None, positions=None, load_balance
 
     monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", fake_prepare)
     tokens = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
-    return Decoder._cp_shard(SimpleNamespace(), tokens, tokens, extra_kwargs, cp_mesh=_MESH,
-                             device=torch.device("cpu"), load_balancer_type=load_balancer_type)
+    return Decoder._cp_shard(
+        SimpleNamespace(),
+        tokens,
+        tokens,
+        extra_kwargs,
+        cp_mesh=_MESH,
+        device=torch.device("cpu"),
+        load_balancer_type=load_balancer_type,
+    )
 
 
 def test_forward_dispatches_per_layer_and_broadcasts_without_a_map():
     """One microbatch builds one entry per key and each layer reads its own; no map broadcasts one mask."""
     builds: list = []
     r1, r4 = object(), object()
-    model = _model([
-        _layer(r1, builds, _Geometry(1)),
-        _layer(r1, builds, _Geometry(1)),  # the same geometry, not the same config instance
-        _layer(r4, builds, _Geometry(4)),
-        _layer(None, builds, _Geometry(8)),  # a builder that contributes no entry
-    ])
+    model = _model(
+        [
+            _layer(r1, builds, _Geometry(1)),
+            _layer(r1, builds, _Geometry(1)),  # the same geometry, not the same config instance
+            _layer(r4, builds, _Geometry(4)),
+            _layer(None, builds, _Geometry(8)),  # a builder that contributes no entry
+        ]
+    )
     attention_metadata = model._get_attention_metadata(_POSITIONS)
 
     assert builds == [_Geometry(1), _Geometry(4), _Geometry(8)]  # one build per geometry, not per layer
@@ -210,8 +244,9 @@ def test_input_annotation_is_spmd_types_only_and_full_dtensor_is_rejected(monkey
     input_dict = {"input": inputs, "positions": _POSITIONS}
     # A bare receiver survives no step at all, so the ValueError is the proof that the guard runs first.
     with pytest.raises(ValueError, match="full_dtensor"):
-        decoder_patch.preprocess_inputs(SimpleNamespace(), input_dict, inputs, parallel_dims=_NO_CP,
-                                        device=inputs.device, parallelism=_FULL_DTENSOR)
+        decoder_patch.preprocess_inputs(
+            SimpleNamespace(), input_dict, inputs, parallel_dims=_NO_CP, device=inputs.device, parallelism=_FULL_DTENSOR
+        )
     assert list(input_dict) == ["input", "positions"] and input_dict["input"] is inputs  # nothing was wrapped
 
 
@@ -222,8 +257,13 @@ def test_the_step_counts_the_local_labels_the_seam_hands_back(monkeypatch):
         return inputs[:, :_SHARD_LEN], labels[:, :_SHARD_LEN], extra_kwargs
 
     monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", shard)
-    trainer = SimpleNamespace(model_parts=[_model([_layer()])], ntokens_seen=16, device=_TOKENS.device,
-                              parallel_dims=_CP, config=SimpleNamespace(parallelism=_NO_SPMD))
+    trainer = SimpleNamespace(
+        model_parts=[_model([_layer()])],
+        ntokens_seen=16,
+        device=_TOKENS.device,
+        parallel_dims=_CP,
+        config=SimpleNamespace(parallelism=_NO_SPMD),
+    )
 
     patched_post_dataloading_process(trainer, {"input": _TOKENS, "positions": _POSITIONS}, _TOKENS)
 
@@ -256,7 +296,7 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     """The map is prepared after the shard, from the row the shard started from; no map is left alone."""
     events: list = []
     _CPBackend.calls, _CPBackend.events = [], events
-    record, untouched = object(), object()
+    record, untouched = _CPMetadata(), object()
     positions = torch.zeros(1, _SEQ_LEN, dtype=torch.int64)
     inputs, labels, out = _shard(monkeypatch, events, {_CPBackend: record, "untouched": untouched}, positions)
 
@@ -264,8 +304,8 @@ def test_cp_shard_owns_the_rank_local_map(monkeypatch):
     assert out["attention_metadata"][_CPBackend] == "rank-local"
     assert out["attention_metadata"]["untouched"] is untouched  # a key without the hook passes through
     assert out["positions"].shape[-1] == inputs.shape[-1] == _SHARD_LEN and labels.shape[-1] == _SEQ_LEN
-    # The transform is the backend class' own static method, handed the permutation
-    # alone (upstream #4617).
+    # The transform is the metadata's own static method, handed the permutation alone
+    # (upstream #4617's hook, hosted by the object being rebuilt).
     handed, permutation, context = _CPBackend.calls[0]
     assert handed is record
     assert permutation.tolist() == _HEADTAIL_PERMUTATION
@@ -288,6 +328,21 @@ def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):
     events: list = []
     _RefusingBackend.events = events
     with pytest.raises(RuntimeError, match="cannot be sharded for CP"):
-        _shard(monkeypatch, events, {_RefusingBackend: object()})
+        _shard(monkeypatch, events, {_RefusingBackend: _RefusingMetadata()})
 
     assert events == ["shard", "prepare"]
+
+
+def test_a_hook_on_the_backend_class_is_not_consulted(monkeypatch):
+    """The seam asks the metadata, never the key: a class-hosted hook cannot fire."""
+    events: list = []
+    _LegacyBackend.events = []
+
+    class _PlainMetadata:
+        pass
+
+    _, _, out = _shard(monkeypatch, events, {_LegacyBackend: _PlainMetadata()})
+
+    assert events == ["shard"]  # no "prepare": the class' hook was never reached
+    assert _LegacyBackend.events == []
+    assert isinstance(out["attention_metadata"][_LegacyBackend], _PlainMetadata)

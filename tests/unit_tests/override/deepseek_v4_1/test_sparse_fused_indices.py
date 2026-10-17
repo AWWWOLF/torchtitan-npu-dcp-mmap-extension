@@ -10,6 +10,7 @@ from itertools import pairwise
 import pytest
 import torch
 
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
 
 
@@ -24,9 +25,18 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
     a TND kernel wants ``[T, N2, K]``.
     """
     length = bounds[-1]
-    metadata = v41_metadata(bounds)
-    assert torch.equal(metadata.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
-    cu_cmp = metadata.frame_for(ratio).cu_seqlens
+    # The entry this layer would read in a run: its own ratio's frames and, for the selection's
+    # width, its own geometry's records -- this test replaces the kernel node wholesale, so what
+    # it pins is the layout the node is handed, but the metadata is still the real pairing.
+    metadata = v41_metadata(
+        bounds,
+        ratio=ratio,
+        geometry=AicpuGeometry(
+            window_size=2, num_heads=2, head_dim=4, index_topk=5, index_num_heads=2, index_head_dim=4
+        ),
+    )
+    assert torch.equal(metadata.cu_seq_q, torch.tensor(bounds, dtype=torch.int32))
+    cu_cmp = metadata.cmp_k.cu_seqlens
 
     # Document-local indices, -1 for unused slots, interleaved: another document's first
     # entry, the first/last own entry, an unused slot and an exclusive-end index -- the
@@ -44,7 +54,19 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
         return torch.zeros_like(q), torch.zeros((1, q.shape[0], q.shape[1]))
 
     monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
-    attention = ascendc.AscV41SparseAttention.Config(window_size=2, softmax_scale=0.5, compress_ratio=ratio).build()
+    attention = ascendc.AscV41SparseAttention.Config(
+        window_size=2,
+        softmax_scale=0.5,
+        compress_ratio=ratio,
+        # The kernel node is replaced below, so this test is about the selection's layout rather
+        # than about the record lookup; the config still states the geometry the metadata above
+        # was sized with, the way a run pairs them.
+        num_heads=2,
+        head_dim=4,
+        index_topk=5,
+        index_num_heads=2,
+        index_head_dim=4,
+    ).build()
     q = torch.zeros((1, length, 2, 4), dtype=torch.bfloat16)
     topk_before = indices.clone()
     out = attention(
@@ -125,7 +147,20 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
         shared,
         indices,
         sink,
-        v41_metadata([0, 4]),  # attention_masks: the frames the kernels grid
+        # The entry this layer reads: the geometry the ``apply`` signature is driven with below
+        # (two heads of width four, a window of two, and a two-wide selection).
+        v41_metadata(
+            [0, 4],
+            ratio=2 if with_shared else 0,
+            geometry=AicpuGeometry(
+                window_size=2,
+                num_heads=2,
+                head_dim=4,
+                index_topk=2,
+                index_num_heads=2,
+                index_head_dim=4,
+            ),
+        ),
         0.5,
         2 if with_shared else 0,
         2,

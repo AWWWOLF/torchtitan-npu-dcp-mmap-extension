@@ -173,10 +173,7 @@ def test_the_ascendc_entry_prepares_this_ranks_copy_for_context_parallel():
     global_entry = AscVarlenMetadata.from_varlen(v32_model.build_reference_varlen_metadata(_POSITIONS))
     assert global_entry.actual_seq_qlen == _CU_SEQ[1:]
 
-    locals_per_rank = [
-        _prepare_for_rank(AscSparseInnerAttention, global_entry, rank)
-        for rank in range(2)
-    ]
+    locals_per_rank = [_prepare_for_rank(AscVarlenMetadata, global_entry, rank) for rank in range(2)]
 
     for entry in locals_per_rank:
         assert isinstance(entry.varlen_meta, CPVarlenMetadata)
@@ -198,10 +195,11 @@ def test_the_reference_core_refuses_context_parallel_while_preparing():
     entry = v32_model.build_reference_varlen_metadata(_POSITIONS)
 
     with pytest.raises(ValueError, match="not context-parallel"):
-        _prepare_for_rank(SparseInnerAttention, entry, 0)
+        _prepare_for_rank(ReferenceVarlenMetadata, entry, 0)
 
-def _prepare_for_rank(backend, attention_metadata, rank: int):
-    """Run one backend's CP transform the way ``Decoder._cp_shard`` does.
+
+def _prepare_for_rank(metadata_type, attention_metadata, rank: int):
+    """Run one metadata type's CP transform the way ``Decoder._cp_shard`` does.
 
     The transform takes the permutation alone (upstream #4617); what it cannot
     recover -- the mesh, the load-balancer type and the *pre-shard* positions --
@@ -212,4 +210,4 @@ def _prepare_for_rank(backend, attention_metadata, rank: int):
         load_balancer_type="headtail",
         positions=_POSITIONS,
     ):
-        return backend.prepare_cp_metadata(attention_metadata, permutation=None)
+        return metadata_type.prepare_cp_metadata(attention_metadata, permutation=None)

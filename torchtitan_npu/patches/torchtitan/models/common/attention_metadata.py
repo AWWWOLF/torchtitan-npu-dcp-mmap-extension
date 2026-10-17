@@ -59,7 +59,7 @@ from collections.abc import Hashable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 import torchtitan.models.common.attention
@@ -70,7 +70,6 @@ from torchtitan.protocols.module import Module
 __all__ = [
     "AttentionMetadata",
     "AttentionMetadataMap",
-    "CPInnerAttention",
     "VarlenAttentionMetadata",
 ]
 
@@ -134,28 +133,6 @@ def _attention_wrapper_metadata_key(self) -> Hashable:
     return self.inner_attention.attention_metadata_key
 
 
-class CPInnerAttention:
-    """The CP hook carrier (upstream #4617's ``CPInnerAttention``).
-
-    Upstream declares this next to its inner-attention base: the backend class
-    owns ``prepare_cp_metadata``, and ``Decoder._cp_shard`` transforms a map
-    entry by asking the class its key names.  Here it is a bare mixin, because
-    the pinned version's CP-capable cores share no base (V3.2's is a
-    ``VarlenAttention``, V4's a plain ``Module``); the subclasses are unchanged
-    otherwise, so the pin bump keeps the classes and swaps the base.
-
-    A backend that mixes this in and cannot shard its metadata raises from its
-    own transform; one that does not mix it in passes through untouched.
-    """
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata: Any, *, permutation: torch.Tensor | None) -> Any:
-        raise NotImplementedError(
-            f"{type(attention_metadata).__name__}'s backend mixes in CPInnerAttention "
-            "without implementing prepare_cp_metadata"
-        )
-
-
 @dataclass(frozen=True)
 class CPShardContext:
     """What a backend's CP transform reads here (upstream: ``ParallelismContext``).
@@ -209,11 +186,15 @@ def prepare_cp_metadata_map(
 ) -> dict[Hashable, Any]:
     """Rank-local metadata for context parallel (upstream #4617's CP half).
 
-    Upstream's loop, per map entry: a key that carries the CP hook is rebuilt by
-    that backend class' ``prepare_cp_metadata``, and every other entry passes
-    through unchanged (the Ulysses case, where metadata stays global).  A
-    backend that cannot be sharded raises from its own transform rather than
-    letting a layer read a layout its rank does not hold.
+    One rule, per map entry: a metadata that carries ``prepare_cp_metadata`` is rebuilt by
+    it, and every entry that does not passes through unchanged (the Ulysses case, where the
+    metadata stays global).  A backend that cannot be sharded raises from its own metadata's
+    transform rather than letting a layer read a layout its rank does not hold.
+
+    Upstream hosts the hook on the backend class and finds it through the map key.  Here it
+    lives on the metadata class, because that is the object being rebuilt -- same signature,
+    same staticmethod shape, one owner -- and because it makes the key pure addressing:
+    anything hashable may address an entry, and no key has to look like a class.
 
     The transform is handed the permutation alone, as upstream does; the pinned
     version has no ambient parallelism context, so the mesh, the load-balancer
@@ -222,11 +203,8 @@ def prepare_cp_metadata_map(
     """
     prepared: dict[Hashable, Any] = {}
     for key, metadata in attention_metadata.items():
-        if isinstance(key, type) and issubclass(key, CPInnerAttention):
-            backend = cast("type[CPInnerAttention]", key)
-            prepared[key] = backend.prepare_cp_metadata(metadata, permutation=permutation)
-        else:
-            prepared[key] = metadata
+        hook = getattr(type(metadata), "prepare_cp_metadata", None)
+        prepared[key] = metadata if hook is None else hook(metadata, permutation=permutation)
     return prepared
 
 
@@ -238,13 +216,11 @@ def apply() -> None:
     attention.VarlenAttentionMetadata = VarlenAttentionMetadata  # pyrefly: ignore [missing-attribute]
     attention.AttentionMetadata = AttentionMetadata  # pyrefly: ignore [missing-attribute]
     attention.AttentionMetadataMap = AttentionMetadataMap  # pyrefly: ignore [missing-attribute]
-    attention.CPInnerAttention = CPInnerAttention  # pyrefly: ignore [missing-attribute]
     if hasattr(attention, "__all__"):
         for name in (
             "VarlenAttentionMetadata",
             "AttentionMetadata",
             "AttentionMetadataMap",
-            "CPInnerAttention",
         ):
             if name not in attention.__all__:
                 attention.__all__.append(name)

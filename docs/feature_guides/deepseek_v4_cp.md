@@ -38,7 +38,7 @@ NGPU=2 \
 
 以下决策是当前方案的设计依据，接手开发时应保持，不做反向重构。
 
-1. **单一 metadata 接缝**。模型以 `build_attention_masks(inputs, labels, extra_kwargs, *, cp_mesh, load_balancer_type)` 统一构建每 batch 的 metadata：CP 时在其中完成输入切分与计划推导，vendor 内核张量由配置解析的 `metadata_extension`（`AscMetadataExtension`）在最后一步填充。接缝只有一处。DeepSeek-V3.2 已迁到上游 backend-owned 接缝（attention backend 自己的 `Config.build_attention_metadata` 与 `prepare_cp_metadata`，见[多后端算子接入](fused_ops.md)）；V4/V4.1 收敛到同一接缝的工作另行推进。
+1. **单一 metadata 接缝**。模型以 `build_attention_masks(inputs, labels, extra_kwargs, *, cp_mesh, load_balancer_type)` 统一构建每 batch 的 metadata：CP 时在其中完成输入切分与计划推导，vendor 内核张量由配置解析的 `metadata_extension`（`AscMetadataExtension`）在最后一步填充。接缝只有一处。DeepSeek-V3.2 已迁到上游 backend-owned 接缝（attention backend 自己的 `Config.build_attention_metadata` 与 `prepare_cp_metadata`，见[多后端算子接入](fused_ops.md)）；V4.1 也已迁入该接缝（entry 由 `AscV41SparseAttention.Config.build_attention_metadata` 构建：参考后端在这一步给出整行的 document 边界，并按自己的 `compress_ratio` 一次折成 `cu_seq_k`（池化轴），端口在这两个 grid 上加自己的 kernel frame 与 `aicpu_metadata` 里的四条记录；CP 由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建；V4.1 的 map key 是 `(端口类, compress_ratio)`，一层一个几何、每个几何一份 entry，参考核直接读 `cu_seq_q` / `cu_seq_k`，不再自己除 ratio，本文描述的 V4 路径仍待迁移）。
 
 2. **纯本地计划**。`build_cp_plan` 输入 `(global_varlen, load_balancer, rank, cp_size, shard_len, window_size, ratios)`，用 `_RankMesh` 垫片逐 rank 调用 `CPVarlenMetadata.from_global`，返回 `(rank-local varlen, plans, window)`。全局上下文（切分前的文档结构 + 置换）在 `build_attention_masks` 帧内即可获得，因此计划阶段零通信，且推导出的 rank-local varlen 与 shard 路径的产物一致。
 

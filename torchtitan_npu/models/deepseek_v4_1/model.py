@@ -40,17 +40,13 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.tools.logging import logger
 
-from torchtitan_npu.models.common.metadata_extension import MetadataExtension
-
-from .context_parallel import ExchangeMetadata, cp_plan, document_bounds
 from .engram import Engram  # noqa: TC001
 from .indexer import IndexerMode
 from .mhc import HcPost, HcPre
@@ -58,7 +54,10 @@ from .mhc import HcPost, HcPre
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE
 
+    from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import AttentionMetadataMap
+
     from .attention import Attention
+    from .context_parallel import ExchangeMetadata
     from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
 
@@ -85,50 +84,26 @@ def compression_alignment(compress_ratios: tuple[int, ...]) -> int:
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class KernelFrame:
-    """One tensor's coordinate frame: the boundaries needed to address it.
-
-    The tensors of a forward -- the query row and the two KV streams -- do **not** share a
-    frame in general, so each carries its own and every consumer reads the frame of the tensor
-    it is addressing rather than assuming one of them.
-
-    ``cu_seqlens`` are the ragged document boundaries (``int32``, ``n_documents + 1``): the
-    packed offsets Attention Gym's ``gather_attn`` takes as ``cu_seqlens``/``cu_seqlens_k``,
-    and the form the kernels take as ``cu_seqlens_*``.  ``seqused`` is the per-document prefix
-    this frame's consumer needs, ``residual`` the trailing partial group of a compressed axis
-    (``None`` where the axis is not compressed, which the kernels reject a value for).
-
-    **Context parallel.**  With one packed row per rank and no sharding, every frame is the
-    row itself.  CP will move the query side's boundaries and the KV side's
-    ``seqused``/``residual`` -- that is, this dataclass and nothing else -- which is why the
-    frames are named after the tensor rather than after the field.
-    """
-
-    cu_seqlens: torch.Tensor
-    seqused: torch.Tensor
-    residual: torch.Tensor | None = None
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
 class DeepSeekV41Metadata:
-    """Per-forward varlen metadata, built by :meth:`V41Model.get_attention_masks`.
+    """The packed row's frames, built by the attention backends' config.
 
-    One geometry, read by both paths: one frame per addressed tensor -- the row's boundaries
-    and each compressed stream's -- which the torch-native core and selector read exactly as
-    the fused ports grid them.
-
-    ``q`` and ``swa_k`` run at full resolution, so one frame each serves the whole forward.
-    The compressed streams do not: every ratio>0 layer pools at *its own* ratio, so there is
-    one frame per ratio the stack uses, looked up with :meth:`frame_for` rather than derived
-    by each consumer.  At CP=1 every frame is the row itself; under context parallelism the
-    query frame becomes this rank's chunks while the KV frames stay the gathered row, a
-    difference the fused ports read through ``seqused``.  The torch-native core and selector
-    are an unsharded path: a context-parallel run uses the fused ports.
+    Upstream's pair of cumulative boundaries -- ``cu_seq_q`` for the queries and ``cu_seq_k`` for
+    the keys this entry addresses -- plus the query side's own positions and, under context
+    parallelism, its movement.  ``cu_seq_k`` is the **pool grid**: an entry belongs to one
+    compression ratio (the metadata map key carries it), so the backend that builds the entry
+    pools the row there and no consumer divides by its ratio at call time.  A layer that pools at
+    all but addresses the row itself (ratio 0 or 1) gets ``cu_seq_k == cu_seq_q``.
     """
 
-    q: KernelFrame
-    swa_k: KernelFrame
-    cmp_k: dict[int, KernelFrame]
+    cu_seq_q: torch.Tensor
+    """Packed document boundaries of the row (``int32``, ``n_documents + 1``): the offsets
+    Attention Gym's ``gather_attn`` takes as ``cu_seqlens`` and the kernels as ``cu_seqlens_*``."""
+
+    cu_seq_k: torch.Tensor
+    """The key side's boundaries this entry addresses: the row's own for a layer that does not
+    pool, its ``compress_ratio``-folded grid for one that does.  Precomputed by the backend that
+    knows the ratio, so the core reads a boundary set instead of dividing one per layer."""
+
     positions_q: torch.Tensor
     """The **query** frame's own positions.  The positions carried beside the input describe the
     keys -- under CP the queries are a permuted copy of the rows that carry them -- so every
@@ -138,16 +113,27 @@ class DeepSeekV41Metadata:
     """Under context parallelism the query side's movement: the query frame is this rank's
     chunks, and its ``positions_q`` carries the positions those chunks rotate at."""
 
-    def frame_for(self, ratio: int) -> KernelFrame | None:
-        """The frame of the compressed stream a layer at this ``ratio`` addresses.
+    @staticmethod
+    def prepare_cp_metadata(
+        attention_metadata: DeepSeekV41Metadata,
+        *,
+        permutation: torch.Tensor | None,
+    ) -> DeepSeekV41Metadata:
+        """Refuse context parallel: only the fused stack has a rank-local form.
 
-        A ratio-1 layer still consumes a compressed stream, but it does not pool: its
-        ``cmp_k`` is the row at full resolution, so its frame is ``q``'s and the kernels
-        reject a ``residual`` for it.  Only ratios above 1 are pooled and stored.
+        The row is the whole packed sequence, and this core hands one grid to both sides of the
+        attention, so a rank that holds a chunk has no metadata it could attend with.  A CP run
+        therefore stops here, before any layer runs, and the fused entry (``AscV41Metadata``)
+        overrides this with the frames and records built from the rank's own chunks.
         """
-        if ratio <= 0:
-            return None
-        return self.cmp_k[ratio]
+        del attention_metadata, permutation
+        raise ValueError(
+            "the V4.1 reference stack does not support context parallel: it hands one grid to "
+            "both sides of the attention, so it cannot describe a rank-local row. Enable the "
+            "fused stack (override.deepseek_v4_1.sparse_attn.asc and "
+            "override.deepseek_v4_1.lightning_indexer.asc) to run with "
+            "--parallelism.context-parallel-degree."
+        )
 
 
 class DeepSeekV41TransformerBlock(TransformerBlock):
@@ -181,7 +167,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_masks: DeepSeekV41Metadata | None,
+        attention_metadata: DeepSeekV41Metadata,
         positions: torch.Tensor | None = None,
         *,
         pre_mix: torch.Tensor,
@@ -217,7 +203,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         x, cmp_k, idx_k, topk_indices, topk_scores, candidates = self.attention(
             self.attention_norm(x),
             positions,
-            attention_masks,
+            attention_metadata,
             cmp_k=cmp_k,
             idx_k=idx_k,
             topk_indices=topk_indices,
@@ -231,6 +217,24 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         x = self.moe(self.ffn_norm(x), image_mask=image_mask)
         x = self.hc_post(x, residual, post, comb)
         return x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates
+
+
+def _layer_attention_metadata(attention_metadata: AttentionMetadataMap, layer: nn.Module) -> DeepSeekV41Metadata:
+    """The metadata one layer reads: its own map entry, keyed by its backend.
+
+    Upstream #4897 hands every layer the entry its own attention backend named, which is what
+    lets one stack carry several backends -- or, with a geometry key, several geometries of one
+    backend -- at once.  The key is the layer's own, so a missing entry means the config built
+    no metadata for a backend the layer runs: a failure, not a reason to hand the layer another
+    geometry's grid.
+    """
+    key = layer.attention.attention_metadata_key  # pyrefly: ignore [missing-attribute]
+    metadata = attention_metadata.get(key)
+    if metadata is None:
+        raise ValueError(f"no attention metadata was built for {key!r}")
+    # The map's value type is the pinned union (a Flex/Varlen mask or a varlen metadata); this
+    # stack's backends only ever publish the row contract, which is what the layer reads.
+    return cast("DeepSeekV41Metadata", metadata)
 
 
 # The two ports that, together, make V4.1's fused attention: the core emits the indexer's
@@ -313,13 +317,6 @@ class DeepSeekV41Model(Decoder):
         candidate_source_layer: int = 20
         candidate_topk_blocks: int = 2048
         candidate_block_size: int = 8
-        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        """Backend post-process of the built masks, run once per microbatch in
-        :meth:`build_attention_masks`.  The default is the identity; the fused
-        recipes swap it via the ``metadata_extension`` override to precompute
-        their kernel metadata, which is why the model dir fills its geometry
-        (heads, head dim, window, index top-k, ratios) here rather than the
-        override factory, which only sees this node."""
 
         def update_from_config(self, *, config, **kwargs):
             parallelism = config.parallelism
@@ -502,191 +499,43 @@ class DeepSeekV41Model(Decoder):
             (max(layer.engram.table.ngram_orders) - 1 for layer in cfg.layers if layer.engram is not None),
             default=0,
         )
-        # The per-microbatch metadata post-process (identity by default).  Built
-        # here rather than at each call so a swapped extension keeps whatever
-        # state it wants across batches; the model dir's geometry lives on the
-        # config, which ``Module`` does not keep.
-        self._metadata_extension = cfg.metadata_extension.build()
-        # The precompute only pays off when a fused core reads the records: a
-        # swapped extension over a reference (or quantized) attention stack is
-        # dead work, so the pairing is flagged here, once, while the config
-        # tree still exists -- a compile-time fact on the config classes, like
-        # every other cross-node check the model makes.
-        if type(cfg.metadata_extension) is not MetadataExtension.Config and not any(
-            getattr(type(layer.attention.inner_attention), "reads_asc_metadata", False) for layer in cfg.layers
-        ):
-            logger.warning(
-                "metadata_extension is overridden but no layer runs an attention core that "
-                "reads the precomputed records: enable sparse_attn.asc alongside asc_metadata "
-                "or drop the metadata override -- the per-microbatch precompute is dead work."
-            )
 
-    @staticmethod
-    def _frame(axis_cu_seqlens: torch.Tensor, axis_lengths: torch.Tensor, ratio: int) -> KernelFrame:
-        """One tensor's frame, from its own boundaries and its own per-document lengths.
-
-        One frame per axis, and every axis is described the same way -- where its segments
-        start, and how much of each segment it addresses -- so the ratio algebra lives here
-        while the builders that call it differ only in where the two arrays come from.
-        """
-        if ratio == 1:
-            # The uncompressed case: the frame is the tensor's own boundaries, and the kernels
-            # reject a ``residual`` for an axis they do not compress.
-            return KernelFrame(cu_seqlens=axis_cu_seqlens, seqused=axis_lengths)
-        # A document need not be a whole number of groups: the compressed axis' boundaries are
-        # the query's rounded down, and ``residual`` is what that rounding dropped, per document.
-        return KernelFrame(
-            cu_seqlens=(axis_cu_seqlens // ratio).to(torch.int32),
-            seqused=(axis_lengths // ratio).to(torch.int32),
-            residual=(axis_lengths % ratio).to(torch.int32),
-        )
-
-    def get_attention_masks(  # pyrefly: ignore [bad-override]
-        self, positions: torch.Tensor
-    ) -> DeepSeekV41Metadata:
-        """Build the **unsharded** forward's metadata: every frame is the row itself.
-
-        One grid, built once per forward and read by both paths: the torch-native core bounds
-        its sliding window with the query frame's boundaries and addresses the pool with the
-        compressed frame's, and the indexer derives its entry-axis reach from the same two --
-        the frames the fused ports grid.  Building it must never depend on which of the two
-        paths is enabled, which is what keeps a reference run and a fused run comparing the
-        same axes.
-
-        A sharded forward builds :meth:`_row_metadata` alone and cuts this rank's frames from
-        it (:meth:`_sharded_attention_masks`), because the whole row is what the fused ports
-        gather at their own boundary.
-        """
-        if positions is None:
-            raise ValueError("DeepSeek V4.1 requires positions to build its attention metadata")
-        return self._row_metadata(positions)
-
-    def _row_metadata(self, positions: torch.Tensor) -> DeepSeekV41Metadata:
-        """The whole row's metadata: one frame per addressed tensor, each of them the row.
-
-        Called at every degree -- the sharded forward cuts this rank's frames from this grid
-        rather than deriving it a second time -- so it stays free of anything only an unsharded
-        forward reads.
-        """
-        cu_seqlens = document_bounds(positions)
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        return DeepSeekV41Metadata(
-            q=self._frame(cu_seqlens, lengths, 1),
-            swa_k=self._frame(cu_seqlens, lengths, 1),
-            cmp_k={
-                ratio: self._frame(cu_seqlens, lengths, ratio)
-                for ratio in sorted({r for r in self.compress_ratios if r > 0})
-            },
-            positions_q=positions,
-        )
-
-    def _sharded_attention_masks(
+    def preprocess_inputs(
         self,
-        metadata: DeepSeekV41Metadata,
-        positions: torch.Tensor,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
         *,
-        cp_size: int,
-        cp_rank: int,
-    ) -> DeepSeekV41Metadata:
-        """Upgrade the row's metadata to this rank's chunks: the sharded forward's metadata.
+        parallel_dims,
+        device,
+        parallelism,
+        **kwargs,
+    ):
+        """Add the packed Engram halo, then run the shared seam.
 
-        The queries are chunk ``cp_rank`` of every document while the KV streams stay the
-        **whole row** -- gathered declaratively at the fused core's boundary -- so the KV frames'
-        ``cu_seqlens`` address that row and their ``seqused = K_d = (cp_rank + 1) · Q_d`` is how
-        far these queries reach into each document.  That is what keeps the kernels' end-aligned
-        window and causal limit anchored at this rank's chunk rather than at the row's end.
-
-        ``metadata`` is :meth:`_row_metadata` of the same row -- the whole row's grid -- and it is
-        where the boundaries come from: its query frame already carries them, so nothing is
-        derived twice.  ``positions`` is the slab, whose own positions are not the query frame's.
+        The halo is the only piece of the sharded forward the model still assembles itself:
+        it is derived from the **global** inputs, which exist only here -- the CP shard below
+        hands every rank its own slab -- and it is one slice, not metadata.  Document resets
+        are what the hashing masks, so a rank keeps the tokens before its slab and nothing
+        else.  Everything else -- the metadata map and the input shard -- is the shared
+        ``Decoder.preprocess_inputs``.
         """
-        bounds = metadata.q.cu_seqlens
-        lengths = metadata.q.seqused
-        # The launcher's contract, checked once per forward and per document: every document is a
-        # whole multiple of ``cp_size * lcm(ratios > 1)``.  Both halves are load-bearing -- the
-        # first makes every prefix a whole number of chunks, the second makes every compressed
-        # prefix a whole multiple of the ratio -- and a violation is silent downstream: a ragged
-        # chunk misplaces rows, and a ragged compressed prefix hands the kernels a partial group.
-        # The value is CP-independent, so the same padding must be used at every degree compared.
-        alignment = cp_size * math.lcm(*sorted({r for r in self.compress_ratios if r > 1}))
-        if bool((lengths % alignment).any()):
-            raise ValueError(
-                f"a document length is not a multiple of cp_size * lcm(compress_ratios > 1) = "
-                f"{alignment}: got {lengths.tolist()}. The dataloader's document alignment must "
-                "be a multiple of that value, the same one at every context-parallel degree "
-                "being compared (the padding is made of real tokens)."
-            )
-        chunk = (lengths // cp_size).to(torch.int32)
-        # The slab is what the chunk grid has to reproduce: the row is cut into ``cp_size`` slabs
-        # and the chunks are this rank's share of every document, so the two must size the same.
-        if int(chunk.sum()) != positions.numel():
-            raise ValueError(
-                f"the sliced rows ({positions.numel()}) are not the chunks' total "
-                f"({int(chunk.sum())}): the boundaries describe a different row than the one the "
-                "inputs were sliced from."
-            )
-        reach = ((cp_rank + 1) * chunk).to(torch.int32)
-        exchange = cp_plan(bounds, cp_size, cp_rank, positions.numel())
-        return DeepSeekV41Metadata(
-            q=self._frame((bounds // cp_size).to(torch.int32), chunk, 1),
-            swa_k=self._frame(bounds, reach, 1),
-            cmp_k={
-                ratio: self._frame(bounds, reach, ratio) for ratio in sorted({r for r in self.compress_ratios if r > 0})
-            },
-            positions_q=exchange.positions_q.reshape(positions.shape),
-            exchange=exchange,
+        if self.engram_history_size and parallel_dims.cp_enabled:
+            cp_mesh = parallel_dims.get_mesh("cp")
+            slab = input_dict["positions"].shape[-1] // cp_mesh.size()
+            lo = cp_mesh.get_local_rank() * slab
+            # Inputs are still global here: retain only the left halo, not a second copy of
+            # the full sequence.
+            input_dict["engram_token_history"] = input_dict["input"][
+                :, max(0, lo - self.engram_history_size) : lo
+            ].clone()
+        return super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+            input_dict,
+            labels,
+            parallel_dims=parallel_dims,
+            device=device,
+            parallelism=parallelism,
+            **kwargs,
         )
-
-    def build_attention_masks(self, inputs, labels, extra_kwargs, *, cp_mesh=None, load_balancer_type=None):
-        """Build the model-owned per-batch varlen metadata.
-
-        The pinned trainer calls this hook for models that own their metadata instead of
-        the Flex/Varlen ``get_attention_masks`` dispatch, so the model attaches its
-        metadata here.
-        """
-        del load_balancer_type
-        positions = extra_kwargs.get("positions")
-        if cp_mesh is None:
-            attention_masks = self.get_attention_masks(positions)
-        else:
-            # The whole row's grid is read here, before the slice, because it is the last point
-            # at which the row exists -- and it is *all* that is built: a sharded forward has no
-            # use for a description of the row itself.
-            row = self._row_metadata(positions)
-            cp_size, cp_rank = cp_mesh.size(), cp_mesh.get_local_rank()
-            slab = positions.numel() // cp_size
-            lo = cp_rank * slab
-            if self.engram_history_size:
-                # Inputs are still global here: retain only the left halo, not a
-                # second copy of the full sequence. Hashing masks document resets.
-                extra_kwargs["engram_token_history"] = inputs[:, max(0, lo - self.engram_history_size) : lo].clone()
-            inputs = inputs[:, lo : lo + slab]
-            labels = labels[:, lo : lo + slab]
-            positions = positions[:, lo : lo + slab]
-            extra_kwargs["positions"] = positions
-            attention_masks = self._sharded_attention_masks(row, positions, cp_size=cp_size, cp_rank=cp_rank)
-        # Every document must be a whole number of pooling groups, so the compressed axes
-        # have no partial trailing group and ``cmp_residual_kv`` is zero throughout.  A
-        # non-zero value here means the loader's document alignment and the stack's
-        # ``compress_ratios`` disagree -- the kernels would then grid an axis the pooling
-        # did not produce -- so it is checked rather than passed on.
-        for ratio, frame in attention_masks.cmp_k.items():
-            residual = frame.residual
-            if residual is not None and bool(residual.any()):
-                raise ValueError(
-                    f"compress_ratio {ratio} has a partial trailing group: a document "
-                    f"length is not a multiple of the pooling ratio ({residual.tolist()}). "
-                    "The dataloader's document alignment must be a multiple of every "
-                    "ratio in the stack's compress_ratios."
-                )
-        # The backend post-process runs once per microbatch, on whichever masks
-        # the forward built (sharded or not): the default is the identity, and
-        # the fused recipes swap it to precompute their kernel metadata at this
-        # eager boundary instead of per layer inside the compiled region.
-        if self._metadata_extension is not None:
-            attention_masks = self._metadata_extension(attention_masks)
-        extra_kwargs["attention_masks"] = attention_masks
-        return inputs, labels, extra_kwargs
 
     def _embedded_inputs(
         self,
@@ -712,8 +561,8 @@ class DeepSeekV41Model(Decoder):
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
-        attention_masks: DeepSeekV41Metadata | None = None,
         *,
+        attention_metadata: AttentionMetadataMap,
         input_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         engram_token_history: torch.Tensor | None = None,
@@ -725,6 +574,10 @@ class DeepSeekV41Model(Decoder):
         other layer returns what it was handed.  ``image_mask`` is the stack's only
         modality input: it is ``None`` on the text stack, which never has one, and the
         multimodal stack hands it the mask it derives from ``token_types``.
+
+        ``attention_metadata`` is the seam's per-layer map -- one entry per distinct
+        attention-backend key, built once per microbatch -- and every layer reads the entry
+        its own backend named.
         """
         hidden = self._embedded_inputs(tokens, input_embeds=input_embeds)
         input_ids = tokens.detach().long()
@@ -748,7 +601,7 @@ class DeepSeekV41Model(Decoder):
             ) = layer(
                 hidden,
                 input_ids,
-                attention_masks,
+                _layer_attention_metadata(attention_metadata, layer),
                 positions,
                 pre_mix=pre_mix,
                 cmp_k=cmp_k,
@@ -903,8 +756,8 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
-        attention_masks: DeepSeekV41Metadata | None = None,
         *,
+        attention_metadata: AttentionMetadataMap,
         pixel_values: torch.Tensor | None = None,
         image_grid: torch.Tensor | None = None,
         image_feature_indices: torch.Tensor | None = None,
@@ -928,7 +781,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         return super().forward(
             tokens,
             positions,
-            attention_masks,
+            attention_metadata=attention_metadata,
             input_embeds=embeds,
             image_mask=image_mask,
         )

@@ -91,9 +91,21 @@ torchtitan_npu/override/<scope>/<target>/
 - DeepSeek-V3.2 的 `AscSparseInnerAttention.Config.build_attention_metadata` 把公共的 varlen
   layout 包成 `AscVarlenMetadata` 并读出 TND 需要的 host 序列长度；`sparse_attn.asc` 调用
   `torch_npu.npu_lightning_indexer` 和 `torch_npu.npu_sparse_flash_attention`。
+- DeepSeek-V4.1 的 `AscV41SparseAttention.Config.build_attention_metadata` 建**这个几何自己**的
+  entry：参考后端的 builder 给出整行的 document 边界与按自身 `compress_ratio` 折好的 `cu_seq_k`
+  （池化轴，折一次，消费者不再除），端口在这两个 grid 上加自己的三个 kernel frame（`q` /
+  `swa_k` / `cmp_k`）与 `aicpu_metadata`——按自身几何调用 CANN `sparse_flash_mla_metadata` /
+  `sparse_flash_mla_grad_metadata` 与 `lightning_indexer_metadata` /
+  `sparse_lightning_indexer_kl_loss_grad_metadata` 得到的四条记录（每 microbatch 一次）。
+  `sparse_attn.asc` 逐层按 `(端口类, compress_ratio)` 取自己的 entry，直接读
+  `aicpu_metadata.sparse_attn` 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
+  几何（heads/head dim/indexer 三数）是该 config 自己的必填字段、无默认值，由 override 的五个参数
+  一次写入，默认值即 V4.1-Flash 的发布形状，因此没有单独的 metadata 入口。记录是内核 metadata
+  的唯一来源——没有 inline 回退：拿着没经过端口构建的 metadata 前向会直接失败。
+  CP 下由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建记录。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 生成 CANN `*_metadata`，
   `sparse_attn.asc` 桥接 LightningIndexer/SparseFlashMLA 的正反向；`sparse_attn.pypto` 用
-  PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。（V4/V4.1 尚未迁移到 backend-owned
+  PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。（V4 尚未迁移到 backend-owned
   接缝，仍由 `metadata_extension` 预计算。）
 - MoE token dispatcher 的 `npu_moe_token_unpermute` 与 `npu_moe_re_routing` 在
   `torchtitan_npu/ops/ascendc/` 中以 `torch.library.custom_op` 做编译兼容封装，并提供 Fake 和
@@ -172,9 +184,14 @@ python -m torchtitan_npu.train \
 
 - DeepSeek-V3.2 只需启用 `sparse_attn.asc`：attention 与它自己的 TND metadata 同属一个
   backend，metadata 由被替换的 config 直接构建，不再有单独的 metadata 入口。
+- DeepSeek-V4.1 的 `sparse_attn.asc` 同时替换 attention 并构建它自己的 metadata 记录，
+  没有单独的 metadata 入口；五个几何数是替换后 config 的必填字段，由该入口的参数写入
+  （默认值为 V4.1-Flash 形状），
+  与 `lightning_indexer.asc` 必须同开（教师边只有两侧都在时才存在），
+  见 `torchtitan_npu/override/README.md#deepseek-v41`。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 必须与 `sparse_attn.asc` 或 `sparse_attn.pypto` 配套；
   `sparse_attn.asc`、`sparse_attn.pypto`、`sparse_attn.golden` 声明同一 attention target，
-  三者只能选一个。`golden` 是数值参考，不是融合性能路径。
+  三者只能选一。`golden` 是数值参考，不是融合性能路径。
 - DeepSeek-V4 MHC 的 AscendC 入口声明 `HcPre.Config`/`HcPost.Config`，Triton 入口还包含
   `HcHead.Config`；同一节点只能选择一个实现。
 - 两个 override 声明同一节点，或一个声明另一个的祖先/后代节点时会冲突；可移除互斥入口，

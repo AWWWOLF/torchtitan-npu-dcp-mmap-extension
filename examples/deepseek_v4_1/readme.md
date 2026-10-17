@@ -171,9 +171,8 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 | `common.rope.asc_complex`（A3 文本） | attention/compressor/indexer 的 split-aware 文本旋转（公共 `ComplexRoPE.Config`，保留 split/theta/YaRN） | Ascend rotary mul（interleave） |
 | `common.rope.asc_partial`（A5 文本） | 同上三处文本位点；单个 `inplace_partial_rotary_mul` 只旋转尾部 `dim` 通道 | AscendC partial rotary |
 | `common.rope.asc_half_rotation` | 视觉塔 2D 位置表的 half 旋转（半宽 cos/sin，融合前复制为全宽表，逐 batch 折叠保位置） | 同上 |
-| `sparse_attn.asc`（仅 A5，须与下一行同开） | 替换完整 attention forward；反向除自身梯度外还在 `topk_scores` 梯度上产出 indexer 教师 | Ascend sparse flash MLA |
+| `sparse_attn.asc`（仅 A5，须与下一行同开） | 替换完整 attention forward；反向除自身梯度外还在 `topk_scores` 梯度上产出 indexer 教师。该 config 按**自己的几何**（每个 `(端口, compress_ratio)` 一个 map entry）每微批预计算 SMLA 与 indexer 元数据（`sparse_flash_mla_metadata` / `sparse_flash_mla_grad_metadata` / `lightning_indexer_metadata` / `sparse_lightning_indexer_kl_loss_grad_metadata`），随 entry 的 `aicpu_metadata` 字段下发，前向/重算/反向直接读字段（没有查表）。几何即该 config 自己的必填字段（无默认值），由该入口的五个参数一次写入，默认值即 V4.1-Flash 的发布形状；记录是内核 metadata 的唯一来源：拿着没经过端口构建的 metadata 前向会直接失败，不会在层里补一次算子调用（没有 inline 回退） | Ascend sparse flash MLA + CANN `*_metadata` |
 | `lightning_indexer.asc`（仅 A5，须与上一行同开） | 替换 selector 节点 |
-| `sparse_attn.asc_metadata`（仅 A5，可选，须与 `sparse_attn.asc` 同开才有收益） | 在 `build_attention_masks` 边界按 `(compress_ratio, cmp_topk)` 每微批预计算 SMLA 元数据；由 `sparse_attn.asc` 的前向/重算/反向逐层查表消费，未启用或查表 miss 时逐层 inline 计算 | `sparse_flash_mla_metadata` / `sparse_flash_mla_grad_metadata` 预计算 |
 | `common.swiglu_group.asc`（仅 A5） | `*.moe.routed_experts.inner_experts` 的 grouped SwiGLU（FQN 限定） | cann_ops_nn.swiglu_group |
 | `common.swiglu_group.asc_shared_experts`（仅 A5） | `*.moe.shared_experts` 的 SwiGLU（FQN 限定，不替换视觉 MLP） | 同上 |
 | `common.token_dispatcher.asc` | 公共 MoE 的 permute / re-routing / unpermute；reference 不启用 | Ascend token dispatcher |

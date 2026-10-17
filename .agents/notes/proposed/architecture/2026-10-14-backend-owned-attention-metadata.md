@@ -51,9 +51,16 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
   不可 CP → `prepare_cp_metadata` 拒绝）；`AscSparseInnerAttention.Config` 包成带 TND host 序列长度的
   `AscVarlenMetadata`，CP 用 `prepare_cp_varlen_metadata` 得 rank-local 再重读 host 列表。删 `metadata_extension` /
   `_metadata_extension` / `build_attention_masks` 与 `sparse_attn.asc_metadata`。
-- **V4.1**：几何放 inner attention config（同上游 `DSV4InnerAttention.Config`）并由它建 row frames，records
-  （SMLA/SMLAG）由 `AscV41SparseAttention.Config` 构建、`prepare_cp_metadata` 用 rank-local frames 重建；输入的连续
-  slab 交回通用 CP 路径（recipe 本就 `load-balancer None`），模型只留 engram halo。删 `AscV41MetadataExtension` 与
+- **V4.1**：参考核只保留自己读的几何（`window_size` / `softmax_scale` / `compress_ratio`），metadata 是**整行的
+  document 边界**（`create_varlen_metadata_for_document` 的 `cu_seq_q`）加上后端在同一处按自己的 ratio 折一次的
+  池化轴 `cu_seq_k`（消费者不再除）；kernel 几何与 records
+  （SMLA/SMLAG + indexer 的 LI/SLIKG 四条 AI_CPU 算子）属于端口：`AscV41SparseAttention.Config` 用 `map key =
+  (端口类, compress_ratio)` 声明自己的 entry，按 `build_attention_metadata` 每 microbatch 建一次 frames + records
+  （`AscV41Metadata` 的 `q` / `swa_k` / `cmp_k` 三个 `KernelFrame` 与 `aicpu_metadata`），消费者直接读字段而不是查表，
+  `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建；五个几何数是该 config 的必填字段（无默认值），
+  由 override 参数写入、默认值即 V4.1-Flash 发布形状，records 是内核 metadata 的唯一来源（无 inline 回退；
+  拿着没经过端口构建的 metadata 前向会直接失败）。输入的连续 slab 交回
+  通用 CP 路径（recipe 本就 `load-balancer None`），模型只留 engram halo。删 `AscV41MetadataExtension` 与
   `asc_metadata`。
 - **V4**：`CompressedVarlenMetadata` 的帧 + CP plan 搬到 backend；`AscCompressedSparseInnerAttention.Config` 构建四算子
   records，LI record 的 provider 成为该 config 的字段（torchao 量化 / cv_parallel 分块仍以 `@override` 替换该节点
