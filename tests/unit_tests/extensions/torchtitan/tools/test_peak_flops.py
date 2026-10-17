@@ -47,8 +47,8 @@ def peak_flops_ext():
         ("Ascend910B4", 245.76e12),
         ("Ascend950PR", 432e12),
         ("Ascend950PR_9582", 432e12),
-        ("Ascend950DT", 486e12),
-        ("Ascend950DT_9582", 486e12),
+        ("Ascend950DT_9591", 486e12),
+        ("Ascend950DT_9582", 432e12),
     ],
 )
 def test_ascend_peak_flops_bypasses_upstream(peak_flops_ext, monkeypatch, device_name, expected):

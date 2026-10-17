@@ -30,8 +30,8 @@ _ASCEND_BF16_PEAK_FLOPS = {
     "Ascend910B4": 245.76e12,  # total: 280T Cube: 245T
     "Ascend950PR": 432e12,  # total: 486T Cube: 432T (whitepaper Tab 3-1, 32 cube)
     "Ascend950PR_9582": 432e12,  # same as 950PR
-    "Ascend950DT": 486e12,  # total: 547T Cube: 486T (whitepaper Tab 3-1, 36 cube)
-    "Ascend950DT_9582": 486e12,  # same as 950DT
+    "Ascend950DT_9591": 486e12,  # total: 547T Cube: 486T (whitepaper Tab 3-1, 36 cube)
+    "Ascend950DT_9582": 432e12,  # total: 486T Cube: 432T (32 cube)
 }
 
 
