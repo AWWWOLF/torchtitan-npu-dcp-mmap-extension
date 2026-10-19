@@ -177,3 +177,39 @@ def test_default_fp8_communication_keeps_three_payloads(block_module, monkeypatc
     output, inner = wrapper.fsdp_post_all_gather(payload, metadata, torch.bfloat16)
     assert output._data is payload[0]
     assert all(a is b for a, b in zip(inner, payload, strict=True))
+
+
+def test_fp8_prequantized_write_to_out_reuses_payload_tensors(block_module):
+    """FSDP reuse writes new payloads without rebinding or bumping versions."""
+    mod = block_module
+    config = mod.BlockMXQuantizeConfig(fsdp_prequantize=True)
+    out_config = mod.BlockMXQuantizeConfig(fsdp_prequantize=True)
+    activation_config = mod.MXQuantizeConfig()
+    out_activation_config = mod.MXQuantizeConfig()
+
+    q = (torch.arange(4096).reshape(64, 64) % 16).to(torch.float8_e4m3fn)
+    s1 = torch.arange(128, dtype=torch.uint8).reshape(64, 1, 2)
+    s2 = torch.arange(128, dtype=torch.uint8).reshape(1, 64, 2)
+    wrapper = mod.BlockMXTrainingWeightWrapperTensor._from_prequantized(
+        q, s1, s2, config, activation_config
+    )
+    out = mod.BlockMXTrainingWeightWrapperTensor._from_prequantized(
+        q.clone(), s1.clone(), s2.clone(), out_config, out_activation_config
+    )
+
+    inner = (out._data, out._scale_s1, out._scale_s2)
+    versions = tuple(tensor._version for tensor in inner)
+    payload = (q.flip(0).contiguous(), s1.flip(0).contiguous(), s2.flip(1).contiguous())
+
+    result = wrapper.fsdp_post_all_gather(payload, (), torch.bfloat16, out=out)
+
+    assert result is None
+    assert all(
+        actual is expected
+        for actual, expected in zip((out._data, out._scale_s1, out._scale_s2), inner, strict=True)
+    )
+    assert tuple(tensor._version for tensor in inner) == versions
+    assert out.weight_config is config
+    assert out.activation_config is activation_config
+    for actual, expected in zip(inner, payload, strict=True):
+        torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0)

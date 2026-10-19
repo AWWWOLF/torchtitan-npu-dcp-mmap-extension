@@ -171,20 +171,37 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
     ) -> None:
         """Write pre-quantized data into a pre-allocated ``out`` (bare wrapper
         or ``DTensor`` with a wrapper local tensor)."""
-        if isinstance(out, BlockMXTrainingWeightWrapperTensor):
-            out._data = B_q
-            out._scale_s1 = B_s1
-            out._scale_s2 = B_s2
-        elif isinstance(out, DTensor) and isinstance(out._local_tensor, BlockMXTrainingWeightWrapperTensor):
-            local: BlockMXTrainingWeightWrapperTensor = out._local_tensor
-            local._data = B_q
-            local._scale_s1 = B_s1
-            local._scale_s2 = B_s2
-        else:
+        local = out._local_tensor if isinstance(out, DTensor) else out
+        if not isinstance(local, BlockMXTrainingWeightWrapperTensor):
             raise RuntimeError(
                 f"expected out to be {type(self).__name__} or DTensor with "
                 f"local_tensor={type(self).__name__}, but got {type(out)}"
             )
+        if not all(hasattr(local, attr) for attr in ("_data", "_scale_s1", "_scale_s2")):
+            raise RuntimeError("FSDP prequantized output wrapper is missing its payload tensors")
+        if not all(isinstance(getattr(local, attr), torch.Tensor) for attr in ("_data", "_scale_s1", "_scale_s2")):
+            raise RuntimeError("FSDP prequantized output wrapper has invalid payload tensors")
+
+        # FSDP2 reuses a shallow copy of the unsharded wrapper on subsequent
+        # iterations. Restore the current configs just like the base wrapper
+        # path does, so a reused ``out`` cannot retain stale quantization state.
+        local.weight_config = self.weight_config
+        local.activation_config = self.activation_config
+        targets = (local._data, local._scale_s1, local._scale_s2)
+        sources = (B_q, B_s1, B_s2)
+        for target, source in zip(targets, sources, strict=True):
+            if target.shape != source.shape or target.dtype != source.dtype or target.device != source.device:
+                raise RuntimeError("FSDP prequantized output shape, dtype and device must remain unchanged")
+        # FSDP retains the inner tensors returned by the first all-gather. Keep
+        # their storage aliases and the Parameter's inner requires_grad flags:
+        # replacing _data would discard those flags on subsequent gathers.
+        # FP8 outputs normally already share the exact destination view; MXFP4
+        # conversion produces separate buffers that must be copied back. This
+        # restores the same parameter for backward, not an optimizer update.
+        with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(targets):
+            for target, source in zip(targets, sources, strict=True):
+                if not target.is_set_to(source):
+                    target.copy_(source)
 
     @staticmethod
     def _transpose_prequantized_scales(
@@ -425,23 +442,7 @@ class BlockMXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
                 requires_grad=self.requires_grad,  # pyrefly: ignore [missing-attribute]
             )
             return output, (q, s1, s2)
-        local = out._local_tensor if isinstance(out, DTensor) else out
-        if not isinstance(local, type(self)):
-            raise RuntimeError("MXFP4 communication requires a BlockMX output wrapper")
-        if not all(hasattr(local, attr) for attr in ("_data", "_scale_s1", "_scale_s2")):
-            raise RuntimeError("MXFP4 communication requires an initialized BlockMX output wrapper")
-        if not all(isinstance(getattr(local, attr), torch.Tensor) for attr in ("_data", "_scale_s1", "_scale_s2")):
-            raise RuntimeError("MXFP4 communication requires tensor payloads on the BlockMX output wrapper")
-
-        # FSDP2 reuses a shallow copy of the unsharded wrapper on subsequent
-        # iterations. Restore the current configs just like the base wrapper
-        # path does, so a reused ``out`` cannot retain stale quantization state.
-        local.weight_config = self.weight_config
-        local.activation_config = self.activation_config
-        tensors = (local._data, local._scale_s1, local._scale_s2)
-        with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(tensors):
-            for target, source in zip(tensors, (q, s1, s2), strict=True):
-                target.copy_(source)
+        self._write_prequantized_to_out(out, q, s1, s2)
         return None
 
     def to_inference_weight(self) -> MXTensor:
