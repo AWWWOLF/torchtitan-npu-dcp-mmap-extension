@@ -236,6 +236,7 @@ patches → config → extensions → ops
 ```
 
 `compile` 已迁入 `extensions/compile/`，不再是顶层自动导入阶段。该顺序是运行时契约。NPU patch 必须在模型构建和首次编译前生效。新增初始化逻辑不能随意调整此顺序。
+`extensions/compile/dynamo_config.py` 随该阶段无条件设置 Dynamo 的 `use_recursive_dict_tags_for_guards`：guard 管理器在构建 guard 树时标记 tag safe root，之后每次调用命中 tag 即跳过该子树下的完整 guard 检查，从而缩短 guard 求值耗时。该设置只改变 guard 的检查路径，不改变捕获内容与特化行为，也没有关闭开关；`specialize_float` 保持 torch 默认值，避免编译区域内逐步变化的 Python float 每步触发重编译。
 
 ### 5.2 模型和 loss 编译
 

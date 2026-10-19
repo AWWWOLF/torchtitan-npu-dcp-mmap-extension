@@ -34,7 +34,8 @@
       ".torchtitan.components.metrics",
       ".torchtitan.experiments.graph_trainer",
       ".torchtitan.tools.utils",
-      ".torchtitan.eager_flex"
+      ".torchtitan.eager_flex",
+      ".compile.dynamo_config"
     ],
     "torchtitan_npu/patches/torchtitan/__init__.py": [
       ".components.checkpoint",
