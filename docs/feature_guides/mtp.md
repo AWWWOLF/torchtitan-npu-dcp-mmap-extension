@@ -86,6 +86,16 @@ DeepSeek-V4 的默认 recipe 使用 `MTPChunkedLossWrapper`。它继承并逐预
 
 DeepSeek-V3.2 不适配 chunk loss，直接复用社区 `list[logits] + MTPLoss` 训练路径。
 
+### 1.6 DeepSeek-V4 梯度隔离
+
+当前主要用于强化学习（RL）场景：需要继续训练 MTP，同时避免 MTP 辅助损失直接改变主模型的策略梯度时开启。需要 MTP 辅助损失共同训练主模型时保持关闭。
+
+已启用 MTP 的 recipe 可通过 `--loss.mtp-isolate-gradients` 开启梯度隔离，默认关闭。该开关截断主干 hidden state 到 MTP 的梯度，并阻止 MTP 更新共享 token Embedding 和 LM head；LM head 仍向 MTP hidden state 传递梯度，主预测正常更新共享参数。前向输出和 loss 计算公式不变，checkpoint 参数名称与形状不变。
+
+`mtp_isolate_gradients` 在 `MTPChunkedLossWrapper.Config` 中配置，模型在 `update_from_config` 时读取同一设置，统一控制三处梯度边界。
+
+此开关适用于原生 Linear LM head 和 `MTPChunkedLossWrapper`。仅隔离直接梯度，仍使用现有全局梯度裁剪，主模型与 MTP 的裁剪系数仍然关联。
+
 ## 2. 代码结构
 
 ### 2.1 公共 MTP 模块
@@ -105,6 +115,7 @@ TorchTitan-NPU 只补充社区当前尚未提供的组合能力：
 |---|---|
 | `prepare_mtp_batch` | 为 DeepSeek-V4 在 CP 之前生成各深度 token、mask 和 label |
 | `MTPChunkedLossWrapper` | 为 DeepSeek-V4 将原生 chunked loss 扩展到主预测和各 MTP 预测 |
+| `SharedLinear` | MTP 投影期间使用 detached 权重，保留输入梯度及原模块的 FSDP 调用路径 |
 
 DeepSeek-V3.2 直接继承社区 MTP decoder，并复用社区的 block 构造和并行入口。DeepSeek-V4 复用 `roll_mtp_sequence` 和社区多预测列表接口，只实现 mHC 多流状态、CP 和 chunk loss 所需的专用 decoder 与 block。只有 DeepSeek-V4 的专用 decoder 配置放开 MTP 与 CP 的组合；没有修改社区 `MTPDecoder` 或 `MTPLoss`。
 
@@ -193,6 +204,7 @@ config.loss = MTPChunkedLossWrapper.Config(
 |---|---|
 | `num_mtp_layers` | MTP 辅助预测深度数；大于 0 时构造 MTP blocks |
 | `mtp_scale` | 所有 MTP 辅助损失的总权重 |
+| `mtp_isolate_gradients` | 默认 `False`；隔离 MTP 对主干、共享 Embedding 和 LM head 的直接梯度 |
 | `global_vocab_size` | 词表并行交叉熵使用的完整词表大小 |
 | `num_chunks` | DeepSeek-V4 每个主/MTP hidden sequence 的 loss 分块数 |
 | `mtp_layers` | 模型内部展开后的 MTP block 配置列表，通常不手工构造 |

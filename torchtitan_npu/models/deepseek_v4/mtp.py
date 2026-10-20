@@ -16,6 +16,7 @@ __all__ = [
     "roll_mtp_sequence",
 ]
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
@@ -26,10 +27,11 @@ from torchtitan.components.loss import (
     BaseLoss,
     ChunkedLossWrapper,
 )
+from torchtitan.config import derive
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import AttentionMasksType  # noqa: TC002
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
-from torchtitan.models.common.linear import Linear  # noqa: TC002
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE  # noqa: TC002
 from torchtitan.models.common.nn_modules import RMSNorm  # noqa: TC002
 from torchtitan.models.deepseek_v3.mtp import (
@@ -38,6 +40,8 @@ from torchtitan.models.deepseek_v3.mtp import (
     roll_mtp_sequence,
 )
 from torchtitan.protocols.module import ModuleList
+
+from torchtitan_npu.models.common.linear import SharedLinear
 
 from .mhc import HcHead, HcPost, HcPre  # noqa: TC001
 
@@ -149,6 +153,17 @@ def _mtp_labels(
     ]
 
 
+def _mtp_head_context(lm_head, *, isolate_gradients: bool):
+    if not isolate_gradients:
+        return nullcontext()
+    if not isinstance(lm_head, SharedLinear):
+        raise ValueError(
+            "mtp_isolate_gradients requires a SharedLinear LM head; "
+            f"got {type(lm_head).__name__}. Enable isolation on both the model and loss configurations."
+        )
+    return lm_head.detached_weight()
+
+
 class _ScaledLoss:
     def __init__(self, loss_fn: BaseLoss) -> None:
         self.loss_fn = loss_fn
@@ -169,10 +184,12 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
     @dataclass(kw_only=True, slots=True)
     class Config(ChunkedLossWrapper.Config):
         mtp_scale: float = 0.3
+        mtp_isolate_gradients: bool = False
 
     def __init__(self, config: Config, *, compile_config=None):
         super().__init__(config, compile_config=compile_config)
         self.mtp_scale = config.mtp_scale
+        self.mtp_isolate_gradients = config.mtp_isolate_gradients
         self._scaled_loss = _ScaledLoss(self.loss_fn)
         self.loss_fn = self._scaled_loss  # pyrefly: ignore [bad-assignment]
 
@@ -189,6 +206,7 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
         positions = loss_inputs.pop("positions", None)
         mtp_labels = _mtp_labels(pred, labels, positions)
         branch_scale = self.mtp_scale / len(mtp_labels)
+        head_context = _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients)
 
         self._scaled_loss.scale = 1.0
         total_loss, metrics = super().__call__(
@@ -197,16 +215,18 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
             global_valid_tokens,
             **loss_inputs,
         )
-        for hidden, depth_labels in zip(pred[1:], mtp_labels, strict=True):
-            self._scaled_loss.scale = branch_scale
-            depth_loss, depth_metrics = super().__call__(
-                hidden,
-                depth_labels,
-                global_valid_tokens,
-                **loss_inputs,
-            )
-            total_loss = total_loss + depth_loss
-            metrics = self._combine_chunk_metrics(metrics, depth_metrics)
+        # Keep the real head visible to the upstream FSDP chunk lifecycle.
+        with head_context:
+            for hidden, depth_labels in zip(pred[1:], mtp_labels, strict=True):
+                self._scaled_loss.scale = branch_scale
+                depth_loss, depth_metrics = super().__call__(
+                    hidden,
+                    depth_labels,
+                    global_valid_tokens,
+                    **loss_inputs,
+                )
+                total_loss = total_loss + depth_loss
+                metrics = self._combine_chunk_metrics(metrics, depth_metrics)
         return total_loss, metrics
 
 
@@ -300,8 +320,10 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
     class Config(MTPDecoder.Config):
         hc_mult: int = 4
         hc_head: HcHead.Config
+        mtp_isolate_gradients: bool = False
 
         def update_from_config(self, *, config, **kwargs) -> None:
+            self.mtp_isolate_gradients = getattr(getattr(config, "loss", None), "mtp_isolate_gradients", False)
             if not self.mtp_layers:
                 Decoder.Config.update_from_config(
                     self,
@@ -325,9 +347,14 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
                 raise NotImplementedError("MTP does not support pipeline parallelism yet.")
 
     def __init__(self, config: Config):
+        if config.mtp_isolate_gradients:
+            if not config.mtp_layers or type(config.lm_head) is not Linear.Config:
+                raise ValueError("MTP gradient isolation requires MTP layers and an unmodified Linear LM head.")
+            config = derive(config, type(config), lm_head=derive(config.lm_head, SharedLinear.Config))
         # MTPDecoder builds the community MTP block type. DSV4 owns a
         # different block while retaining the same decoder-level contract.
         Decoder.__init__(self, config)
+        self.mtp_isolate_gradients = config.mtp_isolate_gradients
         self.hc_mult = config.hc_mult
         self.hc_head = config.hc_head.build()
 
@@ -361,8 +388,10 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
             state.main_hidden,
             *self._forward_mtp_layers(tokens, state, attention_context, mtp_batch),
         ]
-        if not self._skip_lm_head:
-            outputs = [self.lm_head(item) if self.lm_head is not None else item for item in outputs]
+        if not self._skip_lm_head and self.lm_head is not None:
+            outputs[0] = self.lm_head(outputs[0])
+            with _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients):
+                outputs[1:] = [self.lm_head(item) for item in outputs[1:]]
         return MTPModelOutput(
             outputs,
             mtp_labels=mtp_batch.labels if mtp_batch is not None else None,
@@ -409,7 +438,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
             _annotate_mtp_batch(mtp_batch)
 
         mtp_outputs = []
-        prev_hc_hidden = state.hc_hidden
+        prev_hc_hidden = state.hc_hidden.detach() if self.mtp_isolate_gradients else state.hc_hidden
         for depth, layer in enumerate(self.mtp_layers, 1):
             if mtp_batch is None:
                 mtp_tokens, valid_mask = roll_mtp_sequence(
@@ -422,8 +451,10 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
             else:
                 mtp_tokens = mtp_batch.input_tokens[..., depth - 1]
                 valid_mask = mtp_batch.input_valid_mask[..., depth - 1]
+            with torch.no_grad() if self.mtp_isolate_gradients else nullcontext():
+                mtp_embed = state.tok_embeddings(mtp_tokens)
             prev_hc_hidden, prediction_hidden = layer(
-                state.tok_embeddings(mtp_tokens),
+                mtp_embed,
                 prev_hc_hidden,
                 mtp_tokens.detach().long(),
                 valid_mask,
