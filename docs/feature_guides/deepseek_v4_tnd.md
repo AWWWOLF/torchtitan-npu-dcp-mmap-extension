@@ -13,9 +13,8 @@ bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 DeepSeek-V4 的示例 wrapper 有两种可切换的 recipe（`USE_GOLDEN` 选择；`--override.imports` 是显式覆盖入口）。`scripts/run_train.sh` 只负责通用启动和参数透传，不定义这些 recipe：
 
 ```text
-USE_GOLDEN=1  # wrapper 里的 Golden 组合：
+USE_GOLDEN=1  # wrapper 里的参考组合（模型默认内核 = attn-gym gather_attn）：
               #   override.common.rope.workaround
-              #   override.deepseek_v4.sparse_attn.golden
               #   (the MoE is the normal clamped bf16 path on both sides)
 USE_GOLDEN=0  # wrapper 里的默认测试组合：
               #   override.common.rms_norm.asc
@@ -24,8 +23,8 @@ USE_GOLDEN=0  # wrapper 里的默认测试组合：
               #   override.deepseek_v4.sparse_attn.asc
 ```
 
-Golden DSA 参考（eager 逐文档、FP32、与 `dsv4-infer-npu` 比特一致）用于双层数值校验：
-golden 与 patched transformers 比特一致，AscendC 融合内核与 golden 在容差内一致
+参考路径（模型默认内核：Attention Gym 的 `gather_attn`，eager 逐文档、FP32）用于数值校验：
+参考路径与 patched transformers 做逐 step 容差对比，AscendC 融合内核与参考路径在容差内一致
 这些组合定义在 `examples/deepseek_v4/*.sh` 中；通用 launcher `scripts/run_train.sh` 只接收并透传 `--override.imports`，不会自动注入 DeepSeek-V4 override 组。
 
 ## 数据流
@@ -41,9 +40,6 @@ golden 与 patched transformers 比特一致，AscendC 融合内核与 golden �
         │
         ├─ 默认内核（CompressedSparseInnerAttention）
         │     gather_attn(q, swa_k, cmp_k 容器, 选择) + sink；选择由 LightningIndexer 给出
-        │
-        ├─ golden override（eager 逐文档 FP32，比特级数值参考）
-        │     逐文档 gather-matmul + 逐文档 indexer top-k
         │
         └─ AscendC 融合内核（AscCompressedSparseInnerAttention）
              q/swa_k flatten → [T, N, D] / [T, 1, D]
@@ -108,11 +104,15 @@ overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 - `r=4`（CSA）：启用重叠压缩和 LightningIndexer；前驱块必须属于同一文档（`overlap_valid`）。
 - `r=128`（HCA）：生成连续压缩 KV，不执行 LightningIndexer TopK。
 
-## 参考路径（默认内核与 golden）
+## 参考路径（默认内核）
 
 模型目录默认内核是 `CompressedSparseInnerAttention`：它只读公共 metadata 的 packed 偏移（`cu_seq_q` 与 `plans[ratio].cu_seqlens_cmp_k`），用 Attention Gym 的 `gather_attn` 在 `cat([swa_k, cmp_k 容器])` 上做滑窗 + sink，并按 ratio 取选择——`r=4` 走 `LightningIndexer` 给出的逐文档 TopK，`r=128` 直接取本查询本自然段内因果可达的全部压缩槽。选择与 `gather_attn` 都按“文档内”下标寻址（见 `models/common/document_intervals.py`），因此不再需要文档感知的 BlockMask，也不再需要 `metadata_extension` 预计算参考 tier。
 
-`golden` override 用 eager 逐文档 FP32（gather-matmul + 逐文档 indexer top-k）实现同一层，是当前唯一的比特级数值参考：`test_dsv4.py` 用它锚定默认内核（残差在 fp32 舍入底噪内），融合内核则与它做容差对照。
+默认内核就是唯一的参考路径，不再有独立的 golden override：`test_dsv4.py` 以形状/有限值和 pool 梯度的可复现性守护它，融合内核与它做容差对照。
+
+参考组合不训练 indexer：`r=4` 层的 `LightningIndexer` 只提供 TopK 选择（不可导），它的 KL 蒸馏目标由融合组合的 `asc_li` / SLIG 承担，参考核心本身不产生 indexer loss。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
+
+因此参考组合目前只能用 AdamW：`DistMuon` 在 step 前要求每个配置的参数都有梯度，会以 `missing gradients: layers.<n>.attention.indexer.*` 报错（`USE_GOLDEN=1` 搭配示例里的 Muon 参数即属此情况）。
 
 ## AscendC 融合路径
 

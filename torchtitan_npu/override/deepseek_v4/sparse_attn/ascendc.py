@@ -8,8 +8,8 @@
 
 This module holds the AscendC metadata extension (``AscMetadataExtension``
 + the ``*_metadata`` fill) and the fused TND kernel
-(``AscCompressedSparseInnerAttention``); the eager golden reference lives in
-``golden.py``.  The ``sparse_attn`` package ``__init__`` defines the
+(``AscCompressedSparseInnerAttention``); the PyPTO variant lives in
+``pypto.py``.  The ``sparse_attn`` package ``__init__`` defines the
 registrations, so the override paths stay ``override.deepseek_v4.sparse_attn.*``.
 
 The fused path only bridges the AscendC TND kernels' forward/backward with a

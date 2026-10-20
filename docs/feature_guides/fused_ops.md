@@ -30,7 +30,6 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 
 | Variant | 用途 |
 | --- | --- |
-| `golden` | 标准 PyTorch 算子实现的数值基线 |
 | `asc` | AscendC 融合算子 |
 | `triton` | Triton 融合算子 |
 | `pypto` | 使用 PyPTO 编程模型实现的算子 |
@@ -42,7 +41,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 `rope.asc_complex`、`rope.asc_cossin`、`sparse_attn.asc_metadata`。
 
 - replacement 类采用「variant + target」命名，并保留标准缩写大小写，例如
-`AscRMSNorm`、`AscCompressedSparseInnerAttention`、`GoldenCompressedSparseInnerAttention`。
+`AscRMSNorm`、`AscCompressedSparseInnerAttention`。
 
 ### 文件组织
 
@@ -52,7 +51,6 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 torchtitan_npu/override/<scope>/<target>/
 ├── __init__.py       # @override 注册入口
 ├── ascendc.py        # AscendC 实现
-├── golden.py         # 可选的数值基线
 └── triton.py         # 可选的 Triton 实现
 ```
 
@@ -199,8 +197,7 @@ python -m torchtitan_npu.train \
   自己建（另一条 backend，见上文），池的容量与块大小取自模型 config。它与 `lightning_indexer.asc`
   必须同开（教师边只有两侧都在时才存在），见 `torchtitan_npu/override/README.md#deepseek-v41`。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 必须与 `sparse_attn.asc` 或 `sparse_attn.pypto` 配套；
-  `sparse_attn.asc`、`sparse_attn.pypto`、`sparse_attn.golden` 声明同一 attention target，
-  三者只能选一。`golden` 是数值参考，不是融合性能路径。
+  `sparse_attn.asc` 与 `sparse_attn.pypto` 声明同一 attention target，二者只能选一。
 - DeepSeek-V4 MHC 的 AscendC 入口声明 `HcPre.Config`/`HcPost.Config`，Triton 入口还包含
   `HcHead.Config`；同一节点只能选择一个实现。
 - 两个 override 声明同一节点，或一个声明另一个的祖先/后代节点时会冲突；可移除互斥入口，
@@ -223,7 +220,7 @@ python -m torchtitan_npu.train \
    参数梯度和输入梯度；用 `torch.compile(backend="aot_eager")` 覆盖编译正反向。
 3. **模型层**：执行相关 smoke/integration case，确认 override 日志、kernel 调用、
    `DTensor` sharding、context parallel 和 checkpoint 行为。
-4. **数值层**：需要基线时使用 `golden` 或上游 eager/reference 实现；比较 TensorBoard 中
+4. **数值层**：需要基线时使用上游 eager/reference 实现（如 Attention Gym 的 `gather_attn`）；比较 TensorBoard 中
    未截断的逐 step `loss` 和 `grad_norm`，不要只使用 stdout 的有限精度。未在目标设备、
    runtime 或并行配置上验证的组合标记为「未验证」。
 5. **静态检查**：提交前执行 `git diff --check`，核对入口路径、配置 target、相对链接和
@@ -236,7 +233,7 @@ python -m torchtitan_npu.train \
 | 模块导入失败 | 完整入口路径、PyTorch/`torch_npu`/CANN/PyPTO 依赖 |
 | `target` 未注册 | 是否使用准确的 `module.function`，以及模块是否被导入 |
 | 没有匹配节点 | `target`、`exact`、`fqns`，以及 converter 后的 Config 类型 |
-| 同节点或嵌套节点冲突 | 是否同时启用了 fused、PyPTO、Triton 或 golden 替代实现 |
+| 同节点或嵌套节点冲突 | 是否同时启用了 fused、PyPTO 或 Triton 替代实现 |
 | 训练继续但 replacement 未生效 | 启动日志中的 `[Override]` 和 `Applied N override(s)` |
 | 编译反向失败或 FakeTensor 报错 | custom op 是否注册 `register_fake` 和 `register_autograd` |
 | kernel dtype/shape 报错 | 调用边界的 dtype、layout、stride、TND metadata 和设备限制 |
@@ -245,7 +242,7 @@ python -m torchtitan_npu.train \
 
 - [`override/README.md`](../../torchtitan_npu/override/README.md)：override 机制、入口和当前清单。
 - [`deepseek_v3_2/sparse_attn`](../../torchtitan_npu/override/deepseek_v3_2/sparse_attn)：TND metadata 与 AscendC DSA。
-- [`deepseek_v4/sparse_attn`](../../torchtitan_npu/override/deepseek_v4/sparse_attn)：AscendC、PyPTO 与 golden DSA。
+- [`deepseek_v4/sparse_attn`](../../torchtitan_npu/override/deepseek_v4/sparse_attn)：AscendC 与 PyPTO DSA。
 - [`deepseek_v4/mhc`](../../torchtitan_npu/override/deepseek_v4/mhc)：AscendC 与 Triton 多后端替换。
 - [`torchtitan_npu/override/common/token_dispatcher.py`](../../torchtitan_npu/override/common/token_dispatcher.py)：`token_dispatcher.asc` 在 `AllToAllTokenDispatcher` 中替换局部 dispatch/combine 计算。
 - [`torchtitan_npu/override/common/rope.py`](../../torchtitan_npu/override/common/rope.py)：`rope.asc_partial` 整体替换 partial-RoPE 站点，含可选 CANN 依赖的惰性加载。

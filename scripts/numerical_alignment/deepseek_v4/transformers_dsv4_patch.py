@@ -28,7 +28,7 @@ def _set_rope_debug_trace(trace: dict[str, torch.Tensor] | None) -> None:
 
 
 def _tt_transformers_rms_norm_forward(module, x: torch.Tensor) -> torch.Tensor:
-    """Run a Transformers DSV4 RMSNorm with the torchtitan-npu golden dtype recipe."""
+    """Run a Transformers DSV4 RMSNorm with the torchtitan-npu reference dtype recipe."""
 
     dtype = x.dtype
     x = x.float()
@@ -211,17 +211,37 @@ def _tt_transformers_attention_forward(
     dropout: float | int = 0.0,
     **_kwargs,
 ):
-    """Match the TorchTitan numerical FP32 attention recipe and sparse layout."""
+    """Run the model's reference gather attention on the Transformers operands.
 
-    dtype = query.dtype
-    batch, _, seq_len, _ = query.shape
+    The reference core is Attention Gym's ``gather_attn`` (``impl="reference"``), so the
+    patch calls that same implementation with the operands the core hands it -- the packed
+    window pool, the compressed pool, and the document-local selection.  The attention
+    arithmetic is therefore identical by construction (fp32 accumulation, the sink in the
+    softmax denominator, and the reference path's bf16 probability cast included), and what
+    the alignment still compares is the model around it: projections, norms, RoPE, the
+    compressor, the indexer, mHC and MoE, all re-derived on the Transformers side.
+    """
+
+    if dropout or module.training or attention_mask is not None:
+        raise ValueError(
+            "the numerical-alignment attention expects eval mode, dropout 0 and no attention mask: "
+            "it runs the packed reference attention, which ignores all three"
+        )
+
+    from attn_gym.sparse import gather_attn
+
+    batch, _, seq_len, head_dim = query.shape
     compressor = getattr(module, "compressor", None)
     window = min(seq_len, getattr(module, "sliding_window", None) or seq_len)
-    base = torch.arange(seq_len, device=query.device).unsqueeze(1)
-    window_indices = (base - window + 1).clamp_min(0) + torch.arange(window, device=query.device)
-    topk_indices = torch.where(window_indices <= base, window_indices, -1).unsqueeze(0).expand(batch, -1, -1)
-    if compressor is not None:
-        compressed_len = key.shape[-2] - seq_len
+    cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=query.device)
+    kv = key.squeeze(1)
+    compressed_len = kv.shape[-2] - seq_len
+    if compressor is None or compressed_len <= 0:
+        # A window-only layer: the core passes an empty pool and the row's own offsets.
+        sparse_kv = query.new_zeros((batch, 1, 0, head_dim))
+        kv_indices = query.new_empty((batch, seq_len, 0), dtype=torch.long)
+        cu_seqlens_k = cu_seqlens
+    else:
         if hasattr(compressor, "indexer"):
             compressed_indices = getattr(module, "_tt_compressed_indices", None)
             if compressed_indices is None:
@@ -234,28 +254,24 @@ def _tt_transformers_attention_forward(
             compressed_indices = (
                 torch.where(candidates < causal_limit, candidates, -1).unsqueeze(0).expand(batch, -1, -1)
             )
-        compressed_indices = torch.where(compressed_indices < 0, compressed_indices, compressed_indices + seq_len)
-        topk_indices = torch.cat([topk_indices, compressed_indices], dim=-1)
+        sparse_kv = kv[:, seq_len:, :].unsqueeze(1)
+        kv_indices = compressed_indices.contiguous()
+        cu_seqlens_k = torch.tensor([0, compressed_len], dtype=torch.int32, device=query.device)
 
-    # Match Golden's query-specific, fixed-width gathered KV. Dense masking
-    # changes the NPU reduction layout and the indexer's compressed-key order.
-    valid = topk_indices != -1
-    safe = torch.where(valid, topk_indices, 0).long()
-    batch_indices = torch.arange(batch, device=query.device).view(batch, 1, 1).expand_as(safe)
-    gathered_kv = key.squeeze(1)[batch_indices, safe]
-    gathered_kv = gathered_kv * valid.unsqueeze(-1).to(dtype)
-    query_bshd = query.transpose(1, 2).contiguous()
-    scores = torch.matmul(query_bshd.float(), gathered_kv.float().transpose(-2, -1)) * scaling
-    scores = scores.masked_fill(~valid.unsqueeze(-2), -torch.inf)
-    row_max = scores.max(dim=-1, keepdim=True).values
-    exp_scores = torch.exp(scores - row_max)
-    denominator = exp_scores.sum(dim=-1, keepdim=True)
-    sink = module.sinks.view(1, 1, -1, 1).float()
-    denominator = denominator + torch.exp(sink - row_max)
-    probabilities = exp_scores / denominator
-    probabilities = F.dropout(probabilities, p=float(dropout), training=module.training)
-    output = torch.matmul(probabilities, gathered_kv.to(torch.float32)).to(dtype)
-    return output, probabilities.transpose(1, 2).to(dtype)
+    output = gather_attn(
+        query,
+        kv[:, :seq_len, :].unsqueeze(1),
+        sparse_kv,
+        kv_indices,
+        attention_sink=module.sinks,
+        sliding_window_size=window,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        impl="reference",
+        scale=scaling,
+    )
+    # The weights are only read when a caller asks for attentions; the alignment never does.
+    return output.transpose(1, 2), None
 
 
 def _tt_transformers_router_scores(module, hidden_states: torch.Tensor):

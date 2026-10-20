@@ -81,7 +81,7 @@ python -m tests.integration_tests.run_tests \
 
 #### 1. 精度对齐判定原则：`use_golden` 与 `check_loss`
 集成测试严格区分**算子实现选择**与**数值精确对齐**两个独立维度：
-* **`use_golden`**：决定模型使用 Golden 参考标准实现，还是使用 SMLA / NPU 专用算子优化 override；
+* **`use_golden`**：决定模型使用参考实现（DeepSeek-V4 为模型默认内核，即 attn-gym `gather_attn`；V4.1 为同一入口的 reference override 组合），还是使用 SMLA / NPU 专用算子优化 override；
 * **`check_loss`**：决定是否启用确定性计算（`--debug.deterministic`）、固定随机种子，并严格读取参考基准 Loss 执行逐值比对。
 
 **判定规则**：

@@ -317,10 +317,9 @@ def student_logits_at_picks(
     score scale (``select_compressed_slots`` cancels the operator's internal division; this
     pass never divides).
 
-    No production call site reads this pass yet: the reference recipe's indexer loss lives in
-    the golden override, and the fused one runs inside its SLIG bridge.  It is the reference
-    teacher pass that the LI/teacher binding is meant to consume, and until that lands it is
-    pinned by the unit tests only.
+    No production call site reads this pass yet: the fused recipe's teacher runs inside its
+    SLIG bridge.  It is the reference teacher pass that the LI/teacher binding is meant to
+    consume, and until that lands it is pinned by the unit tests only.
     """
     pool_start_L1, _, _ = document_intervals(cu_seqlens, cu_seqlens_k, num_tokens=idx_q.size(1))
     picked_BLKDi = idx_k.squeeze(0)[(topk_indices + pool_start_L1).squeeze(0).clamp_min(0)].unsqueeze(0)

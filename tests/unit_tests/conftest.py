@@ -195,7 +195,6 @@ def dsv4():
     ns.token_dispatcher = importlib.import_module("torchtitan_npu.models.deepseek_v4.token_dispatcher")
     ns.attention = importlib.import_module("torchtitan_npu.models.deepseek_v4.attention")
     ns.compressor = importlib.import_module("torchtitan_npu.models.deepseek_v4.compressor")
-    ns.golden = importlib.import_module("torchtitan_npu.override.deepseek_v4.sparse_attn.golden")
     spec = importlib.util.spec_from_file_location(
         "varlen_cp_backport",
         _REPO / "torchtitan_npu" / "patches" / "torchtitan" / "distributed" / "varlen_cp.py",

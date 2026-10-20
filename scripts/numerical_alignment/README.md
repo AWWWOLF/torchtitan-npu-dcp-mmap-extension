@@ -117,13 +117,13 @@ python -m scripts.numerical_alignment.deepseek_v4.compare_dsv4_with_transformers
 ```
 
 脚本关闭 NPU matmul、conv 和 ACLNN 的 HF32，并启用确定性算法；确定性补丁自动设置 `CLOSE_MATMUL_K_SHIFT=1` 和 `HCCL_DETERMINISTIC=true`。
-HF 与 DCP 必须来自同一份权重。Golden 模式仅支持 batch size 为 `1`、序列长度为 `128` 的倍数；不支持的配置会在加载权重前报错。
+HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch size 为 `1`（attention metadata 按单条打包序列构建）；参考模式（`--attention golden`，模型默认 attn-gym 路径）还要求序列长度为 `128` 的倍数。不支持的配置会在加载权重前报错。
 
 默认启用 Transformers 数值补丁，使 RoPE、RMSNorm、mHC、indexer、稀疏 attention 和 MoE 的计算顺序及 BF16 边界匹配 TorchTitan。因此，对齐结果的参考是打补丁后的 Transformers 实现。
 
 常用选项：
 
-- `--mode bitwise`：默认模式，要求 logits 逐元素完全相同。
+- `--mode bitwise`：默认模式，要求 logits 逐元素完全相同；patched Transformers 的 attention 直接复用模型参考路径的 attn-gym `gather_attn`，因此两侧逐位可比。
 - `--mode close`：要求 `mean_ae <= 0.02`、`mean_re <= 0.02`、`cos >= 0.9999`。
 - `--no-apply-transformers-patch`：观察未经修改的 Transformers 模型结果。
 - `--attention test`：使用 AscendC override 组合，需要对应 CANN 算子，结果按所选模式独立判定。

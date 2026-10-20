@@ -79,10 +79,9 @@ class CompressedSparseInnerAttention(Module):
       debugging and numerics reference rather than the path to train on -- the fused
       ``sparse_attn.asc`` / ``sparse_attn.pypto`` recipes are the ones the model ships (both
       replace this class and keep working under context parallel, which this core refuses);
-    - it carries no indexer loss of its own: the reference recipe's LI objective lives in the
-      golden override, and the teacher/LI binding that would move it onto the packed selection
-      is a separate change, so a recipe that loads neither has no gradient for the indexer's
-      compressor at all.
+    - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
+      SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
+      trains no gradient for the indexer's compressor.
     """
 
     @dataclass(kw_only=True, slots=True)

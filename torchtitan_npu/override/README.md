@@ -19,8 +19,7 @@ python -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports \
-    torchtitan_npu.override.common.rope.workaround \
-    torchtitan_npu.override.deepseek_v4.sparse_attn.golden
+    torchtitan_npu.override.common.rope.workaround
 ```
 
 多个无参数条目可以用空格或逗号分隔。工厂函数需要关键字参数时，使用
@@ -45,7 +44,6 @@ NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模�
 ```python
 cfg.override.imports = [
     "torchtitan_npu.override.common.rope.workaround",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
 ]
 ```
 
@@ -96,7 +94,6 @@ torchtitan_npu/override/
     └── sparse_attn/
         ├── __init__.py
         ├── ascendc.py
-        ├── golden.py
         └── pypto.py
 ```
 
@@ -126,8 +123,8 @@ torchtitan_npu/override/deepseek_v4_1/
 - 简单 target 使用单文件，文件名采用 target 的 snake_case 语义，例如
   `RMSNorm -> rms_norm.py`。
 - 同一 target 同时包含较大的多后端实现时使用 package。package 名仍表示 target；
-  `__init__.py` 只定义稳定的注册入口，具体实现按 `ascendc.py`、`golden.py`、
-  `triton.py` 等拆分。
+  `__init__.py` 只定义稳定的注册入口，具体实现按 `ascendc.py`、`triton.py`
+  等拆分。
 - 各层 `__init__.py` 不批量导入无关注册模块，避免仅导入上层 package 就注册无关
   target。
 
@@ -147,7 +144,6 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | `asc` | 调用 CANN 或 `torch_npu` 的融合计算能力 |
 | `cann` | 调用 CANN 或 `torch_npu` API 的非融合能力 |
 | `npu` | NPU runtime 级能力；仅在不能用具体 CANN、Torch 或行为名称表达时使用 |
-| `golden` | 模型专属的 eager 数值参考 |
 | `torch` | 完全由标准 PyTorch 算子组成的独立实现 |
 | `triton` | Triton kernel 实现 |
 | `tilelang` | TileLang 融合 kernel 实现 |
@@ -155,7 +151,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | 行为名称 | 与计算后端无关的能力，例如 `optimizer.virtual` |
 
 同一 target family 中存在多个同类实现时，在 variant 后增加对象或职责限定，例如
-`rope.asc_complex`、`rope.asc_cossin` 和 `sparse_attn.golden`。不要添加
+`rope.asc_complex`、`rope.asc_cossin`。不要添加
 `_override` 后缀，也不要使用无法说明实现边界的 `ascend` 等泛化名称。
 
 Replacement 类采用「variant + target」命名，并保留标准缩写的大小写：
@@ -163,7 +159,6 @@ Replacement 类采用「variant + target」命名，并保留标准缩写的大�
 | 类型 | 示例 |
 | --- | --- |
 | AscendC 实现 | `AscRMSNorm`、`AscComplexRoPE` |
-| Golden 实现 | `GoldenCompressedSparseInnerAttention` |
 | Workaround 实现 | `WorkaroundComplexRoPE` |
 | 行为实现 | `VirtualOptimizersContainer` |
 | 后端协议或元数据 | `AscCompressedVarlenMetadata`、`AscBlockLayoutMetadata` |
@@ -350,7 +345,6 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `compressor.asc_metadata` | `CompressorMetadata.Config` | `CompressorMetadata.Config` | 独立预构建 compressor 状态表 |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | — |
 | `sparse_attn.pypto` (replaces `sparse_attn.asc`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` | — |
-| `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` | — |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -398,20 +392,18 @@ torchtitan_npu.override.common.swiglu_group.asc_shared_experts
 
 ```text
 torchtitan_npu.override.common.rope.workaround
-torchtitan_npu.override.deepseek_v4.sparse_attn.golden
 ```
 
-Golden recipe 不替换 RMSNorm 和 MoE：RMSNorm 使用模型配置中的 Torch 实现，MoE 使用
-当前模型路径中经过 package patch 修正的 BF16 实现。仓库不再提供独立的 GoldenRMSNorm
-或 GoldenMoE 入口。`sparse_attn.golden` 是逐文档 eager 数值参考，其 indexer score 和
-gather-matmul 使用 FP32 计算，并用于与 `dsv4-infer-npu` 基线及 AscendC 融合路径比较。
+参考 recipe 只替换 RoPE：RMSNorm 使用模型配置中的 Torch 实现，MoE 使用当前模型
+路径中经过 package patch 修正的 BF16 实现，attention 使用模型目录默认内核
+（Attention Gym 的 `gather_attn`，逐文档 FP32），不再有独立的 attention 数值基线
+入口。
 
-`sparse_attn.asc` 必须与 `sparse_attn.asc_metadata` 配套使用；
-`sparse_attn.golden` 使用模型默认的 metadata 构建（无扩展），不能再启用
-`sparse_attn.asc_metadata`。两种注意力实现声明同一 target，也不能同时启用。
+`sparse_attn.asc` 必须与 `sparse_attn.asc_metadata` 配套使用；它与
+`sparse_attn.pypto` 声明同一 target，不能同时启用。
 
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
-token 数时应调整 `seq_len`。Golden reference 与模型目录默认内核都使用公共的
+token 数时应调整 `seq_len`。参考 recipe（模型目录默认内核）使用公共的
 `CompressedVarlenMetadata`（只含 kernel contract 与 packed 偏移），当前仅支持无
 context parallel 的连续文档布局。AscendC 路径使用独立的精简
 `AscCompressedVarlenMetadata`，只携带 kernel contract 和预计算的 AscendC metadata。

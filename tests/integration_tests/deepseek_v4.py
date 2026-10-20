@@ -8,7 +8,7 @@ from dataclasses import replace
 from tests.integration_tests import OverrideDefinitions
 
 # DeepSeek-V4 NPU recipe from the example scripts.  Ascend attention and MHC
-# overrides are only used on the non-golden path.
+# overrides are only used on the fused path.
 NPU_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rms_norm.asc",
@@ -22,13 +22,12 @@ NPU_OVERRIDES = (
     "torchtitan_npu.override.common.token_dispatcher.asc",
 )
 
-# DeepSeek-V4 golden reference recipe. Golden uses the reference MoE token
-# dispatcher path so the checked-in loss baselines stay independent of the NPU
-# fused token-dispatcher implementation.
+# DeepSeek-V4 reference recipe. It runs the model-dir default (attn-gym's
+# reference attention and the reference MoE token dispatcher) so the checked-in
+# loss baselines stay independent of the NPU fused implementations.
 GOLDEN_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rope.workaround",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
 )
 
 

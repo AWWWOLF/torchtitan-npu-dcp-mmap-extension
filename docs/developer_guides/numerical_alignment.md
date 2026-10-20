@@ -87,7 +87,9 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 - 分别运行小算子基线和被测实现的前向计算；
 - 判断两种实现的 `logits` 和 `loss` 是否满足对应的精度要求，若被测实现为对小算子路径的修改，需满足 `比特一致`。
 
-示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较 Golden 和融合实现的 `loss`、`grad_norm`。
+示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较参考实现（模型默认 attention）和融合实现的 `loss`、`grad_norm`。
+
+注意：参考组合（模型默认 attention）不训练 `r=4` 层的 indexer——TopK 选择不可导，KL 蒸馏目标只在融合组合（`asc_li` / SLIG）中——对比 `indexer` 相关参数或依赖其梯度的 `grad_norm` 时不要把参考组合当作训练对照。参考组合因此只能配 AdamW；`DistMuon` 要求所有参数都有梯度，会报 `missing gradients`。
 
 训练对比默认使用 `seq_len=4096`；其他长度通过 `--seq-len` 统一指定。
 
@@ -111,8 +113,7 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 |---|---|
 | `torchtitan_npu/**` | `3.1`、`3.2`、`3.3`、`3.4` |
 | `torchtitan_npu/override/common` | `3.1`、`3.2`、`3.4` |
-| `torchtitan_npu/override/<golden.py>` | `3.1`、`3.2`、`3.4` |
-| `torchtitan_npu/override/<非common\非golden.py>` | `3.2`、`3.3`、`3.4` |
+| `torchtitan_npu/override/<model>/<非 common>` | `3.2`、`3.3`、`3.4` |
 | `scripts/checkpoint_conversion/**` | `3.1`、`3.4` |
 | `scripts/numerical_alignment/**` | `3.1`、`3.2`、`3.3` |
 | `scripts/run_train.sh` | `3.4` |

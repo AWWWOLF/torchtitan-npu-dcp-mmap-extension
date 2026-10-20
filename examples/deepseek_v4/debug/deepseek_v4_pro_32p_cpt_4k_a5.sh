@@ -9,7 +9,8 @@
 #   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
 #     ./examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
 #     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
-# USE_GOLDEN=1 selects Golden. For deterministic execution, append
+# USE_GOLDEN=1 selects the reference combination (the model's default attention).
+# For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
@@ -148,7 +149,6 @@ OPTIMIZER_OVERRIDES="
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
     )
 else
     NPU_OPS_OVERRIDES=(

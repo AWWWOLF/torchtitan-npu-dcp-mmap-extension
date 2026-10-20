@@ -5,10 +5,7 @@
 
 """Named override recipes for DeepSeek-V4 numerical checks."""
 
-GOLDEN_OVERRIDES = (
-    "torchtitan_npu.override.common.rope.workaround",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
-)
+GOLDEN_OVERRIDES = ("torchtitan_npu.override.common.rope.workaround",)
 
 TEST_OVERRIDES = (
     "torchtitan_npu.override.common.rms_norm.asc",

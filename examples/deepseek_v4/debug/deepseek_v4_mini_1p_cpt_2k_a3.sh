@@ -7,7 +7,8 @@
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
 #   ./examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --training.steps 5
-# USE_GOLDEN=1 selects Golden. For deterministic execution, append
+# USE_GOLDEN=1 selects the reference combination (the model's default attention).
+# For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
@@ -123,7 +124,6 @@ OPTIMIZER_OVERRIDES="
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
     )
 else
     NPU_OPS_OVERRIDES=(

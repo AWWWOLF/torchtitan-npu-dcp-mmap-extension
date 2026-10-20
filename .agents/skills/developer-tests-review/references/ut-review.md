@@ -66,7 +66,7 @@ checkpoint 测试必须断言本次修改涉及的具体 key、tensor、dtype、
 
 #### 1.9 多种实现的精确选择
 
-同一目标存在 `golden`、`cann`、`workaround` 或其他实现时，测试必须确认一条 `override.imports` 只启用请求的工厂，不隐式启用同模块的其他实现；带参数的配置条目要检查解析后的具体参数。
+同一目标存在 `asc`、`cann`、`workaround` 或其他实现时，测试必须确认一条 `override.imports` 只启用请求的工厂，不隐式启用同模块的其他实现；带参数的配置条目要检查解析后的具体参数。
 
 #### 1.10 自动生效的兼容 patch
 

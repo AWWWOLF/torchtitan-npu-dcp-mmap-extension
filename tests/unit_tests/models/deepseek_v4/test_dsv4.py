@@ -11,9 +11,8 @@ Numerics verification criterion: a match is only accepted when it is
 *bitwise*, or the residual sits at the fp32 rounding floor of the outputs
 (at most a few ulps of the output scale) — a floating-point artifact, not
 an arithmetic difference.  The compressor and the indexer are bitwise; the
-reference attention core vs the eager golden stays within 1.8 ulps (the golden
-is exact-fp32 by design, so its own f32/f64 delta is zero and the remaining
-residual is the flex path's fp32 rounding).
+attention core is attn-gym's reference path and is pinned by shape/finiteness
+and by the pool-gradient reproducibility guard below.
 
 Every comparison runs single-threaded (``_reproducible_numerics`` below): the
 pool gradient's backward accumulates duplicate contributions in a
@@ -33,7 +32,6 @@ from torchtitan.models.common.attention import VarlenMetadata
 pytestmark = pytest.mark.usefixtures("dsv4")
 
 DIM, HD, RD = 8, 16, 4
-_GRAD_ULPS = 4
 # Two documents longer than one compression block, with different tails (at
 # ratio 128 neither is a whole number of blocks).
 _GRADIENT_DOCS = (200, 133)
@@ -42,11 +40,10 @@ _EPS32 = 1.1920929e-7  # fp32 machine epsilon
 
 @pytest.fixture(autouse=True)
 def _reproducible_numerics():
-    """Pin the intra-op thread count so the rounding-floor residuals are reproducible.
+    """Pin the intra-op thread count so the pool gradient is reproducible.
 
-    The core and the golden both differentiate the *same* compressed-KV pool, and
-    both read it through advanced indexing (the golden's ``kv[batch, index, :]``,
-    attn-gym's ``kv[b, h, indices]``).  The pool's rows are read by many query
+    The core reads the compressed-KV pool through advanced indexing
+    (attn-gym's ``kv[b, h, indices]``).  The pool's rows are read by many query
     rows, so that gather's backward is an accumulate scatter (ATen lowers it to
     ``index_put_`` with ``accumulate=True``), and its CPU kernel sums the
     duplicate contributions in a thread-scheduling dependent order: measured in
@@ -54,16 +51,13 @@ def _reproducible_numerics():
     give different last bits from run to run at 16 threads with a non-uniform
     upstream gradient.
 
-    So with more than one intra-op thread each consumer drifts against *itself*
-    by up to ~3.5 ulps of ``cmp_k``'s scale, and the core-vs-golden residual
-    wanders between ~2.3 and ~5.2 ulps against this file's 4-ulp budget (an
-    in-process 100-rep loop of the comparison below: median 3.46, max 5.19, 25
-    runs over budget — only ``cmp_k`` moves; ``out``, ``q``, ``swa_k`` and
-    ``sink`` are bitwise constant).  Single-threaded every residual is bitwise
-    reproducible, with measured worsts of 1.8 (out), 1.1 (q), 1.4 (swa_k), 1.2
-    (cmp_k) and 0.0 (sink) ulps.  ``torch.use_deterministic_algorithms(True)``
-    does not help (torch does not call these kernels nondeterministic), and
-    neither does pinning ``MKL_DYNAMIC``/``OMP_NUM_THREADS`` to 16.
+    So with more than one intra-op thread the ``cmp_k`` gradient drifts against
+    itself by up to ~3.5 ulps of its scale (``out``, ``q``, ``swa_k`` and
+    ``sink`` stay bitwise constant).  Single-threaded every projection is exact,
+    which is what ``test_attention_pool_gradient_is_reproducible`` asserts.
+    ``torch.use_deterministic_algorithms(True)`` does not help (torch does not
+    call these kernels nondeterministic), and neither does pinning
+    ``MKL_DYNAMIC``/``OMP_NUM_THREADS`` to 16.
     """
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -554,7 +548,7 @@ def test_compressor_overlap_scatter_bitwise(dsv4, case, ratio):
 
 
 # ---------------------------------------------------------------------------
-# Attention numerics (the gather core vs the eager golden)
+# Attention numerics
 # ---------------------------------------------------------------------------
 
 
@@ -562,15 +556,15 @@ def _assert_rounding_floor(diff, scale, *, ulps: int = 4):
     """The residual must sit at the fp32 rounding floor of the outputs
     (<= ``ulps`` ulps of the output scale) — floating-point error only, not
     arithmetic (an arithmetic difference would exceed it by orders of
-    magnitude).  ``ulps=4`` is the suite-wide budget; the measured worsts are
-    1.8 (attention outputs) and 1.2 (attention gradients) ulps, reproducible
-    because the comparisons run single-threaded."""
+    magnitude).  ``ulps=4`` is the suite-wide budget; the compressor
+    comparison's measured worst is 1.8 ulps, reproducible because the suite
+    runs single-threaded."""
     assert scale > 0
     assert diff.max().item() <= ulps * _EPS32 * scale, (diff.max().item(), scale)
 
 
-def _build_attn_pair(dsv4, ratio, topk, *, indexer_loss_coeff: float = 1.0):
-    core = dsv4.attention.CompressedSparseInnerAttention(
+def _build_core(dsv4, ratio, topk):
+    return dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
             window_size=8,
             compress_ratio=ratio,
@@ -578,72 +572,17 @@ def _build_attn_pair(dsv4, ratio, topk, *, indexer_loss_coeff: float = 1.0):
             index_topk=topk,
         )
     )
-    golden = dsv4.golden.GoldenCompressedSparseInnerAttention(
-        dsv4.golden.GoldenCompressedSparseInnerAttention.Config(
-            window_size=8,
-            compress_ratio=ratio,
-            softmax_scale=0.25,
-            index_topk=topk,
-            indexer_loss_coeff=indexer_loss_coeff,
-        )
-    )
-    return core, golden
-
-
-def _assert_attn_matches_rounding_floor(dsv4, md, x, pos, ratio, topk):
-    torch.manual_seed(0)
-    q = torch.randn(1, 64, 3, HD)
-    swa_k = torch.randn(1, 64, HD)
-    sink = torch.randn(3)
-    cmp = None
-    aq = ak = aw = None
-    if ratio == 4:
-        aq = torch.randn(1, 64, 4, 8)
-        ak = torch.randn(1, 16, 8)
-        aw = torch.randn(1, 64, 4)
-        cmp = _pack_container(dsv4, build_compressor(dsv4, 4)(x, md), md.plans[4])
-    elif ratio > 1:
-        cmp = _pack_container(dsv4, build_compressor(dsv4, 128)(x, md), md.plans[128])
-    core, golden = _build_attn_pair(dsv4, ratio, topk)
-    with torch.no_grad():
-        # Both sides read the same packed selection, in its own numbering.
-        sparse = None
-        if ratio == 4:
-            sparse = dsv4.compressor.select_compressed_slots(
-                aq, ak, aw, md.varlen.cu_seq_q, md.plans[4].cu_seqlens_cmp_k, topk
-            )
-        out = core(q, swa_k, cmp, attn_sink=sink, sparse_indices=sparse, attention_masks=md)
-        gout = golden(q, swa_k, cmp, attn_sink=sink, sparse_indices=sparse, attention_masks=md)
-    assert out.shape == (1, 64, 3, HD) and torch.isfinite(out).all()
-    _assert_rounding_floor((out - gout).abs(), gout.abs().max().item())
-
-
-@pytest.mark.parametrize("ratio,topk", [(1, 0), (4, 8), (128, 0)])
-def test_attention_numerics_ratio(inputs, ratio, topk):
-    """Reference core vs the eager golden (SWA / CSA / HCA) — the residual
-    must sit at the fp32 rounding floor (bitwise-adjacent), proving the
-    difference is floating-point only, not arithmetic."""
-    dsv4, md, x, pos = inputs
-    _assert_attn_matches_rounding_floor(dsv4, md, x, pos, ratio, topk)
 
 
 def test_attention_numerics_ratio4_zero_blocks(dsv4):
-    """The ratio-4 reference path with zero complete blocks — shape/finite
-    (no numerics to compare; the golden is not exercised)."""
+    """The ratio-4 reference path with zero complete blocks — shape/finite."""
     cu = torch.tensor([0, 3, 8], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=5, max_k=5)
     md_s = dsv4.metadata.build_compressed_varlen_metadata(v, (4,))
     comp_s = build_compressor(dsv4, 4)
     cmp_s = _pack_container(dsv4, comp_s(torch.randn(1, 8, DIM), md_s), md_s.plans[4])
     assert cmp_s.shape == (1, 2, 16)
-    core_s = dsv4.attention.CompressedSparseInnerAttention(
-        dsv4.attention.CompressedSparseInnerAttention.Config(
-            window_size=8,
-            compress_ratio=4,
-            softmax_scale=0.25,
-            index_topk=4,
-        )
-    )
+    core_s = _build_core(dsv4, 4, 4)
     with torch.no_grad():
         sparse_s = dsv4.compressor.select_compressed_slots(
             torch.randn(1, 8, 4, 8),
@@ -669,11 +608,11 @@ def test_attention_numerics_ratio4_zero_blocks(dsv4):
 
 
 def _gradient_case(dsv4, ratio=4):
-    """The gradient comparison's inputs: one pool, one selection, one draw per consumer.
+    """The gradient case's inputs: one pool, one selection, one draw per pass.
 
-    One input set is built for both consumers, so any difference in the outputs
-    or the gradients is arithmetic, not a different draw.  Raises if the pool is
-    empty, i.e. if the case stops exercising the compressed path.
+    One input set is built for both passes, so any difference in the gradients is arithmetic, not
+    a different draw.  Raises if the pool is empty, i.e. if the case stops exercising the
+    compressed path.
     """
     torch.manual_seed(0)
     docs = _GRADIENT_DOCS
@@ -703,43 +642,16 @@ def _gradient_case(dsv4, ratio=4):
         pool.detach().clone(),
         sink,
     )
-    core, golden = _build_attn_pair(dsv4, ratio, 8 if ratio == 4 else 0, indexer_loss_coeff=0.0)
-    return md, sparse, base, core, golden
+    return md, sparse, base, _build_core(dsv4, ratio, 8 if ratio == 4 else 0)
 
 
 def _consumer_grads(consumer, sparse, md, base):
-    """One differentiated pass; each consumer gets its own differentiable copy."""
+    """One differentiated pass; each pass gets its own differentiable copy."""
     q, swa_k, cmp_k, attn_sink = (t.detach().clone().requires_grad_() for t in base)
     out = consumer(q, swa_k, cmp_k, attn_sink=attn_sink, sparse_indices=sparse, attention_masks=md)
     upstream = torch.linspace(-1, 1, out.numel()).reshape_as(out)
     (out * upstream).sum().backward()
     return out, (q.grad, swa_k.grad, cmp_k.grad, attn_sink.grad)
-
-
-@pytest.mark.parametrize("ratio", [4, 128])
-def test_attention_gradients_match_the_golden(dsv4, ratio):
-    """Two documents longer than 128 tokens with different tails, differentiated end to end.
-
-    The compressed pool is non-empty at both ratios, the golden's own LI auxiliary loss is off
-    so both passes carry the same objective, and the q / swa_k / cmp_k gradients are compared in
-    addition to the outputs (the case above only compared outputs, under ``no_grad``, on a
-    64-token row whose ratio-128 pool is empty)."""
-    md, sparse, base, core, golden = _gradient_case(dsv4, ratio)
-    seqlen = base[0].shape[1]
-    outs, grads = [], []
-    for consumer in (core, golden):
-        out, grad = _consumer_grads(consumer, sparse, md, base)
-        outs.append(out)
-        grads.append(grad)
-
-    core_out, golden_out = outs
-    assert core_out.shape == golden_out.shape == (1, seqlen, 3, HD)
-    _assert_rounding_floor((core_out - golden_out).abs(), golden_out.abs().max().item())
-    for name, core_grad, golden_grad in zip(("q", "swa_k", "cmp_k", "sink"), *grads):
-        assert core_grad is not None and golden_grad is not None, name
-        _assert_rounding_floor(
-            (core_grad - golden_grad).abs(), golden_grad.abs().max().item(), ulps=_GRAD_ULPS
-        )
 
 
 def test_attention_pool_gradient_is_reproducible(dsv4):
@@ -749,29 +661,28 @@ def test_attention_pool_gradient_is_reproducible(dsv4):
     pool gradient is the backward of the gather that reads the pool, an
     accumulate scatter whose contributions are summed in a thread-scheduling
     dependent order, so with more than one intra-op thread even one consumer
-    disagrees with itself by up to ~3.5 ulps of ``cmp_k``'s scale — and the
-    core-vs-golden residual the test above asserts on then wanders between ~2.3
-    and ~5.2 ulps against its 4-ulp budget.  The thread-count assertion keeps
-    this guard deterministic; without it the two runs only *usually* differ.
+    disagrees with itself by up to ~3.5 ulps of ``cmp_k``'s scale.  The
+    thread-count assertion keeps this guard deterministic; without it the two
+    runs only *usually* differ.
     """
     assert torch.get_num_threads() == 1, "the module fixture must pin the intra-op threads"
-    md, sparse, base, core, _golden = _gradient_case(dsv4)
+    md, sparse, base, core = _gradient_case(dsv4)
     _out, (_q_grad, _swa_k_grad, first, _sink_grad) = _consumer_grads(core, sparse, md, base)
     _out, (_q_grad, _swa_k_grad, second, _sink_grad) = _consumer_grads(core, sparse, md, base)
 
     assert torch.equal(first, second), (
         "the pool gradient must be reproducible; a thread-dependent accumulate "
-        "scatter in its backward makes the rounding-floor comparison above flaky"
+        "scatter in its backward makes any rounding-floor comparison flaky"
     )
 
 
-def test_reference_consumers_reject_context_parallel_frames(dsv4):
-    """The default core and the golden refuse context-parallel frames.
+def test_reference_core_rejects_context_parallel_frames(dsv4):
+    """The default core refuses context-parallel frames.
 
     Under CP the query offsets describe this rank's chunks while the compressed pool is the
     gathered row, so a reference consumer would read boundaries that are not there.  The
     reference tier used to refuse the shape on the consumers' behalf; now that the default
-    extension is the identity, the consumers refuse it themselves, and the fused kernels keep
+    extension is the identity, the consumer refuses it itself, and the fused kernels keep
     taking the frames through their own metadata."""
     from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
@@ -784,14 +695,13 @@ def test_reference_consumers_reject_context_parallel_frames(dsv4):
     assert not torch.equal(cp_meta.cu_seq_q, cp_meta.cu_seq_k)
     md = dsv4.metadata.CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window)
     seqlen = int(cp_meta.cu_seq_q[-1])
-    core, golden = _build_attn_pair(dsv4, 4, 4)
+    core = _build_core(dsv4, 4, 4)
 
-    for consumer in (core, golden):
-        with pytest.raises(ValueError, match="context parallel"):
-            consumer(
-                torch.randn(1, seqlen, 3, HD),
-                torch.randn(1, seqlen, HD),
-                None,
-                attn_sink=torch.randn(3),
-                attention_masks=md,
-            )
+    with pytest.raises(ValueError, match="context parallel"):
+        core(
+            torch.randn(1, seqlen, 3, HD),
+            torch.randn(1, seqlen, HD),
+            None,
+            attn_sink=torch.randn(3),
+            attention_masks=md,
+        )

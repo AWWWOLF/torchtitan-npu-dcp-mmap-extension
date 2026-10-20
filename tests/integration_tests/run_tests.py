@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -327,17 +328,20 @@ def _run_cmd(
     cmd: list[str],
     env: dict[str, str],
     timeout: float | None = None,
+    *,
+    prefix: str | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``cmd`` (an argv list, no shell), capturing merged stdout/stderr.
+    """Run ``cmd`` (an argv list, no shell), streaming merged stdout/stderr live.
 
-    Output is *not* streamed to the parent in real time: when running tests
-    concurrently we want each test's log to appear as one contiguous block
-    rather than interleaved line-by-line with other tests.
+    Each line is written through the output lock, prefixed with the case name, so
+    concurrent cases stay attributable while their progress is visible as it
+    happens: a case the platform kills still leaves the lines it printed, which is
+    what makes a stalled case diagnosable.  The last lines are kept on the result's
+    ``stdout`` for the failure message.
 
     On timeout the child's whole process group is terminated (see
     ``_terminate_process_group``) and a synthetic ``CompletedProcess`` with
-    ``returncode=-1`` is returned, with ``stdout`` populated with whatever the
-    child had emitted so far, so callers do not need to special-case
+    ``returncode=-1`` is returned, so callers do not need to special-case
     ``TimeoutExpired``.
     """
     proc = subprocess.Popen(
@@ -349,28 +353,37 @@ def _run_cmd(
         encoding="utf-8",
         errors="replace",
         start_new_session=True,
+        bufsize=1,
     )
+    tail: deque[str] = deque(maxlen=200)
+
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            tail.append(line)
+            if prefix is None:
+                with _OUTPUT_LOCK:
+                    sys.stderr.write(f"{line}\n")
+                    sys.stderr.flush()
+            else:
+                _emit_line(prefix, line)
+
+    reader = threading.Thread(target=_pump, name=f"run-cmd-{prefix or 'case'}", daemon=True)
+    reader.start()
     try:
-        stdout, _ = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout or "", stderr=None)
+        returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _terminate_process_group(proc)
-        stdout, _ = proc.communicate()
-        return subprocess.CompletedProcess(cmd, -1, stdout=stdout or "", stderr=None)
+        returncode = -1
+    reader.join(timeout=30)
+    return subprocess.CompletedProcess(cmd, returncode, stdout="\n".join(tail), stderr=None)
 
 
-def _emit_block(prefix: str, header: str, body: str, footer: str = "") -> None:
-    """Atomically write a multi-line block prefixed with ``[prefix] ``.
-
-    Holds the global output lock for the entire block so concurrent tests do
-    not interleave their lines.
-    """
+def _emit_line(prefix: str, line: str) -> None:
+    """Write one case-owned output line, holding the cross-case output lock."""
     with _OUTPUT_LOCK:
-        sys.stderr.write(header)
-        for line in body.splitlines():
-            sys.stderr.write(f"[{prefix}] {line}\n")
-        if footer:
-            sys.stderr.write(footer)
+        sys.stderr.write(f"[{prefix}] {line}\n")
         sys.stderr.flush()
 
 
@@ -424,12 +437,9 @@ def _check_phase_results(
         try:
             assert_losses_equal(golden_losses, test_losses)
         except AssertionError:
-            mismatch_body = "\n".join(f"[GOLDEN_MISMATCH] {step} {test_losses[step]}" for step in sorted(test_losses))
-            _emit_block(
-                test_name,
-                f"[GOLDEN_MISMATCH] {test_name} — dumping actual losses for regeneration:\n",
-                mismatch_body,
-            )
+            _emit_line(test_name, f"[GOLDEN_MISMATCH] {test_name} — dumping actual losses for regeneration:")
+            for step in sorted(test_losses):
+                _emit_line(test_name, f"[GOLDEN_MISMATCH] {step} {test_losses[step]}")
             raise
 
 
@@ -510,21 +520,22 @@ def run_single_test(
         )
 
         start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        # torchtitan-npu override: capture the child output and emit it as one
-        # contiguous block, so concurrently running tests never interleave
-        # their lines.
-        result = _run_cmd(cmd, env=env, timeout=test_flavor.timeout)
-        returncode = result.returncode
-        captured = result.stdout or ""
-
-        end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         header = (
-            f"===== [{test_name}] start {start_ts} end {end_ts} "
-            f"flavor: {test_flavor.test_descr} (rc={returncode}) =====\n"
+            f"===== [{test_name}] start {start_ts} flavor: {test_flavor.test_descr} =====\n"
             f"===== [{test_name}] command: {shown_cmd} =====\n"
         )
-        footer = f"===== [{test_name}] end of output (rc={returncode}) =====\n"
-        _emit_block(test_name, header, captured, footer)
+        with _OUTPUT_LOCK:
+            sys.stderr.write(header)
+            sys.stderr.flush()
+        # torchtitan-npu override: stream the child's output as it is produced,
+        # under the case's own prefix, so a case that never finishes still shows
+        # where it stopped in the platform log.
+        result = _run_cmd(cmd, env=env, timeout=test_flavor.timeout, prefix=test_name)
+        returncode = result.returncode
+        captured = result.stdout or ""
+        with _OUTPUT_LOCK:
+            sys.stderr.write(f"===== [{test_name}] end of output (rc={returncode}) =====\n")
+            sys.stderr.flush()
 
         if returncode != 0:
             tail = "\n".join(captured.splitlines()[-50:])

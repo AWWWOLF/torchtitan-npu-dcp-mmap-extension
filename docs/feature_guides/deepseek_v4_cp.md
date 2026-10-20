@@ -1,6 +1,6 @@
 # DeepSeek-V4 上下文并行（CP）
 
-DeepSeek-V4（DSV4）在文档打包序列上训练时，压缩注意力（CSA/HCA）的 KV 块按压缩比 `r` 对齐文档前缀：块可能跨越相邻 CP 卡的边界，各 rank 可压缩的块数随文档分布不均，查询可见的滑窗行与压缩块是文档相对范围。本仓为 DSV4 的 AscendC 融合路径实现了上下文并行：每个 batch 由 `build_cp_plan` 从切分前的全局文档结构纯本地推导出「计划」，`CPTokenDispatcher` 按计划完成窗口行与压缩块的 gather，以及压缩容器的声明式 all-gather。context parallel 由 CLI 参数 `--parallelism.context-parallel-degree` 激活（配合 `--parallelism.spmd-backend=spmd_types`）。参考内核与 golden 数值基线不启用 CP。
+DeepSeek-V4（DSV4）在文档打包序列上训练时，压缩注意力（CSA/HCA）的 KV 块按压缩比 `r` 对齐文档前缀：块可能跨越相邻 CP 卡的边界，各 rank 可压缩的块数随文档分布不均，查询可见的滑窗行与压缩块是文档相对范围。本仓为 DSV4 的 AscendC 融合路径实现了上下文并行：每个 batch 由 `build_cp_plan` 从切分前的全局文档结构纯本地推导出「计划」，`CPTokenDispatcher` 按计划完成窗口行与压缩块的 gather，以及压缩容器的声明式 all-gather。context parallel 由 CLI 参数 `--parallelism.context-parallel-degree` 激活（配合 `--parallelism.spmd-backend=spmd_types`）。参考内核不启用 CP。
 
 本文是 CP 功能的**实施交接文档**，目标读者是接手 DSV4 CP 开发的后续开发者：先看「启用方式」「设计要点」「关键设计决策」掌握整体方案与取舍依据，再看「每层数据流」「压缩器在 CP 下的工作方式」（含图示）与「组件与文件」定位代码，最后按「验证方式」执行回归。已知限制与内核契约均记录在案。
 
@@ -16,7 +16,7 @@ NGPU=2 \
 
 - `--parallelism.context-parallel-degree > 1` 时即启用 CP；必须配合 `--parallelism.spmd-backend spmd_types`（`spmd_types` 后端是压缩容器 `S(1) -> R` 声明式 all-gather 的前提）。
 - `--parallelism.context-parallel-load-balancer` 支持 `headtail`（默认）与 `None`（plain 顺序切分）。headtail 要求 `seq_len` 整除 `2 * context_parallel_degree`，plain 要求整除 `context_parallel_degree`，不满足时 `_build_cp_metadata` 直接报错。
-- 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效：分片帧由融合 metadata 承载，模型目录自带的默认内核与 golden 读不了这些帧，因而都只支持无 CP。
+- 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效：分片帧由融合 metadata 承载，模型目录自带的默认内核读不了这些帧，因而只支持无 CP。
 - `local_batch_size == 1` 是当前文档打包约定（增大批数据应提高 `seq_len`）；DSA 路径 TP 固定为 1。
 
 ## 设计要点
@@ -56,7 +56,7 @@ NGPU=2 \
 
 9. **内核契约是方案的前提**。窗口打包依赖内核「窗口范围由属性决定而非区间长度」（端对齐坐标），CP 与参考的可见范围一致依赖内核的 p0 通道（`limit(pos) = floor((p0 + pos + 1) / r)`）。计划据此构造 `cu_seqlens_cmp_k` / `block_remainder`（文档相对块数与余数）与 `cu_seqlens_ori_kv`（窗口长度前缀和），修改计划必须保持这两个内核语义不变。
 
-10. **参考实现与 golden 不启用 CP**。两者按连续文档（`cu_seq_q == cu_seq_k`）构建，对 CP 形状流显式报错；数值验收以融合路径自身的三配置一致性为准。
+10. **参考实现不启用 CP**。模型目录的默认内核按连续文档（`cu_seq_q == cu_seq_k`）构建，对 CP 形状流显式报错；数值验收以融合路径自身的三配置一致性为准。
 
 ## 每层数据流
 
@@ -195,7 +195,7 @@ pytest tests/unit_tests
 | `test_cp_dispatch.py::test_multiprocess_gloo` | 真实双进程集合通信（不均衡 alltoallv、压缩级 all-gather）的分组与偏移语义 |
 | `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py`（矩阵） | 压缩数学本身：plain/headtail、cp 1~8、ratio 4/128，f32/f64 双精度矩阵；f64 预算在浮点噪声底（逐位量级），f32 在单精度舍入量级 |
 | `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py::test_degeneracy` | 计划推导的无漂移护栏：cp=1 的 `build_cp_plan` 与非 CP `build_kernel_layout` 五个契约字段逐位一致 |
-| `tests/unit_tests/models/deepseek_v4/test_dsv4.py`（数值系列） | 非 CP 基线：压缩器对独立逐文档参考、重叠掩码逐位、索引器选择、参考内核对 golden 的舍入底比对 |
+| `tests/unit_tests/models/deepseek_v4/test_dsv4.py`（数值系列） | 非 CP 基线：压缩器对独立逐文档参考、重叠掩码逐位、索引器选择、参考内核以形状/有限值与 pool 梯度可复现性守护 |
 
 定位路径与「已知数值边界」对应：上述用例全部通过时，组装的数据与键对 oracle 一致，发散必然位于内核层（几何 / 选择 / 梯度三类来源）；任一失败则说明 CP 数据路径本身被改坏，按失败用例定位。
 

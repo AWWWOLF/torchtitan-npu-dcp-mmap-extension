@@ -45,7 +45,7 @@ def test_debugmodel_uses_cann_profiler_extension():
 def test_every_layer_pins_the_core_config_the_overrides_target():
     """The sparse core's config type is the anchor the fused overrides replace.
 
-    ``asc``/``pypto``/``golden`` are registered against exactly this type, so a model that
+    ``asc``/``pypto`` are registered against exactly this type, so a model that
     moved to another Config class would quietly run the reference core instead of the fused
     one.  The core's implementation may change; this anchor may not.
     """

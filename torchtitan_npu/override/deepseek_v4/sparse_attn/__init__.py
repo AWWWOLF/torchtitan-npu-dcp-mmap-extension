@@ -1,13 +1,14 @@
 """DeepSeek-V4 sparse-attention overrides (registry-facing module).
 
 The AscendC fused implementation (metadata extension + kernel) lives in
-``ascendc.py``, the eager golden reference in ``golden.py``; the registrations
-are defined here so the override paths stay
-``override.deepseek_v4.sparse_attn.{asc_li_metadata, asc_li,
-asc_metadata, asc, pypto, golden}``.  The
-model's ``build_attention_masks`` owns the per-batch metadata construction
-(including context parallel); the ``asc_metadata`` override injects the
-AscendC kernel-metadata extension (the model dir stays backend-agnostic).
+``ascendc.py``, the PyPTO variant in ``pypto.py``; the registrations are defined
+here so the override paths stay
+``override.deepseek_v4.sparse_attn.{asc_li_metadata, asc_li, asc_metadata, asc,
+pypto, pypto_li}``.  The model's ``build_attention_masks`` owns the per-batch
+metadata construction (including context parallel); the ``asc_metadata``
+override injects the AscendC kernel-metadata extension (the model dir stays
+backend-agnostic).  The reference tier is attn-gym's own attention, i.e. the
+model default, so no override selects it.
 """
 
 from typing import TYPE_CHECKING
@@ -23,8 +24,6 @@ from torchtitan_npu.models.common.metadata_extension import (
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
 
-from .golden import GoldenCompressedSparseInnerAttention
-
 if TYPE_CHECKING:
     from .ascendc import AscCompressedSparseInnerAttention
     from .pypto import PyPTOCompressedSparseInnerAttention
@@ -38,7 +37,7 @@ if TYPE_CHECKING:
 def asc_metadata(
     cfg: SparseAttentionMetadata.Config,
 ) -> SparseAttentionMetadata.Config:
-    # Imported lazily so the golden path does not require cann_ops_transformer.
+    # Imported lazily so the reference path does not require cann_ops_transformer.
     from .ascendc import AscMetadataExtension
 
     return derive(cfg, SparseAttentionMetadata.Config, extension=AscMetadataExtension)
@@ -77,7 +76,7 @@ def asc(
     cfg: CompressedSparseInnerAttention.Config,
     indexer_loss_coeff: float = 1.0,
 ) -> "AscCompressedSparseInnerAttention.Config":
-    # Imported lazily so the golden path does not require cann_ops_transformer.
+    # Imported lazily so the reference path does not require cann_ops_transformer.
     from .ascendc import AscCompressedSparseInnerAttention
 
     # ``sharding_config`` is copied from the source by ``derive``; the
@@ -106,7 +105,7 @@ def pypto(
     cfg: CompressedSparseInnerAttention.Config,
     indexer_loss_coeff: float = 1.0,
 ) -> "PyPTOCompressedSparseInnerAttention.Config":
-    # Imported lazily so the golden path does not require cann_ops_transformer.
+    # Imported lazily so the reference path does not require cann_ops_transformer.
     from .pypto import PyPTOCompressedSparseInnerAttention
 
     return derive(
@@ -125,18 +124,3 @@ def pypto_li(cfg: LightningIndexer.Config):
     from .pypto import PyPTOLightningIndexer
 
     return derive(cfg, PyPTOLightningIndexer.Config)
-
-
-@override(
-    target=CompressedSparseInnerAttention.Config,
-    exact=True,
-    description=("DSV4 sparse attention golden reference"),
-)
-def golden(
-    cfg: CompressedSparseInnerAttention.Config,
-    indexer_loss_coeff: float = 1.0,
-) -> GoldenCompressedSparseInnerAttention.Config:
-    result = derive(cfg, GoldenCompressedSparseInnerAttention.Config, indexer_loss_coeff=indexer_loss_coeff)
-    if result.sharding_config is not None:
-        result.sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(tp=spmd.R)
-    return result

@@ -103,7 +103,7 @@ def _parse_args() -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=1,
-        help="input batch size (Golden supports only 1)",
+        help="input batch size (must be 1: the attention metadata is one packed sequence)",
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default="npu")
@@ -111,7 +111,11 @@ def _parse_args() -> argparse.Namespace:
         "--mode",
         choices=("bitwise", "close"),
         default="bitwise",
-        help="logits gate: exact equality or numerical approximation",
+        help=(
+            "logits gate: 'bitwise' compares the two implementations element for element (the "
+            "Transformers patch reuses the model's attn-gym reference attention, so it holds); "
+            "'close' applies the numerical thresholds instead"
+        ),
     )
     parser.add_argument(
         "--trace-modules",
@@ -123,6 +127,11 @@ def _parse_args() -> argparse.Namespace:
         "--attention",
         choices=("golden", "test"),
         default="golden",
+        help=(
+            "golden (historical name; there is no golden implementation any more): the model-dir "
+            "default attention, i.e. attn-gym's reference path with no attention override; "
+            "test: the AscendC override stack"
+        ),
     )
     parser.add_argument(
         "--apply-transformers-patch",
@@ -142,11 +151,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--n-layers, --seq-len and --batch-size must be positive")
     if args.n_layers > dsv4_config.DEFAULT_N_LAYERS:
         parser.error("--n-layers must be in [1, 4] for the inference reference")
-    if args.attention == "golden":
-        if args.batch_size != 1:
-            parser.error("Golden attention requires --batch-size=1 for the packed metadata layout")
-        if args.seq_len % 128 != 0:
-            parser.error("Golden attention requires --seq-len to be divisible by 128")
+    if args.batch_size != 1:
+        parser.error("this recipe requires --batch-size=1: the attention metadata is one packed sequence")
+    if args.attention == "golden" and args.seq_len % 128 != 0:
+        parser.error("the model-dir default attention requires --seq-len to be divisible by 128")
     if args.device.split(":", 1)[0] != "npu":
         parser.error("this alignment recipe requires an NPU device")
     for requested, module in (

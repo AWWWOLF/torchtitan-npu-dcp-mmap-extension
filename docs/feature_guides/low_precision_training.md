@@ -231,7 +231,7 @@ attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K �
 
 启动日志中的 `Applied TorchAO-NPU recipe=...` 表示 recipe 已应用；同时检查 `mxfp4_qat`、`li_quantization`、`sparse_attention_quantization` 和 `enable_fsdp_prequantize` 是否符合预期。预量化白名单的生效来源由 `fsdp_prequantize whitelist = recipe default ...`（默认白名单）或 `fsdp_prequantize whitelist = user ...`（用户白名单）日志行确认。该日志用于确认配置应用情况，不能替代训练精度和性能验证。
 
-需要采集性能信息时，可增加 `--profiler.enable-profiling`。示例脚本中的 `USE_GOLDEN=1` 用于选择数值基线 attention override，默认使用 Ascend 融合路径；该变量不控制低精度训练总开关。
+需要采集性能信息时，可增加 `--profiler.enable-profiling`。示例脚本中的 `USE_GOLDEN=1` 用于选择参考 recipe（模型目录默认 attention，attn-gym 的 `gather_attn`），默认使用 Ascend 融合路径；该变量不控制低精度训练总开关。
 
 ## 实现与验证入口
 

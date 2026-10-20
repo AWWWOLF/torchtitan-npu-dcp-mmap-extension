@@ -133,7 +133,6 @@ OPTIMIZER_OVERRIDES="
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
     )
 else
     NPU_OPS_OVERRIDES=(
