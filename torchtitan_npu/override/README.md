@@ -430,7 +430,7 @@ runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | SMLA 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 SMLA 与 indexer 元数据（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；记录几何是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状 |
+| `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | AscendC attention 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 attention 与 indexer 的 metadata（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；kernel geometry 是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状。本入口不声明任何量化：量化 selector 的 metadata 属于量化后的 attention backend，它替换本节点并自建 entry（见下文），本入口在那条路径上不生效 |
 | `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
@@ -450,7 +450,7 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 入口都要求 `num_max_tokens_per_rank`，取值需覆盖该次运行的最大 batch。启用方式见
 [V4.1 独立训练基线](../../examples/deepseek_v4_1/readme.md)。
 
-#### `sparse_attn.asc` 的记录几何是 override 的参数
+#### `sparse_attn.asc` 的 kernel geometry 是 override 的参数
 
 SMLA 与 indexer 的 metadata 都是 AI_CPU 算子，只依赖本次 forward 的 frames 与静态几何，
 所以它们在 `build_attention_metadata`（每 microbatch 一次的 eager 边界）里预计算，随 map entry
@@ -467,19 +467,56 @@ torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc={"num_heads":8,"head_dim":
 
 参数默认值为 `num_heads=64, head_dim=512, index_topk=512, index_num_heads=32, index_head_dim=128`，
 即 V4.1-Flash 的发布形状；端口自己的 config 顶层则是**必填、无默认值**，所以一层一定会读到
-按它自己那五个数构建的记录。**没有 inline 回退**：记录是内核 metadata 的唯一来源，因此
+按它自己那五个数构建的 metadata。**没有 inline 回退**：这些 metadata 是内核的唯一来源，因此
 
-- 端口 config 上的五个数是必需的，缺一个就 `TypeError`，不存在「依赖默认值静默按发布形状构建」
-  的情况，也不会在层里补一次 AI_CPU 调用；
-- 记录挂在 entry 的 `aicpu_metadata` 字段上（`sparse_attn` / `sparse_attn_grad` /
-  `lightning_indexer` / `lightning_indexer_kl_loss_grad`），消费者直接读字段：一条 entry 就是
-  一个几何，没有按 topk 或按几何查表的步骤，因而不存在「查不到」这类运行期错误；
+- config 上的五个数是必需的，缺一个就 `TypeError`，不存在「依赖默认值静默按发布形状构建」的
+  情况，也不会在层里补一次 AI_CPU 调用；
+- metadata 挂在 entry 的 `aicpu_metadata` 上，**按消费它的 kernel 分组、按方向取值**：
+
+  ```text
+  aicpu_metadata
+  + sparse_attn
+    + fwd   -> sparse_flash_mla_metadata
+    + bwd   -> sparse_flash_mla_grad_metadata
+  + lightning_indexer
+    + fwd   -> lightning_indexer_metadata
+    + bwd   -> sparse_lightning_indexer_kl_loss_grad_metadata
+  ```
+
+  消费者直接读字段（`aicpu_metadata.sparse_attn.fwd`），一条 entry 就是一个几何，没有按 topk
+  或按几何查表的步骤；
 - 默认值与 config 字段的对应由 `tests/unit_tests/override/deepseek_v4_1/test_fused_geometry.py`
   对着模型自己的取值核对（debug flavor 与默认形状不同，因此它的配方必须显式声明）。
 
-每个 `(port, compress_ratio)` 是 map 里的一个 entry，所以一个 40 层、三个几何的栈只建三份
-记录（不是四十份），也不需要任何一层知道整个栈的 ratio 表；CP 下由该 entry 自己的
-`prepare_cp_metadata` 按 rank-local frames 重建记录。
+每个 `(config 类, compress_ratio)` 是 map 里的一个 entry，所以一个 40 层、三个几何的栈只建三份
+metadata（不是四十份），也不需要任何一层知道整个栈的 ratio 表；CP 下由该 entry 自己的
+`prepare_cp_metadata` 按 rank-local frames 重建。
+
+#### 量化路径是另一个 backend：它自己建自己的 entry
+
+量化后的 sparse attention（`torchao_npu` 里 fused AscendC attention 的拷贝）不是这一版的包装，
+而是**另一个 backend**，因此它自己拥有 entry：量化适配层在 converter 里安装
+`QuantV41SparseAttention.Config`，它覆写 `build_attention_metadata`，用参考 row 与本几何的三个
+frame 建出四份 metadata（SMLA 前后向、量化 selector 的两条 schedule）。入口没有量化词汇：`asc`
+的参数列表不变，量化与否只决定「哪个 config 类被安装」。
+
+两条路径的 entry 接口是同一个：
+
+```text
+lightning_indexer
++ fwd            -> 打分层的 QLI schedule（建池与 pool-free 共用；与池宽度无关，宽度是 launch 参数）
++ fwd_sparse     -> 搜候选池的 QSLI schedule（按几何建；非量化路径暂空，等带 candidate 的非量化算子）
++ sparse_length  -> QSLI 的 per-row 候选数（同上，按几何建）
++ bwd            -> sparse_lightning_indexer_kl_loss_grad（教师边，两条精度路径共用）
+```
+
+- 候选池的两个数来自模型 config（每一层 selector 自己的字段），只出现在 launch 参数与候选数推导里；
+- 量化 selector 与量化 sparse attention **必须同开**：非量化 attention 的 entry 装的是 BF16
+  的 schedule，量化 kernel 读它不是「稍差一点」而是垃圾索引；
+- 没有池（`candidate_topk_blocks <= 0`）时 `fwd` 仍然是量化 QLI 的那份（pool-free 层也要跑 QLI），
+  只有 `fwd_sparse` / `sparse_length` 为空；
+- CP：非量化 entry 由 port 的 `prepare_cp_metadata` 按 rank-local frames 重建；量化 entry 目前
+  只支持 CP=1，其余情况显式报错。
 
 #### indexer 只在两个 override 同开时学习
 

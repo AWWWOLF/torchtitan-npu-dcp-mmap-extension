@@ -43,14 +43,14 @@ def v41_metadata():
     The test states the bounds it wants to exercise; the positions that produce them are
     rebuilt here, so the metadata comes from the same builders the attention backends call
     rather than being hand-rolled.  One ``arange`` per document, concatenated, is what a packed
-    loader emits, and the entry is the row plus one ratio's frames and records -- what a fused
-    layer is handed.
+    loader emits, and the entry is the row plus one ratio's frames and metadata -- what the
+    AscendC attention layer is handed.
 
-    Records are sized by the geometry and every build produces them -- the port has no inline
+    The metadata is sized by the geometry and every build produces it -- the port has no inline
     operator path -- so an entry is always built *for a layer*: state that layer's geometry, or
     hand over its ``port`` config and let it build the entry, which is what a run does.  One of
-    the two is required precisely because a default would silently size records for the released
-    shape, which no test here runs.
+    the two is required precisely because a default would silently size the metadata for the
+    released shape, which no test here runs.
     """
 
     def _build(

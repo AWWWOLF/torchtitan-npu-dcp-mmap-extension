@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""What the fused ports read off a context-parallel forward's frames.
+"""What the AscendC attention reads off a context-parallel forward's frames.
 
 A sharded forward expresses each rank's per-document reach as the frame's per-sequence length, so
 these tests pin the operands the operators actually receive: the query axis is the rank's chunk
@@ -32,8 +32,8 @@ _WINDOW = 128
 # One geometry per entry: a ratio is what the *entry* is built for, so a test states the one
 # it exercises instead of a stack-wide table.
 _RATIO = 2
-# The port's record geometry, at the small widths these tests run.  Only the frames are read
-# here, but a build always produces the records, so the numbers are stated rather than omitted.
+# The port's kernel geometry, at the small widths these tests run.  Only the frames are read
+# here, but a build always produces the metadata, so the numbers are stated rather than omitted.
 _GEOMETRY = dict(num_heads=2, head_dim=4, index_topk=8, index_num_heads=4, index_head_dim=4)
 
 
@@ -50,7 +50,7 @@ def _row(positions: torch.Tensor, ratio: int):
 def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _RATIO):
     """One geometry's frames, or this rank's after the CP re-cut.
 
-    This is what a fused port's ``AscV41Metadata.prepare_cp_metadata`` runs -- the seam's hook
+    This is what the AscendC attention's ``AscV41Metadata.prepare_cp_metadata`` runs -- the seam's hook
     delegates to the same function -- and the frames it returns are the ones the operators grid,
     so the tests below read them through the same option builder the kernels are called with.
     """

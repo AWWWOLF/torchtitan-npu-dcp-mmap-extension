@@ -21,6 +21,8 @@ from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AicpuMetadata,
+    AscLightningIndexerMetadata,
+    AscSparseAttentionMetadata,
     KernelFrame,
 )
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
@@ -85,29 +87,33 @@ def kernel_options(
 
 
 # ---------------------------------------------------------------------------
-# The fused entry: this geometry's frames and its AI_CPU records
+# The entry: this geometry's frames and its AI_CPU metadata
 # ---------------------------------------------------------------------------
 #
-# The four AI_CPU metadata operators depend only on the frames of one forward and the layer's
-# static geometry, never on the operands, so they are computed once per microbatch and read by
-# every layer of the geometry instead of being re-run per layer inside the compiled region.
+# The AI_CPU metadata operators depend only on the frames of one forward and the layer's static
+# geometry, never on the operands, so they are computed once per microbatch and read by every layer
+# of the geometry instead of being re-run per layer inside the compiled region.  This module builds
+# exactly what its own kernels read: the sparse attention's pair and the BF16 selector's pair.  A
+# stack that runs a different backend (the quantized attention) builds its own entry there -- the
+# `fwd_sparse` / `sparse_length` fields on this entry stay empty until the non-quantized candidate
+# kernels land.
 # ``..metadata`` describes the structure; this module owns the entry that carries it.
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class AscV41Metadata(DeepSeekV41Metadata):
-    """The row, this geometry's kernel frames, and the AI_CPU records its kernels read.
+    """The row, this geometry's kernel frames, and the AI_CPU metadata its kernels read.
 
     One entry per ``(port, ratio)``: the map key is this port's own config plus the layer's
     compression ratio, so every layer reads an entry built for its own geometry and no builder
     has to know the stack's ratio table.  The frames are this geometry's own -- the query's, the
-    sliding window's and the compressed axis's -- and ``aicpu_metadata`` holds the four operator
+    sliding window's and the compressed axis's -- and ``aicpu_metadata`` holds the operator
     outputs for exactly those frames, computed at the eager boundary once per microbatch and
     rebuilt per rank under context parallelism from the rank-local frames.
 
-    Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn_grad``):
+    Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``):
     one model runs one selection width, so there is nothing to look up.  Nothing here compares the
-    records' geometry with the layer's own config -- that would need the numbers the reference core
+    metadata's geometry with the layer's own config -- that would need the numbers the reference core
     never sees -- so an override stated with the wrong widths surfaces as the kernels' shape error.
     Every field is a tensor, a primitive or another registered node, because the class is a pytree
     node (see the registration below).
@@ -127,7 +133,7 @@ class AscV41Metadata(DeepSeekV41Metadata):
         *,
         permutation: torch.Tensor | None,
     ) -> "AscV41Metadata":
-        """This rank's frames and records (upstream #4617's CP half), for one geometry.
+        """This rank's frames and metadata (upstream #4617's CP half), for one geometry.
 
         The row and the rank come from the shard context, because this rank's copy is derived
         from all of it.  ``permutation`` is unused and a permuted run is refused: these frames are
@@ -164,12 +170,14 @@ register_pytree_node_for_dataclass(AscV41Metadata)
 
 
 def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: AicpuGeometry) -> AscV41Metadata:
-    """This layer's geometry, built from the row: frames plus the AI_CPU records it reads.
+    """This layer's geometry, built from the row: frames plus the AI_CPU metadata it reads.
 
     The row is the only input: ``cu_seq_k`` is already folded at this ratio by the reference
     backend, so the compressed frame needs nothing but this rank's per-document lengths for
     ``seqused``/``residual``.  Both the reference core and this port therefore start from the same
-    upstream call, and what the port adds is what only it reads.
+    upstream call, and what the port adds is what only it reads: these frames and the operator
+    outputs sized by them.  A backend that runs other kernels (the quantized attention) derives its
+    own frames from the same row and builds its own entry in its own package.
     """
     cu_seqlens = row.cu_seq_q
     # ``cu_seq_k`` was folded by the backend that built the row, so it must be *this* ratio's
@@ -204,7 +212,13 @@ def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: Aicp
         q=q,
         swa_k=swa_k,
         cmp_k=cmp_k,
-        aicpu_metadata=build_aicpu_metadata(ratio=ratio, q=q, swa_k=swa_k, cmp_k=cmp_k, geometry=geometry),
+        aicpu_metadata=build_aicpu_metadata(
+            ratio=ratio,
+            q=q,
+            swa_k=swa_k,
+            cmp_k=cmp_k,
+            geometry=geometry,
+        ),
     )
 
 
@@ -216,15 +230,15 @@ def shard_asc_v41_metadata(
     batch_size: int,
     seq_len: int,
 ) -> AscV41Metadata:
-    """One rank's frames and records: the row's grid re-cut into this rank's chunks.
+    """One rank's frames and metadata: the row's grid re-cut into this rank's chunks.
 
     The queries are chunk ``cp_rank`` of every document while the KV streams stay the **whole
-    row** -- gathered declaratively at the fused core's boundary -- so the KV frames'
+    row** -- gathered declaratively at the AscendC attention's boundary -- so the KV frames'
     ``cu_seqlens`` address that row and their ``seqused = K_d = (cp_rank + 1) * Q_d`` is how far
     these queries reach into each document.  That is what keeps the kernels' end-aligned window
     and causal limit anchored at this rank's chunk rather than at the row's end.
 
-    The records are rebuilt from the rank-local frames: a record is the metadata operators'
+    The metadata is rebuilt from the rank-local frames: the metadata is the operators'
     answer for one geometry *of one frame set*, so a rank that kept the global ones would hand
     the kernels a grid its inputs do not have.  ``seq_len`` is the **slab** width -- the shape of
     the inputs this rank holds, not of the row.
@@ -294,7 +308,12 @@ def build_aicpu_metadata(
     cmp_k: KernelFrame | None,
     geometry: AicpuGeometry,
 ) -> AicpuMetadata:
-    """The four AI_CPU operator outputs for these frames, computed once per microbatch."""
+    """This geometry's AI_CPU operator outputs for these frames, once per microbatch.
+
+    Only what this backend's own kernels are called with, grouped by the consumer that launches it.
+    A stack that runs other kernels (the quantized attention) is another backend: it replaces this
+    layer's config and builds its own entry, so nothing here has to know that it exists.
+    """
     options = kernel_options(ratio=ratio, q=q, swa_k=swa_k, cmp_k=cmp_k, window_size=geometry.window_size)
     has_cmp = cmp_k is not None
     geometry_kwargs = dict(
@@ -319,20 +338,15 @@ def build_aicpu_metadata(
         **options,
         **geometry_kwargs,
     )
-    lightning_indexer = lightning_indexer_kl_loss_grad = None
+    lightning_indexer = AscLightningIndexerMetadata(fwd=None, bwd=None)
     if has_cmp:
-        # The selector's records belong to the port that replaces the selector, and ride this
-        # entry: the teacher edge crosses both kernels, so the two ports' records share one
-        # lifetime.
-        lightning_indexer, lightning_indexer_kl_loss_grad = build_indexer_metadata(
-            ratio=ratio, q=q, cmp_k=cmp_k, geometry=geometry
-        )
+        # The selector's metadata belongs to the selector that replaces it, and rides this entry:
+        # the teacher edge crosses both kernels, so the two share one lifetime.
+        lightning_indexer = build_indexer_metadata(ratio=ratio, q=q, cmp_k=cmp_k, geometry=geometry)
     return AicpuMetadata(
         geometry=geometry,
-        sparse_attn=sparse_attn,
-        sparse_attn_grad=sparse_attn_grad,
+        sparse_attn=AscSparseAttentionMetadata(fwd=sparse_attn, bwd=sparse_attn_grad),
         lightning_indexer=lightning_indexer,
-        lightning_indexer_kl_loss_grad=lightning_indexer_kl_loss_grad,
     )
 
 
@@ -370,8 +384,8 @@ class _SparseMLA(torch.autograd.Function):
             cmp_k=attention_metadata.cmp_k,
             window_size=window_size,
         )
-        # The precomputed record is read instead of re-running the AI_CPU operator per layer.
-        smla_metadata = attention_metadata.aicpu_metadata.sparse_attn
+        # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
+        smla_metadata = attention_metadata.aicpu_metadata.sparse_attn.fwd
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
             ori_kv=swa_k,
@@ -424,9 +438,9 @@ class _SparseMLA(torch.autograd.Function):
             cmp_k=ctx.attention_metadata.cmp_k,
             window_size=ctx.window_size,
         )
-        # The gradient metadata rides the forward's record, so the backward skips its AI_CPU
+        # The gradient metadata rides the forward's schedule, so the backward skips its AI_CPU
         # call too.
-        smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn_grad
+        smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
         dq, dswa_k, dcmp_k, dsinks, _, cmp_softmax_l1_norm = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
@@ -479,18 +493,18 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
 
     @dataclass(kw_only=True, slots=True)
     class Config(CompressedSparseInnerAttention2.Config):
-        """The fused config: the reference core's fields plus the geometry its records need.
+        """The fused config: the reference core's fields plus the geometry its metadata needs.
 
         That geometry is the *port's*: the reference core neither reads it nor knows it exists,
         and it is stated once by the override's arguments instead of being restated on every
-        layer of every recipe.  The records built from it are the kernels' only metadata source --
+        layer of every recipe.  The metadata built from it are the kernels' only metadata source --
         there is no per-layer fallback call -- and a recipe that states widths its layers do not
         run is a misconfiguration the kernels report, since this config cannot see them.
         """
 
         window_size: int
         compress_ratio: int
-        # The record geometry has no defaults here: the released V4.1-Flash shape is stated once,
+        # The kernel geometry has no defaults here: the released V4.1-Flash shape is stated once,
         # on the override factory a recipe names, and travels to every layer as these arguments.
         num_heads: int
         head_dim: int
@@ -514,7 +528,7 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
         def attention_metadata_key(self):
             """This layer's own entry: the port's class plus its compression ratio.
 
-            One entry per ratio is what lets the builder precompute exactly the records this
+            One entry per ratio is what lets the builder precompute exactly the metadata this
             geometry reads -- no stack-wide ratio table anywhere, and no entry shared by layers
             whose kernels grid different axes.
             """
@@ -528,11 +542,11 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
         ) -> AscV41Metadata:
-            """This geometry's frames and AI_CPU records, built once per microbatch (#4897).
+            """This geometry's frames and AI_CPU metadata, built once per microbatch (#4897).
 
             The row -- and with it ``cu_seq_k``, already folded at this layer's ratio -- comes from
             the reference backend's builder, so both cores grid one set of boundaries.  The
-            records are the AI_CPU operators' answers for that geometry, computed here at the
+            metadata is the AI_CPU operators' answer for that geometry, computed here at the
             eager boundary instead of per layer inside the compiled region, and rebuilt per rank
             by ``prepare_cp_metadata``.
             """

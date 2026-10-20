@@ -3,7 +3,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DeepSeek-V4.1 QLI/QSLI selection with an SLIKG backward edge."""
+"""DeepSeek-V4.1 QLI/QSLI selection with an SLIKG backward edge.
+
+The kernels' AI_CPU schedules are not built here either: the quantized attention's own config
+precomputes them per microbatch at the eager boundary and hands them over on the entry this module
+receives (``attention_metadata`` is the provider).  QSLI's per-row candidate count is derived at the
+same time, from the row's lengths -- never read back off QLI's output, which is what lets the
+search's schedule exist before the forward.  This module launches the pair and reads that metadata,
+the way the BF16 selector reads its own.
+"""
 
 __all__ = ["QuantV41LightningIndexer"]
 
@@ -11,53 +19,14 @@ import cann_ops_transformer  # noqa: F401  # register torch.ops.cann_ops_transfo
 import torch
 import torch_npu
 
-# This training adapter packs both Q and K as TND with separate scale tensors.
-_LAYOUT = "TND"
-# Right-down causal masking matches the BF16 selector and SLIKG backward.
-# Although QLI/QSLI also support mode 0, switching requires coordinated changes
-# to model visibility, cmp_residual_k, metadata, and backward semantics.
-_MASK_MODE = 3
-# The packed-MXFP4 ABI is the only value either kernel accepts; the number labels the
-# storage format (two E2M1 values per byte plus uE8M0 scales), it is not a precision knob.
-_QUANT_MODE = 1
+from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import (
+    QUANT_MODE,
+    kernel_options,
+)
+
 # MXFP4 uses one E8M0 scale per 32 elements. The kernels and _pack_mxfp4's
 # [T, H, D/64, 2] scale layout require this group size.
 _MX_BLOCK_SIZE = 32
-
-
-def _kernel_options(attention_masks, ratio: int) -> dict[str, object]:
-    compressed = attention_masks.frame_for(ratio)
-    return {
-        "cu_seqlens_q": attention_masks.q.cu_seqlens,
-        "cu_seqlens_k": compressed.cu_seqlens,
-        "seqused_q": attention_masks.q.seqused,
-        "seqused_k": compressed.seqused,
-        "cmp_residual_k": compressed.residual,
-        "layout_q": _LAYOUT,
-        "layout_k": _LAYOUT,
-        "mask_mode": _MASK_MODE,
-        "cmp_ratio": ratio,
-    }
-
-
-def _quantized_kernel_geometry(num_heads: int, head_dim: int, topk: int) -> dict[str, int]:
-    return {
-        "num_heads_q": num_heads,
-        "num_heads_k": 1,
-        "head_dim": head_dim,
-        "topk": topk,
-    }
-
-
-def _slikg_kernel_geometry(num_heads: int, head_dim: int, topk: int) -> dict[str, int | None]:
-    return {
-        "num_heads_q": num_heads,
-        "num_heads_k": 1,
-        "head_dim": head_dim,
-        "topk": topk,
-        "max_seqlen_q": None,
-        "max_seqlen_k": None,
-    }
 
 
 def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -82,34 +51,42 @@ def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-def _candidate_length(candidate_block_indices: torch.Tensor) -> torch.Tensor:
-    """Recover the valid prefix length from QLI's contiguous ``-1`` tail."""
-    return (candidate_block_indices >= 0).sum(dim=-1).to(torch.int32).contiguous()
+def _selector_metadata(attention_metadata):
+    """The entry's quantized selector schedules.
+
+    They are built by the attention backend that owns this stack -- the quantized sparse attention
+    -- once per microbatch, before this forward.  There is no second builder here: a stack whose
+    entry carries none is a wiring error, and the two kernels' metadata is not interchangeable
+    (an unquantized schedule fed to the quantized kernel yields garbage indices).
+    """
+    indexer = getattr(attention_metadata.aicpu_metadata, "lightning_indexer", None)
+    if indexer is None or getattr(indexer, "fwd", None) is None:
+        raise ValueError(
+            "the attention entry carries no quantized selector schedules: the quantized selector "
+            "runs only with the quantized sparse attention."
+        )
+    return indexer
 
 
-def _validate_candidate_role(
-    *,
-    candidate_topk_blocks: int,
-    candidate_block_size: int,
-    is_source: bool,
-    candidate: torch.Tensor | None,
-) -> None:
-    has_candidate_pool = candidate_topk_blocks > 0
-    if is_source and not has_candidate_pool:
-        raise ValueError("a candidate source requires candidate_topk_blocks > 0")
-    if has_candidate_pool and candidate_block_size <= 0:
-        raise ValueError("an enabled candidate pool requires candidate_block_size > 0")
+def _validate_role(*, candidate_topk_blocks: int, is_source: bool, candidate: torch.Tensor | None) -> None:
+    """Refuse a layer whose role and candidate table disagree.
 
-    expects_candidate = has_candidate_pool and not is_source
-    if (candidate is not None) != expects_candidate:
-        role = (
-            "a searcher requires the source candidate table"
-            if expects_candidate
+    A pool's source builds the table and is handed none; a searcher is handed the source's; a layer
+    with no pool never sees one.  The branch below picks the kernel from ``candidate`` alone, so a
+    mismatch would silently train a searcher that scores every entry -- the pool's whole point
+    being that it does not.
+    """
+    searcher = candidate_topk_blocks > 0 and not is_source
+    if (candidate is not None) == searcher:
+        return
+    raise ValueError(
+        "the candidate table disagrees with this layer's role: "
+        + (
+            "a searcher requires the source's candidate table"
+            if searcher
             else "this layer cannot consume a candidate table"
         )
-        raise ValueError(f"the candidate table disagrees with this layer's role: {role}")
-    if candidate is not None and (candidate.ndim != 4 or candidate.shape[0] != 1 or candidate.shape[2] != 1):
-        raise ValueError(f"the model candidate table must have shape [1, T, 1, capacity], got {tuple(candidate.shape)}")
+    )
 
 
 def _quantized_forward(
@@ -118,31 +95,23 @@ def _quantized_forward(
     idx_w: torch.Tensor,
     topk: int,
     *,
-    candidate_topk_blocks: int,
-    candidate_block_size: int,
+    schedules,
     is_source: bool,
     candidate: torch.Tensor | None,
-    **kernel_options,
+    candidate_topk_blocks: int,
+    candidate_block_size: int,
+    **options,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run QLI for a producer/pool-free layer or QSLI for a searcher."""
-    _validate_candidate_role(
-        candidate_topk_blocks=candidate_topk_blocks,
-        candidate_block_size=candidate_block_size,
-        is_source=is_source,
-        candidate=candidate,
-    )
-
-    geometry = _quantized_kernel_geometry(idx_q.shape[1], idx_q.shape[2], topk)
+    _validate_role(candidate_topk_blocks=candidate_topk_blocks, is_source=is_source, candidate=candidate)
+    if candidate is not None and (candidate.ndim != 4 or candidate.shape[0] != 1 or candidate.shape[2] != 1):
+        raise ValueError(f"the model candidate table must have shape [1, T, 1, capacity], got {tuple(candidate.shape)}")
     idx_q_mxfp4, idx_q_scale = _pack_mxfp4(idx_q)
     idx_k_mxfp4, idx_k_scale = _pack_mxfp4(idx_k)
 
     if candidate is None:
-        qli_metadata = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer_metadata(
-            **kernel_options,
-            **geometry,
-            candidate_topk_blocks=candidate_topk_blocks,
-            candidate_block_size=candidate_block_size,
-        )
+        # One QLI schedule serves both QLI roles: the candidate writer's width is a launch argument
+        # (this layer's own config states it), not part of the metadata, so nothing is chosen here.
         topk_indices, _, candidate_block_indices, _ = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer(
             idx_q_mxfp4,
             idx_k_mxfp4,
@@ -150,38 +119,33 @@ def _quantized_forward(
             idx_q_scale,
             idx_k_scale,
             topk,
-            _QUANT_MODE,
-            metadata=qli_metadata,
+            QUANT_MODE,
+            metadata=schedules.fwd,
             return_value=False,
             candidate_topk_blocks=candidate_topk_blocks,
             candidate_block_size=candidate_block_size,
-            **kernel_options,
+            **options,
         )
         return topk_indices, candidate_block_indices.unsqueeze(0) if is_source else None
 
-    block_indices = candidate.squeeze(0)
-    block_length = _candidate_length(block_indices)
-    qsli_metadata = torch.ops.cann_ops_transformer.ds41.quant_sparse_lightning_indexer_metadata(
-        block_length,
-        **kernel_options,
-        **geometry,
-        quant_mode=_QUANT_MODE,
-        candidate_block_size=candidate_block_size,
-    )
+    # The count and the schedule are one object: the search is bound by exactly the prefix QLI
+    # published, derived from the lengths rather than read back off the candidate table.  The
+    # table travels as ``[B, L, 1, C]`` between layers and a kernel wants ``[T, 1, C]``, so the
+    # batch axis is squeezed here rather than at the caller.
     topk_indices, _ = torch.ops.cann_ops_transformer.ds41.quant_sparse_lightning_indexer(
         idx_q_mxfp4,
         idx_k_mxfp4,
         idx_w,
         idx_q_scale,
-        block_indices,
-        block_length,
+        candidate.squeeze(0),
+        schedules.sparse_length,
         topk,
-        _QUANT_MODE,
+        QUANT_MODE,
         candidate_block_size,
         descale_k=idx_k_scale,
-        metadata=qsli_metadata,
+        metadata=schedules.fwd_sparse,
         return_value=False,
-        **kernel_options,
+        **options,
     )
     return topk_indices, candidate
 
@@ -197,23 +161,26 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
         idx_w,
         topk,
         ratio,
-        attention_masks,
-        candidate_topk_blocks,
-        candidate_block_size,
+        attention_metadata,
         is_source,
         candidate,
         num_global_queries,
+        candidate_topk_blocks,
+        candidate_block_size,
     ):
+        # The options and the schedules both come off the same entry, so a launch and the metadata
+        # it is handed describe one frame set.
         topk_indices, candidate_out = _quantized_forward(
             idx_q,
             idx_k,
             idx_w,
             topk,
-            candidate_topk_blocks=candidate_topk_blocks,
-            candidate_block_size=candidate_block_size,
+            schedules=_selector_metadata(attention_metadata),
             is_source=is_source,
             candidate=candidate,
-            **_kernel_options(attention_masks, ratio),
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+            **kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k),
         )
         topk_indices = topk_indices.sort(dim=-1, descending=True).values
         topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
@@ -221,7 +188,9 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
         ctx.topk = topk
         ctx.ratio = ratio
-        ctx.attention_masks = attention_masks
+        # A dataclass, so ``save_for_backward`` cannot take it; the node holds the boundary
+        # tensors the backward's options are read from and is released with it.
+        ctx.attention_metadata = attention_metadata
         return topk_indices, topk_scores, candidate_out
 
     @staticmethod
@@ -240,19 +209,16 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             raise RuntimeError("Set Selector.num_global_queries before training the indexer")
         # Match the BF16 path: the trainer counts queries across the full step and DP mesh.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
-        options = _kernel_options(ctx.attention_masks, ctx.ratio)
-        slikg_metadata = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
-            **_slikg_kernel_geometry(idx_q.shape[1], idx_q.shape[2], ctx.topk),
-            **options,
-        )
+        # The backward rides the same entry, so it launches no AI_CPU operator either, and the
+        # SLIKG metadata is the one the BF16 selector would read: the teacher edge is BF16 in both.
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,
             w=idx_w,
             sparse_indices=topk_indices,
             attn_softmax_l1_norm=attn_softmax_l1_norm,
-            metadata=slikg_metadata,
-            **options,
+            metadata=ctx.attention_metadata.aicpu_metadata.lightning_indexer.bwd,
+            **kernel_options(ratio=ctx.ratio, q=ctx.attention_metadata.q, cmp_k=ctx.attention_metadata.cmp_k),
         )
         return (
             dq,
@@ -260,12 +226,12 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             dw,
             None,  # topk
             None,  # ratio
-            None,  # attention_masks
-            None,  # candidate_topk_blocks
-            None,  # candidate_block_size
+            None,  # attention_metadata
             None,  # is_source
             None,  # candidate
             None,  # num_global_queries
+            None,  # candidate_topk_blocks
+            None,  # candidate_block_size
         )
 
 
@@ -288,27 +254,31 @@ class QuantV41LightningIndexer(torch.nn.Module):
         idx_q_BLHiDi: torch.Tensor,
         idx_k_BNDi: torch.Tensor,
         weights_BLHi: torch.Tensor,
-        attention_masks,
+        attention_metadata,
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if idx_q_BLHiDi.shape[0] != 1 or idx_k_BNDi.shape[0] != 1 or weights_BLHi.shape[0] != 1:
             raise ValueError("V4.1 QLI/QSLI requires one packed TND row (model batch size 1)")
 
-        topk = self.index_topk
+        # Which schedule this layer launches, and whether it builds the pool, follow from its own
+        # role -- which the model states and the entry's schedules were sized for.
         is_source = self.has_candidate_pool and self.mode == "full"
+        topk = self.index_topk
         topk_indices, topk_scores, candidate = _QuantV41LightningIndexerTND.apply(
             idx_q_BLHiDi.squeeze(0),
             idx_k_BNDi.squeeze(0).unsqueeze(1),
             weights_BLHi.squeeze(0).float(),
             topk,
             self.compress_ratio,
-            attention_masks,
-            self.candidate_topk_blocks,
-            self.candidate_block_size,
+            attention_metadata,
             is_source,
             candidates_BL1C,
             self.num_global_queries,
+            # The width this layer runs with: the sentinel outside the pool, the capacity on the
+            # source -- exactly what its own selector config states.
+            self.candidate_topk_blocks,
+            self.candidate_block_size,
         )
         return (
             topk_indices.reshape(1, -1, topk),

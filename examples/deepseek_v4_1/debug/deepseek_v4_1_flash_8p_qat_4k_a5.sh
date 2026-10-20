@@ -16,10 +16,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# The quantized sparse attention (torchao_npu's QuantV41SparseAttention) keeps
-# its own per-layer metadata operators and does not read the records
-# `sparse_attn.asc`'s config precomputes, so that precompute is dead work on this
-# entry today; making the quantized core read the records is the 2d follow-up.
+# The quantized sparse attention (torchao_npu's QuantV41SparseAttention) is its own backend:
+# its converter-installed config builds the attention entry, so this entry launches no per-layer
+# metadata operator.  It replaces the node `sparse_attn.asc` targets, so that override (kept
+# below for the unquantized variants of this list) is a no-op here.
 # The override list is the non-tilelang fused branch of
 # deepseek_v4_1_flash_8p_cpt_4k_a5.sh -- keep the two lists in sync.
 export CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rope.asc_partial \

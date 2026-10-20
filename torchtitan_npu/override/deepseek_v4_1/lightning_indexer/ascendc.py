@@ -3,14 +3,23 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The BF16 LightningIndexer selection fused with its SLIKG backward edge."""
+"""The selector's BF16 port: LightningIndexer with its SLIKG edge.
+
+Its two metadata tensors (``build_indexer_metadata``) are sized from the frames and the geometry
+the attention override states, and neither is launched from a layer.  A backend that runs another
+selector (the quantized one) builds its own entry in its own package instead of extending this one.
+"""
 
 from dataclasses import dataclass
 
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry, KernelFrame
+from torchtitan_npu.override.deepseek_v4_1.metadata import (
+    AicpuGeometry,
+    AscLightningIndexerMetadata,
+    KernelFrame,
+)
 
 _LAYOUT = "TND"
 _MASK_MODE = 3  # right-down causal: entry j is complete for query t iff j < (t+1)//ratio
@@ -49,8 +58,8 @@ def build_indexer_metadata(
     q: KernelFrame,
     cmp_k: KernelFrame,
     geometry: AicpuGeometry,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The selector's two AI_CPU metadata tensors for this geometry.
+) -> AscLightningIndexerMetadata:
+    """The selector's two AI_CPU metadata tensors for this geometry, forward and backward.
 
     ``max_seqlen_q``/``max_seqlen_k`` are pinned to ``None`` because both the BF16
     ``lightning_indexer_metadata`` and SLIKG's take them as optional ints; passing them makes the
@@ -65,9 +74,9 @@ def build_indexer_metadata(
         max_seqlen_q=None,
         max_seqlen_k=None,
     )
-    return (
-        torch.ops.cann_ops_transformer.lightning_indexer_metadata(**geometry_kwargs, **options),
-        torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
+    return AscLightningIndexerMetadata(
+        fwd=torch.ops.cann_ops_transformer.lightning_indexer_metadata(**geometry_kwargs, **options),
+        bwd=torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad_metadata(
             **geometry_kwargs,
             **options,
         ),
@@ -99,8 +108,8 @@ class _LightningIndexerTND(torch.autograd.Function):
         # was handed*, so the kernels' ``[T, H, D]`` layout has to be established outside
         # this node rather than inside it.
         options = kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
-        # The record is read instead of re-running the AI_CPU operator per layer.
-        li_metadata = attention_metadata.aicpu_metadata.lightning_indexer
+        # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
+        li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
         topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
             idx_q,
             idx_k,
@@ -167,8 +176,8 @@ class _LightningIndexerTND(torch.autograd.Function):
         # Scaling p scales SLIKG's Z * softmax(I) - p by the same factor.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
         options = kernel_options(ratio=ctx.ratio, q=ctx.attention_metadata.q, cmp_k=ctx.attention_metadata.cmp_k)
-        # Rides the same record as the forward, so the backward skips its AI_CPU call too.
-        slig_metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer_kl_loss_grad
+        # Rides the same entry as the forward, so the backward skips its AI_CPU call too.
+        slig_metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer.bwd
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,

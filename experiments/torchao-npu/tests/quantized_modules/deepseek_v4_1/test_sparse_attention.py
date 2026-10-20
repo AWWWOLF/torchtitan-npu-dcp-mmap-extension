@@ -15,12 +15,28 @@ from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_sparse_attentio
 from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer, sparse_attention
 
 
-def _metadata(*, tokens=4, compressed_tokens=2):
-    compressed = SimpleNamespace(
-        cu_seqlens=torch.tensor([0, compressed_tokens], dtype=torch.int32),
-        residual=torch.zeros(1, dtype=torch.int32),
-        seqused=torch.tensor([compressed_tokens], dtype=torch.int32),
+def _indexer_metadata():
+    """The selector's group on the entry: the sparse attention core never reads it."""
+    return SimpleNamespace(
+        fwd=torch.tensor([7], dtype=torch.int32),
+        bwd=torch.tensor([5], dtype=torch.int32),
     )
+
+
+def _metadata(*, tokens=4, compressed_tokens=2, ratio=2, quant=False):
+    """The attention metadata one layer is handed: this geometry's frames, and its AI_CPU metadata.
+
+    The SMLA pair is what the quantized core reads; the selector's group rides the same entry when
+    the MXFP4 selector is installed, and a stack that keeps its selector in BF16 carries none.
+    """
+    if compressed_tokens is None:
+        cmp_k = None
+    else:
+        cmp_k = SimpleNamespace(
+            cu_seqlens=torch.tensor([0, compressed_tokens], dtype=torch.int32),
+            residual=None if ratio == 1 else torch.zeros(1, dtype=torch.int32),
+            seqused=torch.tensor([compressed_tokens], dtype=torch.int32),
+        )
     return SimpleNamespace(
         q=SimpleNamespace(
             cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
@@ -30,19 +46,26 @@ def _metadata(*, tokens=4, compressed_tokens=2):
             cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32),
             seqused=torch.tensor([tokens], dtype=torch.int32),
         ),
-        frame_for=lambda ratio: compressed,
+        cmp_k=cmp_k,
+        aicpu_metadata=SimpleNamespace(
+            sparse_attn=SimpleNamespace(
+                fwd=torch.tensor([3], dtype=torch.int32),
+                bwd=torch.tensor([4], dtype=torch.int32),
+            ),
+            lightning_indexer=_indexer_metadata() if quant else None,
+        ),
     )
 
 
 def _fake_mla_apply(captured):
-    def apply(q, swa_k, cmp_k, indices, sinks, attention_masks, scale, ratio, window, scores, wants_teacher):
+    def apply(q, swa_k, cmp_k, indices, sinks, attention_metadata, scale, ratio, window, scores, wants_teacher):
         captured.update(
             q=q,
             swa_k=swa_k,
             cmp_k=cmp_k,
             indices=indices,
             sinks=sinks,
-            attention_masks=attention_masks,
+            attention_metadata=attention_metadata,
             scale=scale,
             ratio=ratio,
             window=window,
@@ -57,7 +80,7 @@ def _fake_mla_apply(captured):
 
 @pytest.mark.parametrize(
     ("ratio", "with_shared", "cmp_tokens"),
-    [(0, False, 0), (1, True, 4), (2, True, 2)],
+    [(0, False, None), (1, True, 4), (2, True, 2)],
     ids=["window-only", "full-resolution-shared-kv", "compressed-shared-kv"],
 )
 def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
@@ -77,27 +100,21 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
     )
     scores = torch.empty((4, 1, 2), device=device, dtype=torch.float32, requires_grad=True) if with_shared else None
     sinks = torch.ones((2,), device=device, dtype=torch.float32, requires_grad=True)
-    attention_masks = _metadata(tokens=4, compressed_tokens=cmp_tokens)
-    attention_masks.q.seqused = torch.tensor([2], dtype=torch.int32)
-    attention_masks.swa_k.seqused = torch.tensor([3], dtype=torch.int32)
-    attention_masks.frame_for(ratio).seqused = torch.tensor([min(cmp_tokens, 1)], dtype=torch.int32)
-    expected_residual = attention_masks.frame_for(ratio).residual if ratio > 0 else None
+    attention_metadata = _metadata(tokens=4, compressed_tokens=cmp_tokens, ratio=ratio)
+    attention_metadata.q.seqused = torch.tensor([2], dtype=torch.int32)
+    attention_metadata.swa_k.seqused = torch.tensor([3], dtype=torch.int32)
+    if attention_metadata.cmp_k is not None:
+        attention_metadata.cmp_k.seqused = torch.tensor([min(cmp_tokens, 1)], dtype=torch.int32)
+    expected_residual = attention_metadata.cmp_k.residual if with_shared else None
     expected_lengths = {
-        "seqused_q": attention_masks.q.seqused,
-        "seqused_ori_kv": attention_masks.swa_k.seqused,
-        "seqused_cmp_kv": attention_masks.frame_for(ratio).seqused if ratio > 0 else None,
+        "seqused_q": attention_metadata.q.seqused,
+        "seqused_ori_kv": attention_metadata.swa_k.seqused,
+        "seqused_cmp_kv": attention_metadata.cmp_k.seqused if with_shared else None,
     }
-    forward_metadata = torch.tensor([7], device=device, dtype=torch.int32)
-    grad_metadata = torch.tensor([9], device=device, dtype=torch.int32)
-    metadata_calls = []
     quantize_calls = []
     forward_kwargs = {}
     lse = torch.zeros((1, q.shape[0], q.shape[1]), device=device, dtype=q.dtype)
     teacher = torch.arange(8, device=device, dtype=torch.float32).reshape(4, 1, 2) if with_shared else torch.empty(0)
-
-    def metadata(*args, **kwargs):
-        metadata_calls.append((args, kwargs))
-        return forward_metadata if len(metadata_calls) == 1 else grad_metadata
 
     def fake_quantize(kv, quant_group_size, quant_mode):
         quantize_calls.append((kv, quant_group_size, quant_mode))
@@ -118,7 +135,9 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
         assert kwargs["cmp_kv"] is cmp_k
         assert kwargs["cmp_sparse_indices"] is indices
         assert kwargs["sinks"] is sinks
-        assert kwargs["metadata"] is grad_metadata
+        # Both passes read the metadata the override built for these frames, so the quantized core
+        # launches no AI_CPU operator and cannot disagree with the unquantized one.
+        assert kwargs["metadata"] is attention_metadata.aicpu_metadata.sparse_attn.bwd
         assert kwargs["cmp_residual_kv"] is expected_residual
         assert kwargs["softmax_scale"] == 0.5
         assert kwargs["cmp_ratio"] == max(ratio, 1)
@@ -133,8 +152,6 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
             teacher,
         )
 
-    monkeypatch.setattr(sparse_attention, "sparse_flash_mla_metadata", metadata)
-    monkeypatch.setattr(sparse_attention, "sparse_flash_mla_grad_metadata", metadata)
     monkeypatch.setattr(sparse_attention, "fake_quantize_mx_bf16", fake_quantize)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", sparse_flash_mla)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", sparse_flash_mla_grad)
@@ -145,7 +162,7 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
         cmp_k,
         indices,
         sinks,
-        attention_masks,
+        attention_metadata,
         0.5,
         ratio,
         2,
@@ -160,15 +177,14 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
     assert quantize_calls[0][1:] == (32, "mxfp8_bf16")
     torch.testing.assert_close(forward_kwargs["ori_kv"], swa_k + 1)
     assert forward_kwargs["cmp_kv"] is cmp_k
-    assert forward_kwargs["metadata"] is forward_metadata
+    assert forward_kwargs["metadata"] is attention_metadata.aicpu_metadata.sparse_attn.fwd
     assert forward_kwargs["cmp_sparse_indices"] is indices
     assert forward_kwargs["sinks"] is sinks
     assert forward_kwargs["cmp_residual_kv"] is expected_residual
 
     output.sum().backward()
 
-    assert len(metadata_calls) == 2
-    for options in (forward_kwargs, *(kwargs for _, kwargs in metadata_calls)):
+    for options in (forward_kwargs,):
         for name, expected in expected_lengths.items():
             assert options[name] is expected
     torch.testing.assert_close(q.grad, torch.full_like(q, 2))
@@ -208,7 +224,7 @@ def test_forward_ratio_zero_passes_window_only_inputs_to_mla(monkeypatch):
     assert output.shape == q.shape
     assert captured["cmp_k"] is None
     assert captured["indices"] is None
-    assert captured["attention_masks"] is metadata
+    assert captured["attention_metadata"] is metadata
     assert captured["ratio"] == 0
     assert captured["window"] == 3
     assert captured["scores"] is None
@@ -245,7 +261,7 @@ def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monke
     )
 
     assert output.shape == q.shape
-    assert captured["attention_masks"] is metadata
+    assert captured["attention_metadata"] is metadata
     assert captured["cmp_k"].shape == (4, 1, 512)
     assert captured["scores"].shape == (4, 1, 2)
     assert captured["wants_teacher"] is True
@@ -341,8 +357,8 @@ def test_module_swap_forwards_teacher_carrier_and_restores_original(monkeypatch)
     original_forward = host.forward
     captured = {}
 
-    def quantized_forward(self, q, swa_k, attn_sink, attention_masks, **kwargs):
-        captured.update(self=self, args=(q, swa_k, attn_sink, attention_masks), kwargs=kwargs)
+    def quantized_forward(self, q, swa_k, attn_sink, attention_metadata, **kwargs):
+        captured.update(self=self, args=(q, swa_k, attn_sink, attention_metadata), kwargs=kwargs)
         return "quantized"
 
     monkeypatch.setattr(sparse_attention.QuantV41SparseAttention, "forward", quantized_forward)
@@ -364,7 +380,7 @@ def test_module_swap_forwards_teacher_carrier_and_restores_original(monkeypatch)
 
 def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monkeypatch):
     tokens, topk = 4, 2
-    attention_masks = _metadata(tokens=tokens, compressed_tokens=2)
+    attention_metadata = _metadata(tokens=tokens, compressed_tokens=2, quant=True)
     idx_q = torch.zeros((tokens, 2, 4), dtype=torch.bfloat16, requires_grad=True)
     idx_k = torch.zeros((2, 1, 4), dtype=torch.bfloat16, requires_grad=True)
     idx_w = torch.zeros((tokens, 2), dtype=torch.float32, requires_grad=True)
@@ -377,15 +393,8 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         torch.ops.cann_ops_transformer,
         "ds41",
         SimpleNamespace(
-            quant_lightning_indexer_metadata=lambda **kwargs: torch.tensor([1], dtype=torch.int32),
             quant_lightning_indexer=lambda *args, **kwargs: (selected, torch.empty(0), torch.empty(0), torch.empty(0)),
         ),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.cann_ops_transformer,
-        "sparse_lightning_indexer_kl_loss_grad_metadata",
-        lambda **kwargs: torch.tensor([2], dtype=torch.int32),
         raising=False,
     )
 
@@ -399,8 +408,6 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         slikg,
         raising=False,
     )
-    monkeypatch.setattr(sparse_attention, "sparse_flash_mla_metadata", lambda *args, **kwargs: torch.tensor([3]))
-    monkeypatch.setattr(sparse_attention, "sparse_flash_mla_grad_metadata", lambda *args, **kwargs: torch.tensor([4]))
     monkeypatch.setattr(sparse_attention, "fake_quantize_mx_bf16", lambda value, **kwargs: value)
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -426,12 +433,13 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         idx_w,
         topk,
         2,
-        attention_masks,
-        -1,
-        -1,
+        attention_metadata,
         False,
         None,
         torch.tensor(16.0),
+        # This layer runs no candidate pool: a pool-free selector is the QLI branch.
+        -1,
+        -1,
     )
     output, _ = sparse_attention._SparseMLA.apply(
         torch.zeros((tokens, 2, 4), dtype=torch.bfloat16, requires_grad=True),
@@ -439,7 +447,7 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         torch.zeros((2, 1, 4), dtype=torch.bfloat16, requires_grad=True),
         indices,
         torch.zeros(2, dtype=torch.float32, requires_grad=True),
-        attention_masks,
+        attention_metadata,
         0.5,
         2,
         3,

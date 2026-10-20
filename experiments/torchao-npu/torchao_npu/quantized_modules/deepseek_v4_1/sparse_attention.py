@@ -10,6 +10,10 @@ group 32) on the way into the kernel, and the same quantized tensor is replayed 
 the backward so both passes see identical operands.  Its gradient passes straight
 through to the original input, i.e. the Q/DQ is an identity STE.
 
+The kernels' AI_CPU metadata is *not* a copy step: this core reads what the attention
+override precomputed on the entry, so the quantized and the unquantized core launch the very
+same ``metadata`` tensors.
+
 The main KV is *not* quantized here.  It arrives already fake-quantized: the
 source Compressor does the Q/DQ once, on the layer that produces it, and every
 consuming layer reuses that tensor (``QuantCompressor``).  Quantizing on
@@ -23,16 +27,11 @@ line-for-line so the quantized stack and the unquantized one cannot drift.
 
 __all__ = ["QuantV41SparseAttention"]
 
+import cann_ops_transformer  # noqa: F401  # register torch.ops.cann_ops_transformer
 import torch
-import torch_npu
-from cann_ops_transformer import sparse_flash_mla_grad_metadata, sparse_flash_mla_metadata
 
 from torchao_npu.ops.kv_cache_fake_quant import fake_quantize_mx_bf16
-
-try:
-    _IS_A5 = torch_npu.npu.get_device_name().startswith("Ascend950")
-except (AttributeError, TypeError):
-    _IS_A5 = False
+from torchao_npu.quantized_modules.deepseek_v4_1.attention_metadata import smla_kernel_options
 
 # The SWA branch's quantization: FP8 with the group size the FP4 main-KV cache does not
 # use, because the two streams carry different precision budgets.
@@ -40,46 +39,18 @@ _SWA_QUANT_GROUP_SIZE = 32
 _SWA_QUANT_MODE = "mxfp8_bf16"
 
 
-def _kernel_options(attention_masks, ratio, window_size):
-    """The kernel options, read off the metadata's frames.
+def _kernel_options(attention_metadata, ratio, window_size):
+    """The kernel options, read off the entry's frames.
 
-    Both the metadata call and the main call take these, and they must agree
-    option-for-option; reading one source is what makes that structural rather than a
-    convention two call sites have to keep in step.
+    The metadata this backend precomputes and the launches that consume it read them from one
+    builder -- ``smla_kernel_options`` -- so the two cannot disagree option-for-option.
     """
-    # Only ratio 0 has no compressed axis, and the kernels spell that ``None``.  Every
-    # other ratio has one -- at ratio 1 it is the row itself and its frame carries no
-    # residual, which is exactly what the kernel wants there.
-    compressed = attention_masks.frame_for(ratio) if ratio > 0 else None
-    return dict(
-        cu_seqlens_q=attention_masks.q.cu_seqlens,
-        cu_seqlens_ori_kv=attention_masks.swa_k.cu_seqlens,
-        cu_seqlens_cmp_kv=None if compressed is None else compressed.cu_seqlens,
-        seqused_q=attention_masks.q.seqused,
-        seqused_ori_kv=attention_masks.swa_k.seqused,
-        seqused_cmp_kv=None if compressed is None else compressed.seqused,
-        cmp_residual_kv=None if compressed is None else compressed.residual,
-        cmp_ratio=max(ratio, 1),
-        ori_mask_mode=4,
-        cmp_mask_mode=0 if _IS_A5 and compressed is None else 3,
-        ori_win_left=window_size - 1,
-        ori_win_right=0,
-        layout_q="TND",
-        layout_kv="TND",
-    )
-
-
-def _kernel_geometry(topk_indices, cmp_k):
-    """The geometry both kernel calls are built with.
-
-    K can differ between the candidate and indexer paths, so it comes off the supplied
-    shape rather than the LI configuration's top-k.
-    """
-    return dict(
-        ori_topk=0,
-        cmp_topk=0 if topk_indices is None else topk_indices.shape[-1],
-        has_ori_kv=True,
-        has_cmp_kv=cmp_k is not None,
+    return smla_kernel_options(
+        ratio=ratio,
+        q=attention_metadata.q,
+        swa_k=attention_metadata.swa_k,
+        cmp_k=attention_metadata.cmp_k,
+        window_size=window_size,
     )
 
 
@@ -104,24 +75,23 @@ class _SparseMLA(torch.autograd.Function):
         cmp_k,
         topk_indices,
         sinks,
-        attention_masks,
+        attention_metadata,
         softmax_scale,
         ratio,
         window_size,
         topk_scores,
         wants_teacher,
     ):
-        options = _kernel_options(attention_masks, ratio, window_size)
-        geometry = _kernel_geometry(topk_indices, cmp_k)
-        smla_metadata = sparse_flash_mla_metadata(
-            q.shape[1],
-            1,
-            q.shape[2],
-            ori_topk_length=None,
-            cmp_topk_length=None,
-            **options,
-            **geometry,
-        )
+        options = _kernel_options(attention_metadata, ratio, window_size)
+        # The metadata this backend built for these frames, not a per-layer AI_CPU launch: the
+        # quantized core and the unquantized one hand the kernel the same schedule.
+        if not hasattr(attention_metadata, "aicpu_metadata"):
+            raise ValueError(
+                "the quantized sparse attention needs the AI_CPU metadata its own config builds: "
+                "the entry handed to this forward carries none. Enable the quantized attention "
+                "(and the quantized selector with it) instead of the unquantized override."
+            )
+        smla_metadata = attention_metadata.aicpu_metadata.sparse_attn.fwd
         qdq_swa_k = fake_quantize_mx_bf16(swa_k, quant_group_size=_SWA_QUANT_GROUP_SIZE, quant_mode=_SWA_QUANT_MODE)
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
@@ -147,11 +117,11 @@ class _SparseMLA(torch.autograd.Function):
         )
         ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
         ctx.wants_teacher = wants_teacher
-        # The mask is a dataclass, so ``save_for_backward`` cannot take it; it is a
+        # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
         # context attribute instead.  That is not extra retention: it holds the same
         # boundary tensors the graph already keeps for the backward, and the node -- and
         # with it this reference -- is released when that backward has run.
-        ctx.attention_masks = attention_masks
+        ctx.attention_metadata = attention_metadata
         # The teacher consumes the LSE as a detached constant.
         ctx.mark_non_differentiable(lse)
         return output, lse
@@ -162,14 +132,9 @@ class _SparseMLA(torch.autograd.Function):
         # Nothing but the operand tensors is saved, and ``swa_k`` here is the quantized
         # one -- the backward has to differentiate the same graph the forward built.
         q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
-        options = _kernel_options(ctx.attention_masks, ctx.ratio, ctx.window_size)
-        smla_grad_metadata = sparse_flash_mla_grad_metadata(
-            q.shape[1],
-            1,
-            q.shape[2],
-            **options,
-            **_kernel_geometry(topk_indices, cmp_k),
-        )
+        options = _kernel_options(ctx.attention_metadata, ctx.ratio, ctx.window_size)
+        # The gradient side rides the same entry, so the backward launches nothing either.
+        smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
         dq, dswa_k, dcmp_k, dsinks, _, cmp_softmax_l1_norm = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
@@ -187,7 +152,7 @@ class _SparseMLA(torch.autograd.Function):
             **options,
         )
         # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices,
-        # sinks, attention_masks, softmax_scale, ratio, window_size, topk_scores,
+        # sinks, attention_metadata, softmax_scale, ratio, window_size, topk_scores,
         # wants_teacher). PyTorch silently ignores extra trailing entries, so spell out
         # every slot to keep the teacher on the carrier input.
         return (
@@ -223,7 +188,7 @@ class QuantV41SparseAttention(torch.nn.Module):
         q,
         swa_k,
         attn_sink,
-        attention_masks,
+        attention_metadata,
         *,
         cmp_k=None,
         topk_indices=None,
@@ -252,7 +217,7 @@ class QuantV41SparseAttention(torch.nn.Module):
             None if cmp_k is None else cmp_k.squeeze(0).unsqueeze(1),
             None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1]),
             attn_sink.float(),
-            attention_masks,
+            attention_metadata,
             self.softmax_scale,
             self.compress_ratio,
             self.window_size,

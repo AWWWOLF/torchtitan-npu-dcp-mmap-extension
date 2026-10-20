@@ -8,15 +8,19 @@
 The LightningIndexer half lives in its own package, :mod:`...deepseek_v4_1.lightning_indexer`,
 so the two can be selected independently.
 
-There is one entry, not two: the precomputed SMLA records belong to the fused core's own
+There is one entry, not two: the precomputed SMLA metadata belongs to the AscendC attention's own
 config (upstream #4897 ownership), so swapping the core in builds them.  A second override
 on a metadata node could only be turned on against the attention it is meant to serve, and
 two overrides claiming the same stack is exactly the wiring this removes.
 
-The records are sized from the numbers this entry states, defaulting to the released V4.1-Flash
-shape, because a kernel record is the one thing here the model's own config has no business
+The metadata is sized from the numbers this entry states, defaulting to the released V4.1-Flash
+shape, because kernel metadata is the one thing here the model's own config has no business
 knowing: the reference core reads only the row's boundaries and its own ratio.  Nothing falls back
-to a per-layer AI_CPU call -- a width or a geometry the built records do not match raises.
+to a per-layer AI_CPU call -- a width or a geometry the built metadata do not match raises.
+
+The entry states nothing about quantization: the quantized attention is another backend, whose
+config replaces this one and builds an entry of its own in its own package, so nothing here has to
+know that it exists.
 """
 
 from torchtitan.config import derive, override
@@ -38,12 +42,12 @@ def asc(
     index_num_heads: int = 32,
     index_head_dim: int = 128,
 ):
-    """The fused core, with the record geometry stated on the override.
+    """The AscendC attention, with the kernel geometry stated on the override.
 
-    The defaults are the released V4.1-Flash shape, so the shipped recipes need no arguments;
-    a recipe that runs other widths states them here (``asc={"num_heads":8,"head_dim":64,
+    The five widths default to the released V4.1-Flash shape, so the shipped recipes need no
+    arguments; a recipe that runs other widths states them here (``asc={"num_heads":8,"head_dim":64,
     "index_topk":32,"index_num_heads":8,"index_head_dim":32}``).  The reference config carries
-    none of them: only a fused port's records are sized by this, and the record's own guard
+    none of them: only the AscendC attention's metadata is sized by this, and its own guard
     rejects a geometry that disagrees with the layer reading it.
     """
     from .ascendc import AscV41SparseAttention

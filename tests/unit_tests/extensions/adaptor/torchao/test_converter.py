@@ -146,6 +146,20 @@ def test_quantization_converter_preserves_li_metadata_replacement(converter_modu
     assert not quantization_calls
 
 
+def _v41_attention():
+    """One layer's own numbers: the five widths, and the pool its selector declares."""
+    return SimpleNamespace(
+        n_heads=64,
+        head_dim=512,
+        indexer=SimpleNamespace(
+            index_topk=512,
+            num_index_heads=32,
+            index_head_dim=128,
+            selector=SimpleNamespace(candidate_topk_blocks=2048, candidate_block_size=8),
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("model_type", "expect_sparse_attention_converter"),
     [("v4", False), ("v41", True)],
@@ -161,6 +175,12 @@ def test_recipe_converters_select_filters_for_model_type(
         dst_type_max=0.0,
         enable_fsdp_prequantize=False,
         model_compile_enabled=False,
+        # The sparse-attention replacement is sized from the stack's single geometry.
+        model_config=SimpleNamespace(
+            layers=[SimpleNamespace(attention=_v41_attention())],
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+        ),
     )
 
     sparse_attention_converters = [
@@ -171,30 +191,19 @@ def test_recipe_converters_select_filters_for_model_type(
     assert bool(sparse_attention_converters) is expect_sparse_attention_converter
 
 
-def test_v41_li_quantization_alone_selects_only_the_qli_qsli_converter(converter_module):
-    from torchao_npu.configs import DeepSeekV41QuantLightningIndexerConfig
-
-    converters = converter_module._recipe_converters(
-        "mix",
-        model_type="v41",
-        enable_sparse_attention_quantization=False,
-        enable_mxfp4_qat=False,
-        dst_type_max=0.0,
-        enable_fsdp_prequantize=False,
-        model_compile_enabled=False,
-        li_quantization="mxfp4",
-    )
-
-    li_converters = [
-        converter
-        for converter in converters
-        if converter.filter_fn is converter_module._DSV41_CONFIG_FILTERS["lightning_indexer"]
-    ]
-    assert len(li_converters) == 1
-    assert isinstance(li_converters[0].base_config, DeepSeekV41QuantLightningIndexerConfig)
-    assert not any(
-        converter.filter_fn is converter_module._DSV41_CONFIG_FILTERS["sparse_attention"] for converter in converters
-    )
+def test_v41_li_quantization_alone_is_refused(converter_module):
+    """The quantized selector launches the quantized sparse attention's schedules."""
+    with pytest.raises(ValueError, match="requires .*enable-sparse-attention-quantization"):
+        converter_module._recipe_converters(
+            "mix",
+            model_type="v41",
+            enable_sparse_attention_quantization=False,
+            enable_mxfp4_qat=False,
+            dst_type_max=0.0,
+            enable_fsdp_prequantize=False,
+            model_compile_enabled=False,
+            li_quantization="mxfp4",
+        )
 
 
 def test_recipe_converters_warn_when_sparse_attention_filter_is_unavailable(converter_module, caplog):
@@ -402,13 +411,17 @@ def _capture_compressor_encoding(monkeypatch, width):
     return captured
 
 
-@pytest.mark.parametrize("li_enabled", [False, True], ids=["bf16-li", "qli"])
-@pytest.mark.parametrize("sparse_enabled", [False, True], ids=["bf16-smla", "quant-smla"])
-def test_v41_teacher_pair_survives_independent_quantization_switches(
+@pytest.mark.parametrize("li_enabled, sparse_enabled", [(False, False), (False, True), (True, True)])
+def test_v41_teacher_pair_survives_each_supported_switch_combination(
     converter_module,
     li_enabled,
     sparse_enabled,
 ):
+    """Every combination a V4.1 recipe may state keeps both sides of the teacher edge intact.
+
+    ``li_enabled`` without the sparse-attention switch is not among them: the quantized selector
+    launches the quantized attention's schedules, so the converter refuses that pairing outright.
+    """
     from torchao_npu.configs import DeepSeekV41QuantLightningIndexerConfig, DeepSeekV41QuantSparseAttentionConfig
     from torchtitan.config.override import OverrideConfig, apply_overrides
 
@@ -456,6 +469,7 @@ def test_v41_recipe_rejects_non_mxfp4_lightning_indexer(converter_module, li_qua
         converter_module._recipe_converters(
             "mix",
             model_type="v41",
+            enable_sparse_attention_quantization=True,
             enable_mxfp4_qat=False,
             dst_type_max=0.0,
             enable_fsdp_prequantize=False,

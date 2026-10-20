@@ -99,12 +99,27 @@ QLI（Quantized Lightning Indexer，量化索引器）与 QSLI（Quantized Spars
 
 候选池保存 key 的块索引，每块包含 `candidate_block_size` 个位置，最多保留 `candidate_topk_blocks` 个块。它与最终的 `index_topk` 个 key 是两级筛选：QLI 候选源层先确定候选块，后续 QSLI 层使用各自的 query 和权重在这些块内重新选分。Reuse 层直接沿用已有选择，不调用 QLI 或 QSLI。
 
+QLI/QSLI 的 metadata（一条 QLI schedule、一条 QSLI schedule 以及 QSLI 被约束的 per-row 候选数
+`sparse_length`）在每 microbatch 的 eager 边界预计算，随 attention metadata 下发、全层共享；候选数
+按本 rank 的 frames 推导而不是回读 QLI 的输出，所以这些 metadata 在 forward 之前就绪，层内不再
+调用任何 metadata 算子。量化后的 sparse attention 是**另一个 backend**：`li-quantization` 只在
+`enable-sparse-attention-quantization` 同开时可用（converter 直接报错），由量化适配层
+（`torchtitan_npu/extensions/adaptor/torchao/converter.py`）安装它自己的 attention config，该 config
+用 `torchao_npu` 的 provider（`quantized_modules/deepseek_v4_1/attention_metadata.py`）建整份 entry
+——SMLA 前后向、QLI schedule、QSLI schedule + 候选数、BF16 SLIKG 的 backward metadata，字段分组与
+非量化路径同一套（`sparse_attn` / `lightning_indexer`，各按 `fwd` / `bwd` 取值）。候选池的容量与块大小
+取自模型 config（`candidate_topk_blocks` / `candidate_block_size`，参考 selector 建池、搜池用的就是它们），
+只作为 **launch 参数**与候选数推导的输入；QLI metadata 本身与池宽度无关（实测三组宽度逐字节相同），
+所以一个几何只有一条 QLI schedule，建池层和 pool-free 层共用它。`sparse_attn.asc` 上没有任何池参数，
+在这条路径上也不生效；只跑 BF16 selector 的配方不装量化 attention，`fwd_sparse` / `sparse_length`
+保持为空（字段存在，值 `None`）。
+
 `li-quantization=mxfp4` 同时启用这两种实现，由模型层的角色和候选池配置自动选择，无需分别指定。两者输出的索引交给 sparse attention 计算注意力；训练反向均使用 BF16 SLIKG 消费教师信号，QLI/QSLI 本身不替代 sparse attention。
 
-V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教师信号），再由 selector 的 SLIKG 反向消费。标准 A5 融合路径会同时导入两侧 BF16 override 作为 fallback；在此前提下，以下两个配置可以独立替换对应一侧：
+V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教师信号），再由 selector 的 SLIKG 反向消费。目标侧可以通过 `enable-sparse-attention-quantization` 单独量化；选分侧则不能单独量化，因为量化 selector 启动的是量化 attention 建的 schedule（单独开启 `li-quantization` 会被 converter 拒绝）：
 
-- `--extension.quantization.li-quantization mxfp4`：将 BF16 LI selector 替换为 MXFP4 QLI/QSLI，SLIKG 反向保持 BF16。
-- `--extension.quantization.enable-sparse-attention-quantization`：同时替换 KV source Compressor 和 sparse attention；sparse attention 反向继续提供 indexer teacher。
+- `--extension.quantization.li-quantization mxfp4`：将 BF16 LI selector 替换为 MXFP4 QLI/QSLI，SLIKG 反向保持 BF16；必须与下一条同开。
+- `--extension.quantization.enable-sparse-attention-quantization`：同时替换 KV source Compressor 和 sparse attention；sparse attention 反向继续提供 indexer teacher。该开关本身也决定 entry 由哪个 backend 建——开着就是量化 attention 自建，关着就是 `sparse_attn.asc` 那份。
 
 稀疏 attention 量化路径中，swa_kv 使用 `mxfp8_bf16`，cmp_kv 使用 `mxfp4_bf16`。该路径对 KV 量化再反量化后调用 sparse attention 算子，以引入对应的量化误差。
 

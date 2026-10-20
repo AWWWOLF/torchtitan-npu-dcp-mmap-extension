@@ -20,8 +20,9 @@
 # Run from the repository root:
 #   NGPU=1 bash examples/deepseek_v4_1/debug/deepseek_v4_1_stripped_1p_a5.sh --training.steps 5
 #
-# Append CLI arguments to override the defaults below. The TorchAO-NPU option replaces
-# the selector with QLI/QSLI; sparse attention remains the BF16 teacher provider.
+# Append CLI arguments to override the defaults below. `QUANTIZATION_ARGS` swaps the whole
+# quantized stack in -- QLI/QSLI for the selector and the quantized sparse attention for the
+# teacher provider -- and needs `custom_ops`; without those flags the recipe runs both BF16 ports.
 
 set -euo pipefail
 
@@ -38,9 +39,13 @@ export TORCHTITAN_ENGRAM_TABLE_ROWS="${TORCHTITAN_ENGRAM_TABLE_ROWS:-100000}"
 #
 LIGHTNING_INDEXER_OVERRIDE="torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"
 
+# The quantized selector launches the quantized sparse attention's schedules, so the two switches
+# go together: without the sparse-attention quantization the entry carries the unquantized kernel's
+# metadata, which is a different schedule.  Needs `custom_ops` (kv_compress_epilog_v2).
 QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
     --extension.quantization.li-quantization mxfp4
+    --extension.quantization.enable-sparse-attention-quantization
 )
 
 CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rms_norm.asc \

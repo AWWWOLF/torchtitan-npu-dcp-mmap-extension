@@ -96,13 +96,22 @@ torchtitan_npu/override/<scope>/<target>/
   （池化轴，折一次，消费者不再除），端口在这两个 grid 上加自己的三个 kernel frame（`q` /
   `swa_k` / `cmp_k`）与 `aicpu_metadata`——按自身几何调用 CANN `sparse_flash_mla_metadata` /
   `sparse_flash_mla_grad_metadata` 与 `lightning_indexer_metadata` /
-  `sparse_lightning_indexer_kl_loss_grad_metadata` 得到的四条记录（每 microbatch 一次）。
+  `sparse_lightning_indexer_kl_loss_grad_metadata` 得到的四条 metadata（每 microbatch 一次），
+  在 `aicpu_metadata` 下按消费它的 kernel 分组、按方向取值：`sparse_attn.fwd` /
+  `sparse_attn.bwd` 与 `lightning_indexer.fwd` / `lightning_indexer.bwd`。就这些——一方向一份。
   `sparse_attn.asc` 逐层按 `(端口类, compress_ratio)` 取自己的 entry，直接读
-  `aicpu_metadata.sparse_attn` 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
+  `aicpu_metadata.sparse_attn.fwd` 等字段：一条 entry 就是一个几何，没有按 topk 或按几何查表的步骤。
   几何（heads/head dim/indexer 三数）是该 config 自己的必填字段、无默认值，由 override 的五个参数
-  一次写入，默认值即 V4.1-Flash 的发布形状，因此没有单独的 metadata 入口。记录是内核 metadata
-  的唯一来源——没有 inline 回退：拿着没经过端口构建的 metadata 前向会直接失败。
-  CP 下由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建记录。
+  一次写入，默认值即 V4.1-Flash 的发布形状，因此没有单独的 metadata 入口。这些 metadata 是内核的
+  唯一来源——没有 inline 回退：拿着没经过 override 构建的 metadata 前向会直接失败。
+  CP 下由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建。
+  attention override 不声明任何量化：量化后的 attention 是**另一个 backend**，由量化适配层
+  （`torchtitan_npu/extensions/adaptor/torchao/converter.py`）安装自己的 config 替换本节点，并由
+  `torchao_npu` 的 provider（`quantized_modules/deepseek_v4_1/attention_metadata.py`）建自己的 entry
+  ——字段名与上面同一套（`sparse_attn.fwd`/`.bwd`、`lightning_indexer.fwd`/`.bwd`），但 selector
+  那一组换成量化 selector 的 QLI schedule 并多出 `fwd_sparse`（QSLI）与 `sparse_length`（逐行候选数）；
+  候选池的容量与块大小从模型 config 读取，只作为 launch 参数与候选数推导的输入。因此 `asc` 在这条路径上
+  不生效，非量化 entry 的 `fwd_sparse`/`sparse_length` 保持为空，等带 candidate 的非量化算子落地后由端口填。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 生成 CANN `*_metadata`，
   `sparse_attn.asc` 桥接 LightningIndexer/SparseFlashMLA 的正反向；`sparse_attn.pypto` 用
   PyPTO 实现 LI/LIG，并复用 AscendC 的其余 attention kernel。（V4 尚未迁移到 backend-owned
@@ -184,11 +193,11 @@ python -m torchtitan_npu.train \
 
 - DeepSeek-V3.2 只需启用 `sparse_attn.asc`：attention 与它自己的 TND metadata 同属一个
   backend，metadata 由被替换的 config 直接构建，不再有单独的 metadata 入口。
-- DeepSeek-V4.1 的 `sparse_attn.asc` 同时替换 attention 并构建它自己的 metadata 记录，
+- DeepSeek-V4.1 的 `sparse_attn.asc` 同时替换 attention 并构建它自己的 metadata，
   没有单独的 metadata 入口；五个几何数是替换后 config 的必填字段，由该入口的参数写入
-  （默认值为 V4.1-Flash 形状），
-  与 `lightning_indexer.asc` 必须同开（教师边只有两侧都在时才存在），
-  见 `torchtitan_npu/override/README.md#deepseek-v41`。
+  （默认值为 V4.1-Flash 形状）。本入口不声明量化：量化 selector 的 metadata 由量化后的 attention
+  自己建（另一条 backend，见上文），池的容量与块大小取自模型 config。它与 `lightning_indexer.asc`
+  必须同开（教师边只有两侧都在时才存在），见 `torchtitan_npu/override/README.md#deepseek-v41`。
 - DeepSeek-V4 的 `sparse_attn.asc_metadata` 必须与 `sparse_attn.asc` 或 `sparse_attn.pypto` 配套；
   `sparse_attn.asc`、`sparse_attn.pypto`、`sparse_attn.golden` 声明同一 attention target，
   三者只能选一。`golden` 是数值参考，不是融合性能路径。

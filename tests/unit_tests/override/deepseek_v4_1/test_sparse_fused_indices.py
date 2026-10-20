@@ -26,7 +26,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
     """
     length = bounds[-1]
     # The entry this layer would read in a run: its own ratio's frames and, for the selection's
-    # width, its own geometry's records -- this test replaces the kernel node wholesale, so what
+    # width, its own geometry's metadata -- this test replaces the kernel node wholesale, so what
     # it pins is the layout the node is handed, but the metadata is still the real pairing.
     metadata = v41_metadata(
         bounds,
@@ -59,7 +59,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
         softmax_scale=0.5,
         compress_ratio=ratio,
         # The kernel node is replaced below, so this test is about the selection's layout rather
-        # than about the record lookup; the config still states the geometry the metadata above
+        # than about the metadata lookup; the config still states the geometry the metadata above
         # was sized with, the way a run pairs them.
         num_heads=2,
         head_dim=4,

@@ -3,18 +3,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The precomputed SMLA metadata: one record set per geometry, built by the port, read per layer.
+"""The precomputed SMLA metadata: one metadata set per geometry, built by the port, read per layer.
 
-``AscV41SparseAttention.Config`` -- the config that owns the fused core -- builds its own
+``AscV41SparseAttention.Config`` -- the config that owns the AscendC attention -- builds its own
 geometry's AI_CPU metadata operators' outputs at the metadata seam, off the per-layer hot path
 (the forward, the full-AC recompute and the backward alike).  The entry *is* one geometry: the
-port keys itself by ``(class, compress_ratio)``, so the map carries one record set per ratio the
+port keys itself by ``(class, compress_ratio)``, so the map carries one metadata set per ratio the
 stack runs, no builder has to know the stack's ratio table, and every layer reads a grid built
 for its own kernels.  These tests pin the contracts that make the reuse safe: what one geometry
-precomputes, that the map builds each geometry exactly once, that the records are the only source
+precomputes, that the map builds each geometry exactly once, that the metadata is the only source
 of the kernels' metadata (a row that never went through the port fails instead of falling back to
 an inline operator call), the pytree shape the compiled path flattens, and the CP half rebuilding
-the records from this rank's own frames.
+the metadata from this rank's own frames.
 """
 
 from itertools import pairwise
@@ -50,7 +50,7 @@ _TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
 _POSITIONS = torch.arange(128).unsqueeze(0)
 
 # The geometry the fused recipes state, at the widths the tiny debug flavor runs.  Stated by
-# the override's arguments, not by the model: the port is the only thing that sizes records.
+# the override's arguments, not by the model: the port is the only thing that sizes metadata.
 _TINY_GEOMETRY = dict(window_size=128, num_heads=2, head_dim=8, index_topk=32, index_num_heads=2, index_head_dim=4)
 _TINY_AICPU_GEOMETRY = AicpuGeometry(**_TINY_GEOMETRY)
 
@@ -58,14 +58,14 @@ _TINY_AICPU_GEOMETRY = AicpuGeometry(**_TINY_GEOMETRY)
 def _fake_metadata_ops(monkeypatch):
     """Count the AI_CPU metadata launches and keep each call's output and geometry.
 
-    All four operators of one geometry: the SMLA forward/backward pair the fused core reads and
+    All four operators of one geometry: the SMLA forward/backward pair the attention reads and
     the indexer pair the fused selector reads, which ride the same entry.  ``raising=False``
     keeps the fakes installable on runners without ``cann_ops_transformer`` registered at all;
     the operators are never really run either way.
     """
     state = {"smla_fwd": [], "smla_bwd": [], "li": [], "slig": []}
 
-    def _record(kind):
+    def _metadata_op(kind):
         def _call(*args, **kwargs):
             out = torch.zeros(1, dtype=torch.int32)
             state[kind].append((kwargs, out))
@@ -73,15 +73,15 @@ def _fake_metadata_ops(monkeypatch):
 
         return _call
 
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _record("smla_fwd"), raising=False)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _metadata_op("smla_fwd"), raising=False)
     monkeypatch.setattr(
-        torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _record("smla_bwd"), raising=False
+        torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _metadata_op("smla_bwd"), raising=False
     )
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", _record("li"), raising=False)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", _metadata_op("li"), raising=False)
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
         "sparse_lightning_indexer_kl_loss_grad_metadata",
-        _record("slig"),
+        _metadata_op("slig"),
         raising=False,
     )
     return state
@@ -97,7 +97,7 @@ def _core_config(
     index_num_heads: int = 2,
     index_head_dim: int = 4,
 ):
-    """A fused core config: the reference core's fields plus the geometry its records need."""
+    """An AscendC attention config: the reference core's fields plus the geometry its metadata needs."""
     return AscV41SparseAttention.Config(
         window_size=window_size,
         softmax_scale=0.5,
@@ -122,13 +122,13 @@ def _reference_row(bounds: list[int], *, ratio: int) -> DeepSeekV41Metadata:
 
 
 @pytest.mark.parametrize("ratio", [0, 1, 2])
-def test_a_geometry_builds_its_own_ratios_frames_and_records(monkeypatch, ratio):
-    """One config, one geometry: its own ratio's axis and exactly that geometry's records.
+def test_a_geometry_builds_its_own_ratios_frames_and_metadata(monkeypatch, ratio):
+    """One config, one geometry: its own ratio's axis and exactly that geometry's metadata.
 
     The port's builder starts from the same row the reference core builds -- the backend that
     knows the ratio folds ``cu_seq_k`` there, once -- and adds only what a fused kernel reads:
-    this geometry's frames and the records sized for it.  A ratio-0 layer has no compressed
-    axis at all, and its single record is the window-only one; nothing here consults a
+    this geometry's frames and the metadata sized for it.  A ratio-0 layer has no compressed
+    axis at all, and its single metadata is the window-only one; nothing here consults a
     stack-wide ratio table, because there is none.
     """
     state = _fake_metadata_ops(monkeypatch)
@@ -159,42 +159,42 @@ def test_a_geometry_builds_its_own_ratios_frames_and_records(monkeypatch, ratio)
         else:
             assert built.cmp_k.residual is not None
             assert built.cmp_k.residual.tolist() == [0, 0]
-    # One record set per operator pair -- and one launch each, not one per layer, which is the
+    # One metadata set per operator pair -- and one launch each, not one per layer, which is the
     # point of building them here.
     assert len(state["smla_fwd"]) == 1
     assert len(state["smla_bwd"]) == 1
-    records = built.aicpu_metadata
-    assert isinstance(records, AicpuMetadata)
-    assert records.sparse_attn is state["smla_fwd"][0][1]
-    assert records.sparse_attn_grad is state["smla_bwd"][0][1]
-    # The indexer's records ride the same entry, and only where the layer owns a pool.
+    metadata = built.aicpu_metadata
+    assert isinstance(metadata, AicpuMetadata)
+    assert metadata.sparse_attn.fwd is state["smla_fwd"][0][1]
+    assert metadata.sparse_attn.bwd is state["smla_bwd"][0][1]
+    # The indexer's metadata ride the same entry, and only where the layer owns a pool.
     assert len(state["li"]) == (1 if ratio > 0 else 0)
     assert len(state["slig"]) == (1 if ratio > 0 else 0)
     if ratio > 0:
-        assert records.lightning_indexer is state["li"][0][1]
-        assert records.lightning_indexer_kl_loss_grad is state["slig"][0][1]
+        assert metadata.lightning_indexer.fwd is state["li"][0][1]
+        assert metadata.lightning_indexer.bwd is state["slig"][0][1]
     else:
-        assert records.lightning_indexer is None
-        assert records.lightning_indexer_kl_loss_grad is None
-    # The geometry the records were sized with: this ratio, this selection width, this pool.
-    assert records.geometry == AicpuGeometry(
+        assert metadata.lightning_indexer.fwd is None
+        assert metadata.lightning_indexer.bwd is None
+    # The geometry the metadata were sized with: this ratio, this selection width, this pool.
+    assert metadata.geometry == AicpuGeometry(
         window_size=2, num_heads=2, head_dim=4, index_topk=3, index_num_heads=2, index_head_dim=4
     )
     selection = 3 if ratio > 0 else 0
     kwargs, _ = state["smla_fwd"][0]
     assert (kwargs["cmp_topk"], kwargs["has_cmp_kv"], kwargs["cmp_ratio"]) == (selection, ratio > 0, max(ratio, 1))
-    # ... and the selector's records were sized with the config's own indexer numbers.
+    # ... and the selector's metadata were sized with the config's own indexer numbers.
     if ratio > 0:
         indexer_kwargs, _ = state["li"][0]
         assert (indexer_kwargs["num_heads_q"], indexer_kwargs["head_dim"], indexer_kwargs["topk"]) == (2, 4, 3)
 
 
-def test_the_reference_row_carries_no_records_and_the_port_always_builds(monkeypatch):
-    """Two builders, two products: the row contract, and the row plus this geometry's records.
+def test_the_reference_row_carries_no_metadata_and_the_port_always_builds(monkeypatch):
+    """Two builders, two products: the row contract, and the row plus this geometry's metadata.
 
     The reference core reads the row's boundaries and its own ratio, so its builder produces
     that and nothing else -- no kernel geometry anywhere on its config.  The port's builder
-    always adds records: its config states all five numbers, so an entry is always sized for
+    always adds metadata: its config states all five numbers, so an entry is always sized for
     *some* geometry, and the geometry it was sized with rides the entry.
     """
     reference = CompressedSparseInnerAttention2.Config(window_size=2, softmax_scale=0.5, compress_ratio=2)
@@ -204,7 +204,7 @@ def test_the_reference_row_carries_no_records_and_the_port_always_builds(monkeyp
     assert type(row) is DeepSeekV41Metadata
     assert row.cu_seq_q.tolist() == [0, 4]
     assert row.cu_seq_k.tolist() == [0, 2]
-    # No frames and no records: a row is not a fused entry, and nothing pretends otherwise.
+    # No frames and no metadata: a row is not a fused entry, and nothing pretends otherwise.
     assert not hasattr(row, "q")
     assert not hasattr(row, "aicpu_metadata")
 
@@ -213,7 +213,7 @@ def test_the_reference_row_carries_no_records_and_the_port_always_builds(monkeyp
 
     built = port.build_attention_metadata(_positions([0, 4]))
 
-    # The numbers the records were sized with are the port's own, stated once on its config.
+    # The numbers the metadata were sized with are the port's own, stated once on its config.
     assert built.aicpu_metadata.geometry == port.geometry
     assert built.cmp_k is not None
     assert len(state["smla_fwd"]) == len(state["smla_bwd"]) == len(state["li"]) == len(state["slig"]) == 1
@@ -251,20 +251,20 @@ def test_the_map_carries_one_entry_per_ratio_and_builds_each_once(monkeypatch):
         else:
             assert entry.cmp_k is not None
     # Three geometries, so exactly three launches of each operator for the whole microbatch --
-    # the window-only geometry included, whose single record is keyed 0.
+    # the window-only geometry included, whose single metadata is keyed 0.
     assert len(state["smla_fwd"]) == 3
     assert len(state["smla_bwd"]) == 3
     assert sum(1 for kwargs, _ in state["smla_fwd"] if not kwargs["has_cmp_kv"]) == 1
-    # Two of them pool, so two indexer record sets.
+    # Two of them pool, so two indexer metadata sets.
     assert len(state["li"]) == 2
     assert len(state["slig"]) == 2
-    # Every record was built for the geometry the override's arguments stated -- one numbers
+    # Every metadata was built for the geometry the override's arguments stated -- one numbers
     # source, the port's own config, rather than a per-layer restatement.
     for entry in metadata.values():
         assert entry.aicpu_metadata.geometry == _TINY_AICPU_GEOMETRY
 
 
-def test_the_fused_core_reads_the_record_and_never_launches(monkeypatch):
+def test_the_attention_reads_the_metadata_and_never_launches(monkeypatch):
     """The builder launches each operator once; every consumer after that launches nothing.
 
     There is no per-layer operator path left, so a forward, a recompute and a backward add
@@ -314,7 +314,7 @@ def test_the_fused_core_reads_the_record_and_never_launches(monkeypatch):
         )
 
     # Two forward-and-backward cycles: four kernel passes over the same entry, and the counts do
-    # not move -- the forward and the backward both read the record the builder produced.
+    # not move -- the forward and the backward both read the metadata the builder produced.
     for _ in range(2):
         out = consume(entry)
         assert out.shape == (1, 4, 1, 4)
@@ -323,11 +323,11 @@ def test_the_fused_core_reads_the_record_and_never_launches(monkeypatch):
 
 
 def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
-    """The records are the only source of the kernels' metadata: there is no inline fallback.
+    """The metadata are the only source of the kernels' metadata: there is no inline fallback.
 
-    The fused core reads this geometry's frames and records off the entry it is handed.  A
+    The AscendC attention reads this geometry's frames and metadata off the entry it is handed.  A
     caller holding the reference row -- what the reference backend builds, with no geometry on
-    it -- is holding the wrong metadata for a fused core, and the forward fails on the missing
+    it -- is holding the wrong metadata for the AscendC attention, and the forward fails on the missing
     field rather than paying for an AI_CPU call on the side.
     """
     state = _fake_metadata_ops(monkeypatch)
@@ -351,11 +351,11 @@ def test_a_row_that_never_went_through_the_port_is_refused(monkeypatch):
     assert {kind: len(state[kind]) for kind in state} == {"smla_fwd": 0, "smla_bwd": 0, "li": 0, "slig": 0}
 
 
-def test_the_shared_records_survive_every_consumer(monkeypatch):
-    """One record serves every layer, the recompute and the backward: nothing writes it.
+def test_the_shared_metadata_survive_every_consumer(monkeypatch):
+    """One metadata set serves every layer, the recompute and the backward: nothing writes it.
 
     The kernels take ``metadata`` as a read-only input -- the AI_CPU operator's own output,
-    consulted for the grid -- so sharing one record across all consumers is sound; this pins
+    consulted for the grid -- so sharing one metadata set across all consumers is sound; this pins
     this side of the premise, the operator side being validated by the end-to-end A5 runs the
     PR documents.  Through several forward and backward cycles every kernel call reads the
     very same tensor objects, and they stay bit-for-bit what the builder produced.
@@ -384,8 +384,8 @@ def test_the_shared_records_survive_every_consumer(monkeypatch):
 
     config = _core_config(compress_ratio=1, num_heads=1, head_dim=4, index_topk=3, index_num_heads=0, index_head_dim=0)
     entry = config.build_attention_metadata(_positions([0, 4]))
-    records = entry.aicpu_metadata
-    before = (records.sparse_attn.clone(), records.sparse_attn_grad.clone())
+    metadata = entry.aicpu_metadata
+    before = (metadata.sparse_attn.fwd.clone(), metadata.sparse_attn.bwd.clone())
 
     attention = build_cpu_model(config)
 
@@ -406,43 +406,43 @@ def test_the_shared_records_survive_every_consumer(monkeypatch):
         consume()
 
     # Every kernel call -- three layers' worth of forwards and their backwards -- read the
-    # same, still-unchanged record tensors.
+    # same, still-unchanged metadata tensors.
     assert len(received_fwd) == 3
     assert len(received_bwd) == 3
-    assert all(t is records.sparse_attn for t in received_fwd)
-    assert all(t is records.sparse_attn_grad for t in received_bwd)
-    torch.testing.assert_close(records.sparse_attn, before[0], rtol=0, atol=0)
-    torch.testing.assert_close(records.sparse_attn_grad, before[1], rtol=0, atol=0)
+    assert all(t is metadata.sparse_attn.fwd for t in received_fwd)
+    assert all(t is metadata.sparse_attn.bwd for t in received_bwd)
+    torch.testing.assert_close(metadata.sparse_attn.fwd, before[0], rtol=0, atol=0)
+    torch.testing.assert_close(metadata.sparse_attn.bwd, before[1], rtol=0, atol=0)
 
 
-def test_the_records_flatten_through_the_pytree_registry(monkeypatch):
+def test_the_metadata_flatten_through_the_pytree_registry(monkeypatch):
     """The fused metadata round-trips the compiled path's flattening; the row stays opaque."""
     _fake_metadata_ops(monkeypatch)
     entry = _core_config(compress_ratio=2, num_heads=1, head_dim=4, index_topk=3).build_attention_metadata(
         _positions([0, 4])
     )
-    records = entry.aicpu_metadata
+    metadata = entry.aicpu_metadata
 
     leaves, spec = tree_flatten(entry)
     restored = tree_unflatten(leaves, spec)
 
     # The leaves survive the round trip as the very same objects, and the rebuild keeps the
-    # ratio, the frames and the records the consumers read off the entry.
+    # ratio, the frames and the metadata the consumers read off the entry.
     assert isinstance(restored, AscV41Metadata)
     assert restored.ratio == 2
     assert restored.cmp_k is not None and restored.cmp_k.cu_seqlens is entry.cmp_k.cu_seqlens
-    assert restored.aicpu_metadata.sparse_attn is records.sparse_attn
+    assert restored.aicpu_metadata.sparse_attn.fwd is metadata.sparse_attn.fwd
     round_trip, _ = tree_flatten(restored)
     assert len(round_trip) == len(leaves)
     for before, after in zip(leaves, round_trip, strict=True):
         assert before is after
-    # The registry flattens past the dataclass and its nodes: the records' tensors are leaves in
+    # The registry flattens past the dataclass and its nodes: the metadata' tensors are leaves in
     # their own right, not opaque blobs.
-    assert any(leaf is records.sparse_attn for leaf in leaves)
-    assert any(leaf is records.sparse_attn_grad for leaf in leaves)
-    assert any(leaf is records.lightning_indexer for leaf in leaves)
-    assert any(leaf is records.lightning_indexer_kl_loss_grad for leaf in leaves)
-    # The reference row contract is deliberately *not* registered: a stack without a fused port
+    assert any(leaf is metadata.sparse_attn.fwd for leaf in leaves)
+    assert any(leaf is metadata.sparse_attn.bwd for leaf in leaves)
+    assert any(leaf is metadata.lightning_indexer.fwd for leaf in leaves)
+    assert any(leaf is metadata.lightning_indexer.bwd for leaf in leaves)
+    # The reference row contract is deliberately *not* registered: a stack without the AscendC attention
     # keeps its metadata opaque, so one stack's tracer requirement cannot change another
     # path's flattening.
     row = _reference_row([0, 4], ratio=2)
@@ -455,10 +455,10 @@ def test_the_records_flatten_through_the_pytree_registry(monkeypatch):
     register_pytree_node_for_dataclass(AicpuMetadata)
 
 
-def test_the_cp_half_recuts_the_frames_and_rebuilds_the_records(monkeypatch):
-    """This rank's records are built from this rank's frames (upstream #4617's CP half).
+def test_the_cp_half_recuts_the_frames_and_rebuilds_the_metadata(monkeypatch):
+    """This rank's metadata are built from this rank's frames (upstream #4617's CP half).
 
-    A record is the metadata operators' answer for one geometry *of one frame set*: a rank that
+    The metadata is the operators' answer for one geometry *of one frame set*: a rank that
     kept the row's would hand the kernels a grid its inputs do not have.  The rebuild runs the
     same builder the microbatch path runs, for the entry's **own** ratio: the queries are this
     rank's chunk of every document, the KV frames stay the whole row, and this geometry's
@@ -491,12 +491,12 @@ def test_the_cp_half_recuts_the_frames_and_rebuilds_the_records(monkeypatch):
     assert local.cmp_k.cu_seqlens is entry.cu_seq_k
     torch.testing.assert_close(local.positions_q, local.exchange.positions_q.reshape(1, -1), rtol=0, atol=0)
     assert local.q.cu_seqlens.tolist() != entry.q.cu_seqlens.tolist()
-    # The records are rebuilt from the rank-local frames, never shared with the row's.
-    rank_records, row_records = local.aicpu_metadata, entry.aicpu_metadata
-    assert rank_records.sparse_attn is not row_records.sparse_attn
-    assert rank_records.sparse_attn_grad is not row_records.sparse_attn_grad
-    assert rank_records.lightning_indexer is not row_records.lightning_indexer
-    assert rank_records.lightning_indexer_kl_loss_grad is not row_records.lightning_indexer_kl_loss_grad
+    # The metadata are rebuilt from the rank-local frames, never shared with the row's.
+    rank_metadata, row_metadata = local.aicpu_metadata, entry.aicpu_metadata
+    assert rank_metadata.sparse_attn.fwd is not row_metadata.sparse_attn.fwd
+    assert rank_metadata.sparse_attn.bwd is not row_metadata.sparse_attn.bwd
+    assert rank_metadata.lightning_indexer.fwd is not row_metadata.lightning_indexer.fwd
+    assert rank_metadata.lightning_indexer.bwd is not row_metadata.lightning_indexer.bwd
     assert len(state["smla_fwd"]) == 2
     assert len(state["smla_bwd"]) == 2
     assert len(state["li"]) == 2
@@ -592,7 +592,7 @@ def test_the_override_factory_swaps_the_core_and_its_builder(monkeypatch):
 
     The five numbers are the recipe's to state (the defaults are the released shape, pinned in
     ``test_fused_geometry``); what this file pins is that the swap carries them onto the *port's*
-    config and that the config which follows the class is the one whose builder sizes the records.
+    config and that the config which follows the class is the one whose builder sizes the metadata.
     """
     from torchtitan_npu.override.deepseek_v4_1.sparse_attn import asc
 
@@ -606,7 +606,7 @@ def test_the_override_factory_swaps_the_core_and_its_builder(monkeypatch):
     # The reference core's fields survive the swap, and the key names the swapped class.
     assert (port.window_size, port.softmax_scale, port.compress_ratio) == (2, 0.5, 2)
     assert port.attention_metadata_key == (AscV41SparseAttention.Config, 2)
-    # The builder follows the class: this config now precomputes this geometry's records.
+    # The builder follows the class: this config now precomputes this geometry's metadata.
     assert type(port).build_attention_metadata is AscV41SparseAttention.Config.build_attention_metadata
     built = port.build_attention_metadata(_positions([0, 4]))
     assert built.aicpu_metadata.geometry == port.geometry
@@ -615,7 +615,7 @@ def test_the_override_factory_swaps_the_core_and_its_builder(monkeypatch):
 
 
 def _fuse_every_layer(config):
-    """Swap the fused core in on every layer, stating the geometry its kernels are sized with.
+    """Swap the AscendC attention in on every layer, stating the geometry its kernels are sized with.
 
     The override targets the core config with ``exact=True``, so a real run reaches all 40
     layers; the geometry is the tiny debug flavor's own numbers, which is what the recipe's
@@ -630,7 +630,7 @@ def _fuse_every_layer(config):
 
 
 def _fused_tiny_model(monkeypatch):
-    """The tiny debug flavor with the fused core on every layer, as the recipe installs it."""
+    """The tiny debug flavor with the AscendC attention on every layer, as the recipe installs it."""
     return tiny_v41_model(monkeypatch, configure=_fuse_every_layer)[0]
 
 
