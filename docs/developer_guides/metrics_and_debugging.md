@@ -27,9 +27,10 @@ torchtitan 原生提供内存快照功能，使用以下 CLI 参数配置：
 |--------|------|--------|------|
 | `--profiler.enable-memory-snapshot` | bool | false | 是否启用内存快照功能。 |
 | `--profiler.save-memory-snapshot-folder` | str | "profiling/memory_snapshot" | 内存快照文件保存目录。 |
-| `--profiler.profile-freq` | int | 10 | 每隔多少个训练步骤收集一次内存快照。 |
+| `--profiler.memory-snapshot-freq` | int \| None | None | 内存快照采集间隔，设置时必须为正数；未设置时使用 `profile-freq`。 |
+| `--profiler.profile-freq` | int | 10 | 性能分析周期，同时是未设置 `memory-snapshot-freq` 时的内存快照间隔。 |
 
-torchtitan 原生内存快照功能会按照 `--profiler.profile-freq` 指定的频率定期收集内存快照，并在发生 OOM 错误时自动转储当前内存快照。收集到的内存快照将保存到 `--profiler.save-memory-snapshot-folder` 指定的目录中。
+torchtitan 原生内存快照功能优先使用 `--profiler.memory-snapshot-freq`；未设置时才回退到 `--profiler.profile-freq`，并在发生 OOM 错误时自动转储当前内存快照。若同时设置 NPU 性能分析的绝对步数窗口，CANNProfiler 会推导并更新 `profile-freq`；需要保持独立的快照间隔时，应显式设置 `memory-snapshot-freq`。收集到的内存快照将保存到 `--profiler.save-memory-snapshot-folder` 指定的目录中。
 
 ### 配置示例
 
@@ -41,7 +42,7 @@ torchrun --nproc_per_node=2 -m torchtitan_npu.train \
   --config deepseek_v4_debugmodel \
   --profiler.enable-memory-snapshot \
   --profiler.save-memory-snapshot-folder profiling/memory_snapshot \
-  --profiler.profile-freq 10
+  --profiler.memory-snapshot-freq 10
 ```
 
 ---
