@@ -903,5 +903,4 @@ def test_cp_metadata_rejects_a_head_tail_load_balancer():
             SimpleNamespace(seq_len=2048),
             _Mesh(),
             "headtail",
-            None,
         )

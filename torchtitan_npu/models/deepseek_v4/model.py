@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
@@ -205,14 +205,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         runs last.
         """
         positions = extra_kwargs.get("positions")
-        mtp_batch = None
-        if cp_mesh is not None and self.mtp_layers is not None:
-            mtp_batch = prepare_mtp_batch(
-                inputs,
-                labels,
-                positions,
-                len(self.mtp_layers),
-            )
         masks = self.get_attention_masks(positions=positions)
         if not isinstance(masks, VarlenMetadata):
             raise TypeError(
@@ -222,18 +214,15 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             )
         common = build_compressed_varlen_metadata(masks, self.compress_ratios)
         if cp_mesh is not None:
-            inputs, labels, positions, common, mtp_batch = self._build_cp_metadata(
+            inputs, labels, positions, common = self._build_cp_metadata(
                 inputs,
                 labels,
                 positions,
                 common,
                 cp_mesh,
                 load_balancer_type,
-                mtp_batch,
             )
             extra_kwargs["positions"] = positions
-        if mtp_batch is not None:
-            extra_kwargs["mtp_batch"] = mtp_batch
         if self._lightning_indexer_metadata is not None:
             common = self._lightning_indexer_metadata(common)
         if self._metadata_extension is not None:
@@ -249,13 +238,14 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         common,
         cp_mesh,
         load_balancer_type,
-        mtp_batch,
     ):
         """The context-parallel metadata: shard the tensors via the generic
         path and derive the rank-local plan from the global context (the
         common metadata's varlen; the stack shards contiguous slabs).
 
-        Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
+        Returns ``(inputs, labels, positions, metadata)``.  The MTP depths'
+        rolled tokens are prepared by ``preprocess_inputs`` *before* this
+        shard, because a shift across a shard boundary is not a shift."""
         seq_len = common.seq_len
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
@@ -267,19 +257,14 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 f"balancer is {load_balancer_type!r}: run with "
                 "--parallelism.context-parallel-load-balancer None."
             )
-        tensors = (inputs, labels, positions)
-        if mtp_batch is not None:
-            tensors += tuple(mtp_batch)
         tensors, _ = cp_shard(
             cp_mesh,
-            tensors,
+            (inputs, labels, positions),
             None,
             load_balancer_type,
             1,
         )
-        inputs, labels, positions = tensors[:3]
-        if mtp_batch is not None:
-            mtp_batch = MTPBatch(*tensors[3:])
+        inputs, labels, positions = tensors
         rank = cp_mesh.get_local_rank()
         cp_meta, plans, window = build_cp_plan(
             common.varlen,
@@ -294,8 +279,69 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             labels,
             positions,
             CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
-            mtp_batch,
         )
+
+    def preprocess_inputs(
+        self,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        *,
+        parallel_dims: Any,
+        device: torch.device,
+        parallelism: Any,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Prepare the MTP depths' rolled batch on the *global* row, then shard it.
+
+        A depth's rolled tokens have to be derived from the whole row: a shift
+        across a shard boundary is not a shift, so slicing first and rolling
+        afterwards would pick the wrong neighbour at every boundary.  The batch
+        is therefore built here, before the base seam shards the inputs, and
+        the same ``cp_shard`` cut is applied to it afterwards (a local slice,
+        no communication, same contiguous-slab layout as the inputs).
+        Without context parallel or without MTP depths nothing changes.
+        """
+        cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
+        positions = input_dict.get("positions")
+        mtp_batch = None
+        if cp_mesh is not None and self.mtp_layers is not None:
+            # The MTP batch is cut with the same contiguous slab as the inputs, so a load
+            # balancer's permutation would have to be folded into both cuts.  Fail before the
+            # batch is built, not after it was wasted.
+            if parallelism.context_parallel_load_balancer is not None:
+                raise ValueError(
+                    "the MTP batch is sharded with the same contiguous cut as the inputs, but the "
+                    f"context-parallel load balancer is {parallelism.context_parallel_load_balancer!r}: "
+                    "run with --parallelism.context-parallel-load-balancer None."
+                )
+            mtp_batch = prepare_mtp_batch(
+                input_dict["input"],
+                labels,
+                positions,
+                len(self.mtp_layers),
+            )
+        inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+            input_dict,
+            labels,
+            parallel_dims=parallel_dims,
+            device=device,
+            parallelism=parallelism,
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
+        )
+        if mtp_batch is not None:
+            # Narrowing for the type checker: the branch above only builds the batch with a mesh.
+            assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
+            tensors, _ = cp_shard(
+                cp_mesh,
+                tuple(mtp_batch),
+                None,
+                parallelism.context_parallel_load_balancer,
+                1,
+            )
+            extra_kwargs["mtp_batch"] = MTPBatch(*tensors)
+        return inputs, labels, extra_kwargs
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):

@@ -128,9 +128,7 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
     assert torch.isfinite(loss).item()
 
     loss.backward()
-    assert any(
-        parameter.grad is not None for parameter in model.mtp_layers.parameters()
-    )
+    assert any(parameter.grad is not None for parameter in model.mtp_layers.parameters())
 
 
 @pytest.fixture
@@ -270,9 +268,7 @@ def test_deepseek_v4_mtp_state_dict_round_trip():
     model_config = _build_model_config()
     model = build_cpu_model(model_config)
     local_state_dict = {
-        key: value.detach().clone()
-        for key, value in model.state_dict().items()
-        if key.startswith("mtp_layers.0.")
+        key: value.detach().clone() for key, value in model.state_dict().items() if key.startswith("mtp_layers.0.")
     }
     required_local_prefixes = (
         "mtp_layers.0.attention.",
@@ -283,10 +279,7 @@ def test_deepseek_v4_mtp_state_dict_round_trip():
         "mtp_layers.0.moe.shared_experts.",
         "mtp_layers.0.moe.routed_experts.inner_experts.",
     )
-    assert all(
-        any(key.startswith(prefix) for key in local_state_dict)
-        for prefix in required_local_prefixes
-    )
+    assert all(any(key.startswith(prefix) for key in local_state_dict) for prefix in required_local_prefixes)
 
     adapter = DeepSeekV4StateDictAdapter(model_config, hf_assets_path=None)
     hf_state_dict = adapter.to_hf(local_state_dict)
@@ -329,3 +322,78 @@ def test_deepseek_v4_mtp_state_dict_rejects_invalid_depth(method_name, key):
 
     with pytest.raises(ValueError, match="not present"):
         getattr(adapter, method_name)({key: torch.ones(1)})
+
+
+def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
+    """The MTP depths' rolled tokens are built before the CP shard, then cut with it.
+
+    A shift across a shard boundary is not a shift, so the batch must be built
+    from the whole row and the same ``cp_shard`` cut applied afterwards.  The
+    shard here really slices rank 1's half of a two-rank run, so the test pins
+    the alignment, not only the call order.
+    """
+    from types import SimpleNamespace
+
+    from torchtitan_npu.models.deepseek_v4 import model as model_mod
+
+    model = build_cpu_model(_build_model_config())
+    tokens = (torch.arange(SEQ_LEN) % VOCAB_SIZE).view(BATCH_SIZE, -1)
+    labels = (tokens + 1) % VOCAB_SIZE
+    positions = PACKED_POSITIONS.clone()
+
+    real_prepare = model_mod.prepare_mtp_batch
+    built = []
+
+    def record_prepare(inputs, prepared_labels, prepared_positions, num_layers):
+        batch = real_prepare(inputs, prepared_labels, prepared_positions, num_layers)
+        built.append((inputs, prepared_labels, prepared_positions, batch))
+        return batch
+
+    shard_calls = []
+    rank, cp_size = 1, 2
+    shard_len = SEQ_LEN // cp_size
+
+    def fake_cp_shard(mesh, tensors, masks=None, load_balancer_type=None, input_seq_dim=1):
+        shard_calls.append(tuple(tensors))
+        cut = tuple(tensor.narrow(input_seq_dim, rank * shard_len, shard_len) for tensor in tensors)
+        return cut, masks
+
+    monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
+    monkeypatch.setattr(model_mod, "cp_shard", fake_cp_shard)
+
+    mesh = SimpleNamespace(size=lambda *_: cp_size, get_local_rank=lambda: rank, device_type="cpu")
+    parallel_dims = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
+    parallelism = SimpleNamespace(
+        spmd_backend="partial_dtensor",
+        context_parallel_load_balancer=None,
+        context_parallel_ptrr_mask_key=None,
+    )
+    inputs, out_labels, extra_kwargs = model.preprocess_inputs(
+        {"input": tokens, "positions": positions},
+        labels,
+        parallel_dims=parallel_dims,
+        device=tokens.device,
+        parallelism=parallelism,
+    )
+
+    # The batch was built from the global row, once.
+    assert len(built) == 1
+    global_inputs, global_labels, global_positions, batch = built[0]
+    assert global_inputs.shape == tokens.shape
+    assert torch.equal(global_labels, labels)
+    assert torch.equal(global_positions, positions)
+
+    # Two cuts, both fed the full row: the base inputs, then the MTP batch.
+    assert len(shard_calls) == 2
+    for got, expected in zip(shard_calls[0], (tokens, labels, positions), strict=True):
+        assert torch.equal(got, expected)
+    for got, expected in zip(shard_calls[1], batch, strict=True):
+        assert torch.equal(got, expected)
+
+    # The returned inputs and the MTP tensors are the same slab, so they stay aligned per rank.
+    slab = slice(rank * shard_len, (rank + 1) * shard_len)
+    assert torch.equal(inputs, tokens[:, slab])
+    assert torch.equal(out_labels, labels[:, slab])
+    assert torch.equal(extra_kwargs["positions"], positions[:, slab])
+    for got, expected in zip(extra_kwargs["mtp_batch"], batch, strict=True):
+        assert torch.equal(got, expected[:, slab])
