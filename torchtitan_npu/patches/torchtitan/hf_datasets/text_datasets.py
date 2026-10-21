@@ -87,10 +87,12 @@ def pad_segments_to_multiple(segment: tuple, *, multiple: int) -> tuple:
 class AlignedTextDataset(HuggingFaceTextDataset):
     """``HuggingFaceTextDataset`` with per-document pooling alignment.
 
-    The alignment makes a document that fits in one row pool exactly.  It does not
-    extend to the row cut: a document longer than ``seq_len`` is still chunked by the
-    generic row cut, and the continuation row starts its own group grid, so a group can
-    straddle the cut.
+    The alignment makes a document that does not straddle a row cut pool
+    exactly.  It does not extend to the row cut: the cut lands on a block boundary
+    (``seq_len`` and every padded segment are multiples of the alignment), not
+    necessarily on a document boundary, so a document that spans it -- a long one,
+    or any one that starts too late in the row to fit -- is still chunked there and
+    the continuation row starts its own group grid, so a group can straddle the cut.
     """
 
     def __init__(

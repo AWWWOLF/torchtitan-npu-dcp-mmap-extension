@@ -67,7 +67,7 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 - `varlen`：`VarlenMetadata` 或 CP 下的 `CPVarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。`build_kernel_layout` 只构建普通流计划，并明确要求 `cu_seq_q == cu_seq_k`；CP 的 rank-local 计划由 `build_cp_plan` 构建，不会把 CP metadata 传给 `build_kernel_layout`。
 - `batch_size` / `seq_len`：容器网格形状。DSV4 打包场景使用 `local_batch_size == 1`，因此 `batch_size == 1`、`seq_len` 等于总 token 数（`cu_seq_q[-1]`），元数据完全由 varlen 流推导，不依赖 positions。
 - `plans[ratio]`：每个模型实际使用的压缩比（1、4、128）对应一个 `CompressedBlockLayout`：
-  - `cu_seqlens_cmp_k`、`block_remainder`：打包压缩块流边界与每文档尾部余数，直接喂给 AscendC 算子；
+  - `cu_seqlens_cmp_k`、`block_remainder`：打包压缩块流边界与每段尾部余数（对齐后 plain plan 恒 0，CP 计划只在 slab 截断文档时非 0），直接喂给 AscendC 算子；
   - `gather_indices`、`block_positions`、`first_indices`：统一的 Compressor 契约（块 token gather、文档内块起点 RoPE、文档/段首块位置——重叠 borrow 掩码），CP 与非 CP 以同一字段名提供。非 CP 字段由 `build_kernel_layout` 生成；CP 下的 `plans[ratio]` 由 `build_cp_plan` 生成，并额外携带 dispatcher 所需字段。
 - `asc_plans[ratio]`：保存 AscendC 的 `smla_metadata`、`smla_grad_metadata`、`li_metadata` 和 `slig_metadata`。这些张量不进入模型目录的公共 metadata；AscendC extension 返回携带该字段的 `AscCompressedVarlenMetadata`。
 
@@ -83,22 +83,34 @@ cu_seqlens = [0, 3, 5]   # 一行里打包了 2 条序列
 
 ## 压缩与索引规则
 
-[`compressor.py`](../../torchtitan_npu/models/deepseek_v4/compressor.py) 只处理完整压缩块，且**绝不跨文档压缩**。对长度为 `L` 的序列：
+文档在进入行拼接前按 `lcm(compress_ratios)`（V4 为 `128`）对齐：dataloader 在 EOS 之后补 pad token
+（label 为 `-100`，位置继续累加），因此每篇文档都是所有压缩比的整数倍，尾部余数恒为 0，压缩块不会跨文档。
+对齐由 `dataloader.per_doc_alignment` 驱动，registry 从 `compress_ratios` 推出该值（`AlignedHuggingfaceDataloader`），
+与压缩器、内核看到的块网格同源。布局构建器把这条契约当作前提：`build_kernel_layout` 对非空且按
+`lcm(compress_ratios)` 对齐的流，直接把这一行按 ratio 除出计划（边界 `cu_seq_q // ratio`、gather 是恒等、
+块位置是一条等差、余数恒 0），不再逐文档扫描、也没有「尾部不足一块」的分支；破约的流（含空文档或长度不是对齐
+倍数）在构建处直接报错。CP 下仍以 `seq_len / cp_size` 切 slab，块跨 rank 的补块逻辑属于 CP 路径自己的事。
+
+同一对齐值也约束后续两条路径：`seq_len` 必须是 `per_doc_alignment` 的倍数（loader 在构建时校验），
+SFT 的 chat 数据集按同一个值补 pad（`chat_dataloader.sft` 把对齐值透传到 `DeepSeekV4ChatDataLoader`）。
+
+补出的 pad 只影响它自己的位置：压缩槽位只在所属块的**最后一个** token 上可见，而被 pad 补完的尾块最后一个位置必然是 pad，
+因此真实 token 因果上看不到任何含 pad 的压缩键（ratio-4 的选择器同样只会从因果可达的整块里挑），pad 的 label 又是
+`IGNORE_INDEX`，所以对齐不改变单篇文档真实 token 的前向与 loss。打包密度变化（pad 占掉 row 容量）才会改变同一 step
+见到的文档集合——这是 ST 基线平移的原因，不是数值路径变化；`test_padding_a_document_tail_is_invisible_to_its_real_tokens`
+把这条不变量钉在测试里（只改 pad 内容，真实位置的 pool、输出与 CE 逐位不变，pad 位置输出改变且 CE 贡献为 0）。
+
+[`compressor.py`](../../torchtitan_npu/models/deepseek_v4/compressor.py) 只处理完整压缩块，且**绝不跨文档压缩**。文档先按 `lcm(compress_ratios)` 对齐（见上），因此对每篇文档 `compressed_len = L / r` 是整数、`residual = 0`；`block_remainder`（内核的 `cmp_residual_k`）仍按内核契约传入，只是 plain plan 里恒为 0。例如 `cu_seq_q = [0, 128, 384]`（两条文档 128 与 256），`r = 4`：
 
 ```text
-compressed_len = floor(L / r)
-residual       = L - r * compressed_len
+cu_seqlens_cmp_k = [0, 32, 96]   # 压缩块：32 + 64
+block_remainder  = [0, 0]        # 对齐后恒 0；CP 计划的非零值来自 slab 截断
+gather_indices   = [0..383]      # 恒等 gather（[96, 4]）
+block_positions  = [0, 4, ..., 124, 0, 4, ..., 252]  # 文档内相对位置
+overlap_valid    = [F, T x 31, F, T x 63]  # 文档起始块没有前驱
 ```
 
-不足一个完整块的尾部不生成压缩 KV，而是通过 `residual` 传给 AscendC metadata。例如 `cu_seq_q = [0, 10, 27]`（两条序列 10 与 17），`r = 4`：
-
-```text
-cu_seqlens_cmp_k = [0, 2, 6]   # 压缩块：2 + 4
-block_remainder = [2, 1]
-gather_indices   = [A0..A3], [A4..A7], ..., [B12..B15]  # [6, 4]
-block_positions  = [0, 4, 0, 4, 8, 12]
-overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
-```
+非零 `block_remainder` 只出现在 CP 计划里：rank 的 slab 截断文档时，段的 K 前缀可能停在块中间。
 
 - `r=1`：不生成压缩 KV，仅执行原始 KV 的滑窗注意力。公共 `plans[1]` 不包含压缩块，AscendC extension 仍生成对应的 `asc_plans[1]`，融合算子使用 `has_cmp_kv=False`。
 - `r=4`（CSA）：启用重叠压缩和 LightningIndexer；前驱块必须属于同一文档（`overlap_valid`）。

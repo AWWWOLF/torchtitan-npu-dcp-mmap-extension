@@ -12,13 +12,14 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 
 from torchtitan_npu.models.deepseek_v4.chat_dataset import DeepSeekV4ChatDataLoader
 from torchtitan_npu.models.deepseek_v4.chat_encoder import DSV4EncoderConfig, ReasoningEffort, ThinkingMode
+from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedHuggingfaceDataloader
 
 
 @override(
-    target=HuggingFaceTextDataLoader.Config,
+    target=AlignedHuggingfaceDataloader.Config,
     fqns=["dataloader"],
     exact=True,
-    description="Use structured DeepSeek-V4 chat data for SFT",
+    description="Use structured DeepSeek-V4 chat data for SFT (per-document aligned)",
 )
 def sft(
     cfg: HuggingFaceTextDataLoader.Config,

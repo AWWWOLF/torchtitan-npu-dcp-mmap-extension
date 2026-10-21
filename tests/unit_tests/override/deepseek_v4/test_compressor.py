@@ -146,10 +146,18 @@ def compressor_factory(monkeypatch):
 
 def test_prebuilt_compressor_tables_follow_current_boundaries():
     widths = []
-    for lengths in ((16, 16), (8, 24), (8, 8, 16)):
+    # Documents are multiples of lcm(1, 4, 128) = 128: the plan stack only takes
+    # streams on the compression grid.
+    for lengths in ((256, 256), (128, 384), (128, 128, 256)):
         boundaries = torch.tensor((0, *torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32)
         metadata = build_compressed_varlen_metadata(
-            VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=16, max_k=16), (1, 4, 128)
+            VarlenMetadata(
+                cu_seq_q=boundaries,
+                cu_seq_k=boundaries,
+                max_q=max(lengths),
+                max_k=max(lengths),
+            ),
+            (1, 4, 128),
         )
         # The current boundaries, not a possibly stale host maximum, size the table.
         ascendc.build_compressor_state_tables(metadata)
@@ -161,7 +169,7 @@ def test_prebuilt_compressor_tables_follow_current_boundaries():
             assert not table.any()
             assert getattr(table, "_dynamo_unbacked_indices") == {0, 1}
         widths.append(metadata.plans[4].compressor_state_block_table.shape[1])
-    assert widths == [2, 3, 2]
+    assert widths == [32, 48, 32]
 
 
 def test_prebuilt_compressor_table_is_a_pytree_input_and_is_reused(monkeypatch):
@@ -268,7 +276,9 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
     module.ape = torch.nn.Parameter(module.ape.detach().to(ape_dtype), requires_grad=module.ape.requires_grad)
     module.wgate.weight.requires_grad_(not indexer)
     reference = copy.deepcopy(module)
-    lengths = [2 * ratio + 1, ratio - 1, ratio + 2]
+    # Aligned documents with different block counts: two blocks, one block, three
+    # blocks (the plain contract only takes documents on the compression grid).
+    lengths = [2 * ratio, ratio, 3 * ratio]
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
@@ -303,20 +313,6 @@ def test_compressor_cann_schema_document_outputs_and_gradients(
             assert actual_grad is None
         else:
             torch.testing.assert_close(actual_grad, expected_grad, rtol=0.006, atol=0.004)
-
-
-def test_compressor_empty_plan(compressor_factory):
-    module = compressor_factory(4)
-    boundaries = torch.tensor([0, 3], dtype=torch.int32)
-    metadata = build_compressed_varlen_metadata(
-        VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=3, max_k=3), (4,)
-    )
-    x = torch.ones(1, 3, module.wkv.in_features, dtype=torch.float16, requires_grad=True)
-    actual = module(x, metadata)
-    torch.testing.assert_close(actual, module._forward(x, metadata), rtol=0, atol=0)
-    assert actual.shape == (0, module.head_dim)
-    actual.sum().backward()
-    torch.testing.assert_close(x.grad, torch.zeros_like(x), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("api", ["torch-op", "python-wrapper"])
@@ -356,11 +352,9 @@ def test_compressor_available_api_compiles(compressor_factory, monkeypatch, api)
 
 
 @pytest.mark.parametrize("ratio,indexer", [(4, False), (4, True), (128, False)], ids=["c4-attention", "c4-indexer", "c128"])
-@pytest.mark.parametrize("headtail", [False, True], ids=["contiguous", "headtail"])
 @pytest.mark.parametrize("empty_rank", [False, True], ids=["packed", "empty-rank"])
 @pytest.mark.parametrize("compile_model", [False, True], ids=["eager", "aot-eager"])
-def test_compressor_cp_outputs_and_gradients(compressor_factory, monkeypatch, ratio, indexer, headtail, empty_rank, compile_model):
-    from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
+def test_compressor_cp_outputs_and_gradients(compressor_factory, monkeypatch, ratio, indexer, empty_rank, compile_model):
     from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
     module = compressor_factory(ratio, indexer).float()
@@ -372,10 +366,9 @@ def test_compressor_cp_outputs_and_gradients(compressor_factory, monkeypatch, ra
         cu = [*range(total // cp_size + 1), total]
     boundaries = torch.tensor(cu, dtype=torch.int32)
     varlen = VarlenMetadata(cu_seq_q=boundaries, cu_seq_k=boundaries, max_q=total, max_k=total)
-    lb = _HeadTailLoadBalancer(total, cp_size, "cpu") if headtail else None
-    perm = lb._generate_indices(restore=False).reshape(-1) if lb else torch.arange(total)
+    perm = torch.arange(total)
     metadata = [types.SimpleNamespace(varlen=v, plans=p, window=w) for v, p, w in (
-        build_cp_plan(varlen, lb, rank=r, cp_size=cp_size, shard_len=total // cp_size,
+        build_cp_plan(varlen, rank=r, cp_size=cp_size, shard_len=total // cp_size,
                       window_size=4, ratios=[ratio]) for r in range(cp_size)
     )]
     if compile_model:

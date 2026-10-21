@@ -1,7 +1,12 @@
-"""CPU experiment: compressor semantics under CP (plain sharding / headtail LB).
+"""CPU experiment: compressor semantics under CP (contiguous slab sharding).
 
-Oracle: an unsliced global ``VarlenMetadata`` + activations -> the real
-``Compressor`` produces the per-doc pooled compressed keys (ground truth).
+Oracle: an unsliced global ``VarlenMetadata`` + activations -> the per-doc
+pooled compressed keys (ground truth).  The CP matrix keeps arbitrary
+document lengths (``build_cp_plan`` is unchanged), so the oracle keeps the
+pre-alignment per-document contract — ``doc_plan`` below — while the
+production plain builder only accepts documents aligned to the compression
+grid.  The float32 oracle runs the real ``Compressor`` over that per-document
+plan.
 
 Per rank: derive ``CPVarlenMetadata`` from the global metadata, build the
 *boundary borrow plan* (the missing predecessor-block tokens that make
@@ -23,22 +28,17 @@ side), slices the per-segment ``swa_k`` ori ranges, and repacks the
 per-segment compressed streams (``cmp_k`` / ``idx_k``) from the gather.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 from test_dsv4 import IdentityRoPE
-from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
-    _HeadTailLoadBalancer,
-)
 from torchtitan.models.common.attention import VarlenMetadata
 
 torch.manual_seed(0)
 DIM, HD, RD = 8, 16, 4
 RATIO = 4
-
-
-def _ht(seq, cp):
-    return _HeadTailLoadBalancer(seq, cp, "cpu")
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +146,45 @@ def compress_blocks(
     return torch.cat([kv_nope, kv_rope], dim=-1)
 
 
-def rank_plan(cp_meta, shard_len, rank, perm=None, ratio=RATIO, doc_table=None):
+def doc_plan(docs, ratio):
+    """The per-document oracle plan (the plain contract before alignment).
+
+    The CP matrix keeps arbitrary document lengths — ``build_cp_plan`` is
+    unchanged — so the oracle keeps the pre-alignment per-document contract:
+    each document pools its own complete blocks, a shorter tail produces none,
+    the pool is doc-major, the block positions restart at every document, and
+    the first block of every document has no predecessor to borrow from.  (The
+    production plain builder now refuses such a stream: the loader pads every
+    document to ``lcm(compress_ratios)``.)
+    """
+    block_cu = [0]
+    gather: list[int] = []
+    positions: list[int] = []
+    first: list[int] = []
+    token_start = 0
+    for length in docs:
+        n_blocks = length // ratio
+        gather += list(range(token_start, token_start + n_blocks * ratio))
+        positions += list(range(0, n_blocks * ratio, ratio))
+        first.append(block_cu[-1])
+        block_cu.append(block_cu[-1] + n_blocks)
+        token_start += length
+    return SimpleNamespace(
+        cu_seqlens_cmp_k=torch.tensor(block_cu, dtype=torch.int32),
+        n_cmp_blocks_host=block_cu[-1],
+        is_empty_host=not gather,
+        block_remainder=torch.tensor(
+            [length % ratio for length in docs], dtype=torch.int32
+        ),
+        gather_indices=torch.tensor(gather, dtype=torch.int64),
+        block_positions=torch.tensor(positions, dtype=torch.int32),
+        first_indices=torch.tensor(first, dtype=torch.int64),
+        # ``None`` is the dispatcher's plain local gather (no exchange).
+        exchange=None,
+    )
+
+
+def rank_plan(cp_meta, shard_len, rank, ratio=RATIO, doc_table=None):
     """Per-segment borrow plan for one rank, derived from CPVarlenMetadata only.
 
     ``doc_start`` of segment s = k_global_gather_indices[cu_seq_k[s]] (the
@@ -172,15 +210,15 @@ def rank_plan(cp_meta, shard_len, rank, perm=None, ratio=RATIO, doc_table=None):
                       (0 when none), borrowed from the next fragment.
       doc:            document index of the segment.
 
-    The segment's K range in ``k_global_gather_indices`` is doc-ordered (the
-    restore composes the inverse load-balancer permutation), so the fragment
-    is the last ``seg_len`` entries of the range and the predecessor block's
-    tokens are its contiguous ``[(b_first-1)r, b_first*r)`` slice.  All
-    positions are gather positions into the (possibly permuted) stream.
+    The segment's K range in ``k_global_gather_indices`` is doc-ordered
+    (contiguous global positions), so the fragment is the last ``seg_len``
+    entries of the range and the predecessor block's tokens are its
+    contiguous ``[(b_first-1)r, b_first*r)`` slice.  All positions are
+    gather positions into the global stream.
     """
     base = rank * shard_len
-    # local indices into the (possibly permuted) rank stream; the segment
-    # structure from CPVarlenMetadata is already over this stream.
+    # local indices into the global stream; the segment structure from
+    # CPVarlenMetadata is already over this stream.
     local_global = base + torch.arange(shard_len)
     cu_q = cp_meta.cu_seq_q
     cu_k = cp_meta.cu_seq_k
@@ -263,16 +301,16 @@ def rank_plan(cp_meta, shard_len, rank, perm=None, ratio=RATIO, doc_table=None):
     return segments
 
 
-def compress_rank(comp, x_perm, plan, dtype, ratio=RATIO):
+def compress_rank(comp, x_flat, plan, dtype, ratio=RATIO):
     """Compress one rank's blocks: augmented stream -> local packed keys.
 
-    ``x_perm`` is the rank's view of the (possibly load-balanced) stream;
+    ``x_flat`` is the global stream (the rank's view is a contiguous slab);
     all plan positions are gather positions into it.
     """
     augmented = []
     for seg in plan:
         if seg["prepend_global"].numel():
-            augmented.append(x_perm[seg["prepend_global"]])
+            augmented.append(x_flat[seg["prepend_global"]])
         if seg.get("pred_head_global") is not None:
             _, p0 = seg["pred_head_rel"]
             pred_end = seg["blocks"][-1] * ratio
@@ -280,14 +318,14 @@ def compress_rank(comp, x_perm, plan, dtype, ratio=RATIO):
             augmented.append(
                 torch.cat(
                     [
-                        x_perm[seg["pred_head_global"]],
-                        x_perm[seg["local_global"][:head_len]],
+                        x_flat[seg["pred_head_global"]],
+                        x_flat[seg["local_global"][:head_len]],
                     ]
                 )
             )
-        augmented.append(x_perm[seg["local_global"]])
+        augmented.append(x_flat[seg["local_global"]])
         if seg["tail_len"]:
-            augmented.append(x_perm[seg["tail_global"]])
+            augmented.append(x_flat[seg["tail_global"]])
     aug = torch.cat(augmented, dim=0)
     packed = []
     offset = 0
@@ -382,8 +420,8 @@ def derive_doc_table(infos):
     # A doc's length is the maximum seqlen_k among its segments: the segment
     # containing the doc's last token has seqlen_k = doc_len, and every
     # segment's K range is [doc_start, its last token] (full prefix).  The
-    # doc identity is the doc start's *permuted* position — the same value
-    # in every rank's metadata, so (doc, block) keys agree across ranks.
+    # doc identity is the doc start — the same value in every rank's
+    # metadata, so (doc, block) keys agree across ranks.
     return dict(doc_len)
 
 
@@ -392,8 +430,8 @@ class CPDispatcher:
 
     Mirrors the MoE EP dispatcher shape (dispatch -> pack, combine ->
     unpack).  ``pack`` performs the window-token all-to-all — simulated here
-    by slicing the global (possibly load-balanced) stream at the segment's
-    K-range window positions — and assembles the per-segment end-aligned
+    by slicing the global stream at the segment's K-range window positions —
+    and assembles the per-segment end-aligned
     ori ranges ``[window-preceding | local]``; ``unpack`` strips the
     rank-local rows (the Q side), slices the per-segment ``swa_k`` ori
     ranges, and repacks the per-segment compressed streams (``cmp_k`` /
@@ -494,7 +532,6 @@ class CPDispatcher:
 def verify_dispatcher(
     info,
     rank,
-    x_perm,
     x_flat,
     cu,
     comp,
@@ -524,7 +561,7 @@ def verify_dispatcher(
       doc blocks re-packed per segment), and the kernel cumsums.
     """
     cp_meta, seg_plan, doc_map = info["cp_meta"], info["seg_plan"], info["doc_map"]
-    disp = CPDispatcher(cp_meta, seg_plan, x_perm, ratio)
+    disp = CPDispatcher(cp_meta, seg_plan, x_flat, ratio)
     packed_x, seg_meta = disp.pack()
     cu_k = cp_meta.cu_seq_k.tolist()
     cmp_segs, idx_segs, exp_cmp, exp_idx = [], [], [], []
@@ -543,7 +580,7 @@ def verify_dispatcher(
     tol = (1e-12, 1e-12) if dtype == torch.float64 else (1e-6, 1e-6)
 
     # Q-side strip: the unpacked local rows are the rank's own stream
-    local = x_perm[rank * shard_len : (rank + 1) * shard_len]
+    local = x_flat[rank * shard_len : (rank + 1) * shard_len]
     if not torch.equal(out["q_rows"], local):
         failures.append((rank, "disp", "q strip"))
     # q / idx_q / idx_w over the local rows == the direct projections
@@ -617,8 +654,8 @@ def verify_dispatcher(
         failures.append((rank, "disp", "residual"))
 
 
-def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
-    """docs: doc lengths; lb: None or a load balancer instance.
+def run_case(name, docs, cp_size, dtype=torch.float32, ratio=RATIO):
+    """docs: doc lengths; ``cp_size`` contiguous slabs of the global stream.
 
     ``ratio`` selects the compressor variant: 4 = C4A (overlapping), 128 =
     C128A (non-overlapping).  The oracle is the real ``Compressor`` for
@@ -628,8 +665,12 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     seq_len = sum(docs)
     cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=max(docs), max_k=max(docs))
-    md = meta_mod.build_compressed_varlen_metadata(v, (ratio,))
-    plan = md.plans[ratio]
+    # The oracle's metadata: the CP stream keeps arbitrary document lengths, so
+    # the reference keeps the per-document contract (``doc_plan``).
+    plan = doc_plan(docs, ratio)
+    md = SimpleNamespace(
+        plans={ratio: plan}, varlen=v, batch_size=1, seq_len=seq_len
+    )
     comp = build_compressor(dtype, ratio)
     comp_idx = build_compressor(dtype, ratio)  # indexer mirror (own modules)
     q_proj = make_linear(DIM, HD, dtype)
@@ -658,19 +699,12 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
             )
         else:
             packed_oracle = torch.empty((0, HD), dtype=dtype)
-    if lb is None:
-        perm = None
-    else:
-        perm = lb._generate_indices(restore=False).reshape(-1)
-        assert perm is not None and perm.numel() == seq_len
-    x_perm = x_flat[perm] if perm is not None else x_flat
-    # per-doc oracle blocks, keyed by the doc start's *permuted* position —
-    # the doc identity the scheme derives from the metadata
+    # per-doc oracle blocks, keyed by the doc start — the doc identity the
+    # scheme derives from the metadata
     cu_b = plan.cu_seqlens_cmp_k.tolist()
     doc_blocks = {}
     for d in range(len(docs)):
-        ps = int((perm == cu[d]).nonzero()[0]) if perm is not None else int(cu[d])
-        doc_blocks[ps] = packed_oracle[cu_b[d] : cu_b[d + 1]]
+        doc_blocks[int(cu[d])] = packed_oracle[cu_b[d] : cu_b[d + 1]]
     # indexer oracle: the same plan with the indexer's own compressor modules
     if n_blocks:
         bt_full = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
@@ -690,9 +724,9 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     idx_doc_blocks = {}
     orig_start = {}
     for d in range(len(docs)):
-        ps = int((perm == cu[d]).nonzero()[0]) if perm is not None else int(cu[d])
-        idx_doc_blocks[ps] = idx_packed_oracle[cu_b[d] : cu_b[d + 1]]
-        orig_start[ps] = int(cu[d])
+        doc = int(cu[d])
+        idx_doc_blocks[doc] = idx_packed_oracle[cu_b[d] : cu_b[d + 1]]
+        orig_start[doc] = doc
 
     shard_len = seq_len // cp_size
     failures = []
@@ -707,10 +741,10 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     per_rank = []
     for rank in range(cp_size):
         cp_meta = CPVarlenMetadata.from_global(
-            v, FakeMesh(rank, cp_size), 1, seq_len, lb
+            v, FakeMesh(rank, cp_size), 1, seq_len
         )
         per_rank.append({"cp_meta": cp_meta})
-    # the doc structure from the metadata set alone (no global cu/perm)
+    # the doc structure from the metadata set alone (no global cu)
     doc_table = derive_doc_table(per_rank)
     for rank, info in enumerate(per_rank):
         cp_meta = info["cp_meta"]
@@ -759,8 +793,8 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     for info in per_rank:
         seg_plan = info["seg_plan"]
         doc_map = info["doc_map"]
-        local_keys = compress_rank(comp, x_perm, seg_plan, x.dtype, ratio)
-        idx_local_keys = compress_rank(comp_idx, x_perm, seg_plan, x.dtype, ratio)
+        local_keys = compress_rank(comp, x_flat, seg_plan, x.dtype, ratio)
+        idx_local_keys = compress_rank(comp_idx, x_flat, seg_plan, x.dtype, ratio)
         # ownership: block b of a doc is computed by the rank whose
         # fragment contains its start (implicit in the plan's blocks)
         local_idx = 0
@@ -814,7 +848,6 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
         verify_dispatcher(
             info,
             rank,
-            x_perm,
             x_flat,
             cu,
             comp,
@@ -843,68 +876,50 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
 
 _DETERMINISTIC_CASES = [
     # ---- baseline geometries (rounds <= 14)
-    ("plain2", (10, 17, 20, 17), 2, None),
-    ("plain4", (10, 17, 20, 17), 4, None),
+    ("plain2", (10, 17, 20, 17), 2),
+    ("plain4", (10, 17, 20, 17), 4),
     # doc start exactly at a shard boundary (no borrow)
-    ("docstart", (10, 22, 32), 2, None),
+    ("docstart", (10, 22, 32), 2),
     # pure-remainder fragment (no complete block -> all gathered)
-    ("zero-block", (10, 8, 17, 5, 24), 4, None),
+    ("zero-block", (10, 8, 17, 5, 24), 4),
     # lengths not multiple of the ratio: 133/122/744/281 (122 < 128 -> no
     # C128A blocks), seq_len 1280
-    ("irreg", (133, 122, 744, 281), 2, None),
-    ("irreg4", (133, 122, 744, 281), 4, None),
-    # ---- round 15: stress matrix (all f32 + f64, plain + headtail)
+    ("irreg", (133, 122, 744, 281), 2),
+    ("irreg4", (133, 122, 744, 281), 4),
+    # ---- round 15: stress matrix (all f32 + f64)
     # cp=8, shard 502 % 4 = 2: every shard boundary cuts through a block
-    ("cp8", (401, 913, 1003, 1699), 8, None),
-    ("cp8-ht", (401, 913, 1003, 1699), 8, _ht(4016, 8)),
-    # seq 8184: shard 2046 % 4 = 2 and headtail chunk 1023 % 4 = 3 —
-    # CP boundaries cut through blocks at every scale; ~2000 blocks at
-    # r=4; a 27-token sub-128 doc
-    ("long", (307, 1511, 27, 4017, 1019, 1303), 4, None),
-    ("long-ht", (307, 1511, 27, 4017, 1019, 1303), 4, _ht(8184, 4)),
-    # seq 8176, cp=8: shard 1022 % 4 = 2, chunks 511 % 4 = 3 — max
-    # fragmentation (16 chunks)
-    ("long8", (301, 1507, 27, 4017, 1021, 1303), 8, None),
-    ("long8-ht", (301, 1507, 27, 4017, 1021, 1303), 8, _ht(8176, 8)),
-    # seq 8192: shard 2048 and chunk 1024 block-aligned — straddles only
-    # at doc boundaries (the plan must degrade to zero shard traffic)
-    ("aligned-shards", (307, 1511, 29, 4021, 1021, 1303), 4, None),
-    ("aligned-shards-ht", (307, 1511, 29, 4021, 1021, 1303), 4, _ht(8192, 4)),
+    ("cp8", (401, 913, 1003, 1699), 8),
+    # seq 8184: shard 2046 % 4 = 2 — CP boundaries cut through blocks at
+    # every scale; ~2000 blocks at r=4; a 27-token sub-128 doc
+    ("long", (307, 1511, 27, 4017, 1019, 1303), 4),
+    # seq 8176, cp=8: shard 1022 % 4 = 2 — max fragmentation
+    ("long8", (301, 1507, 27, 4017, 1021, 1303), 8),
+    # seq 8192: shard 2048 block-aligned — straddles only at doc
+    # boundaries (the plan must degrade to zero shard traffic)
+    ("aligned-shards", (307, 1511, 29, 4021, 1021, 1303), 4),
     # 15 docs of 1..9 tokens: zero-block fragments, case-B doc-start
     # straddles, case-C predecessor borrows, doc-boundary exclusion
-    # almost everywhere (shard 18 % 4 = 2, chunks 9 % 4 = 1)
-    ("tiny-docs", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4), 4, None),
-    ("tiny-docs-ht", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4), 4, _ht(72, 4)),
+    # almost everywhere (shard 18 % 4 = 2)
+    ("tiny-docs", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4), 4),
     # r-multiples (aligned doc starts), r*k+1 (remainder-1 straddles),
     # r-1 docs
-    ("aligned", (32, 96, 129, 63, 33, 7), 4, None),
-    ("aligned-ht", (32, 96, 129, 63, 33, 7), 4, _ht(360, 4)),
+    ("aligned", (32, 96, 129, 63, 33, 7), 4),
     # a doc ends exactly at a shard boundary mid-block: the partial
     # block must be computed by no one
-    ("boundary-midblock", (34, 30, 64), 2, None),
-    ("boundary-midblock-ht", (34, 30, 64), 2, _ht(128, 2)),
+    ("boundary-midblock", (34, 30, 64), 2),
     # degenerate single-rank sanity at scale (no borrows at all)
-    ("cp1", (1000, 2000, 1496), 1, None),
+    ("cp1", (1000, 2000, 1496), 1),
 ]
-# headtail load balancer: cp2 and cp4, longer non-aligned sequences
-for _cp in (2, 4):
-    for _docs in ((37, 41, 63, 115), (97, 131, 149, 135)):  # 256 / 512
-        _DETERMINISTIC_CASES.append(
-            (f"headtail{_cp}-{sum(_docs)}", _docs, _cp, _ht(sum(_docs), _cp))
-        )
-    _DETERMINISTIC_CASES.append(
-        (f"headtail{_cp}-irreg", (133, 122, 744, 281), _cp, _ht(1280, _cp))
-    )
 
 
 def _deterministic_params():
     params = []
-    for name, docs, cp, lb in _DETERMINISTIC_CASES:
+    for name, docs, cp in _DETERMINISTIC_CASES:
         for ratio in (4, 128):  # C4A (overlapping) and C128A (non-overlapping)
             for dtype in (torch.float32, torch.float64):
                 params.append(
                     pytest.param(
-                        (name, docs, cp, lb, dtype, ratio),
+                        (name, docs, cp, dtype, ratio),
                         id=f"{name}-r{ratio}-{'f32' if dtype == torch.float32 else 'f64'}",
                     )
                 )
@@ -916,17 +931,16 @@ def test_cp_case(dsv4_globals, case):
     """The full CP pipeline for one deterministic geometry: plan, borrows,
     local compression, the compressed-level gather, the per-segment
     assembly vs the oracle, and the Dispatcher round-trip."""
-    name, docs, cp, lb, dtype, ratio = case
-    assert run_case(f"{name}-r{ratio}", docs, cp, lb, dtype, ratio)
+    name, docs, cp, dtype, ratio = case
+    assert run_case(f"{name}-r{ratio}", docs, cp, dtype, ratio)
 
 
 def _sweep_params():
     """Seeded randomized stress sweep (round 15) — fixed configs.
 
     Each config: cp in {2,4,8}, target seq in {2048,4096,8192} adjusted to
-    the divisibility rule (plain: seq % cp == 0; headtail: seq % 2cp == 0),
-    4..12 docs whose lengths mix tiny (1..16) and huge (500..3000) spans,
-    ~half with the headtail load balancer.
+    the divisibility rule (seq % cp == 0), 4..12 docs whose lengths mix tiny
+    (1..16) and huge (500..3000) spans.
     """
     params = []
     rng = torch.Generator().manual_seed(0)
@@ -935,9 +949,7 @@ def _sweep_params():
     while made < 10 and attempts < 40:
         attempts += 1
         cp = int(torch.randint(2, 9, (1,), generator=rng).item())
-        lb = None if torch.rand(1, generator=rng).item() < 0.5 else "ht"
-        div = (2 * cp) if lb else cp
-        lcm = torch.lcm(torch.tensor(div), torch.tensor(8)).item()  # seq % 8 == 0 too
+        lcm = torch.lcm(torch.tensor(cp), torch.tensor(8)).item()  # seq % 8 == 0 too
         target = int(
             torch.tensor([2048, 4096, 8192])[
                 int(torch.randint(0, 3, (1,), generator=rng))
@@ -955,13 +967,12 @@ def _sweep_params():
             continue
         docs.append(seq - sum(docs))  # the remainder becomes one huge doc
         assert sum(docs) == seq, (seq, sum(docs))
-        lb_inst = _ht(seq, cp) if lb else None
-        name = f"sweep{made}-cp{cp}-{'ht' if lb else 'plain'}-{seq}"
+        name = f"sweep{made}-cp{cp}-{seq}"
         for ratio in (4, 128):
             for dtype in (torch.float32, torch.float64):
                 params.append(
                     pytest.param(
-                        (name, tuple(docs), cp, lb_inst, dtype, ratio),
+                        (name, tuple(docs), cp, dtype, ratio),
                         id=f"{name}-r{ratio}-{'f32' if dtype == torch.float32 else 'f64'}",
                     )
                 )
@@ -973,22 +984,31 @@ def _sweep_params():
 @pytest.mark.parametrize("case", _sweep_params())
 def test_cp_sweep_case(dsv4_globals, case):
     """One seeded randomized sweep config through the full pipeline."""
-    name, docs, cp, lb, dtype, ratio = case
-    assert run_case(f"{name}-r{ratio}", docs, cp, lb, dtype, ratio)
+    name, docs, cp, dtype, ratio = case
+    assert run_case(f"{name}-r{ratio}", docs, cp, dtype, ratio)
 
 
 @pytest.mark.parametrize(
     "docs,ratio",
     [
         pytest.param(d, r, id=f"docs{sum(d)}-r{r}")
-        for d in ((10, 17, 20, 17), (133, 122, 744, 281), (37, 41, 63, 115))
+        for d in (
+            (128, 256, 384, 256),
+            (384, 512, 256, 128),
+            (128, 128, 128, 256),
+        )
         for r in (4, 128)
     ],
 )
 def test_degeneracy(dsv4_globals, docs, ratio):
     """Plain ``build_kernel_layout`` vs the cp=1 ``build_cp_plan``: the CP
     plan degenerates bitwise to the plain contract — the permanent
-    no-drift guard between the two plan builders."""
+    no-drift guard between the two plan builders.
+
+    The documents are aligned: the plain contract only takes streams on the
+    compression grid, while the CP plan builder itself still accepts arbitrary
+    lengths (exercised by the rest of this file).
+    """
     from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
     seq = sum(docs)
@@ -997,7 +1017,6 @@ def test_degeneracy(dsv4_globals, docs, ratio):
     plain = meta_mod.build_kernel_layout(v, (ratio,))
     _cp_meta, cp1_plans, _window = build_cp_plan(
         v,
-        None,
         rank=0,
         cp_size=1,
         shard_len=seq,

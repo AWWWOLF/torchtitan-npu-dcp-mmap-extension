@@ -17,8 +17,11 @@ from torchtitan.models.common.attention import VarlenMetadata
 pytestmark = pytest.mark.usefixtures("dsv4")
 
 HD = 16
-_SHORT = torch.tensor([0, 10, 27, 47, 64], dtype=torch.int32)
-_LONG = torch.tensor([0, 320, 640], dtype=torch.int32)
+# The metadata is built with the model's full ratio stack (1, 4, 128), so every
+# document is a whole number of 128-token blocks (the loader's alignment): four
+# one-block documents, and two long three-block documents.
+_SHORT = torch.tensor([0, 128, 256, 384, 512], dtype=torch.int32)
+_LONG = torch.tensor([0, 384, 768], dtype=torch.int32)
 _RATIOS = (1, 4, 128)
 _WINDOW, _SCALE, _TOPK = 8, 0.25, 8
 

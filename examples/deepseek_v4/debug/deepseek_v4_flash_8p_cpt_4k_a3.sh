@@ -67,6 +67,7 @@ PARALLELISM_ARGS="
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
+    --parallelism.context-parallel-load-balancer None
     --parallelism.pipeline-parallel-degree ${PP}
 "
 

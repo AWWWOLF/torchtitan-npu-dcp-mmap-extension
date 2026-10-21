@@ -9,14 +9,14 @@ Two halves live here (the single home of all DSV4 CP logic):
 
 1. **The plan builder** — a pure derivation from the global context: the
    pre-shard document structure (the model's ``get_attention_masks``
-   result) plus the load-balancer permutation.  Every rank derives every
-   rank's rank-local shard metadata in-frame via
-   ``CPVarlenMetadata.from_global`` (the shard path's own builder), so
-   there is **no plan-time communication** at all.  The whole derivation
-   is expressed in the documents' **permuted slices** (``docs``, keyed by
-   the segment's doc identity): every row a plan consumes — window
-   ``[win_start, q0)`` or plan blocks ``[A, B)`` — is a plain slice of
-   one document's slice.
+   result; the stack shards contiguous slabs, so no load-balancer
+   permutation exists).  Every rank derives every rank's rank-local shard
+   metadata in-frame via ``CPVarlenMetadata.from_global`` (the shard
+   path's own builder), so there is **no plan-time communication** at all.
+   The whole derivation is expressed in the documents' slices (``docs``,
+   keyed by the segment's doc identity): every row a plan consumes —
+   window ``[win_start, q0)`` or plan blocks ``[A, B)`` — is a plain slice
+   of one document's slice.
 
    The plan has two independent parts:
 
@@ -41,8 +41,8 @@ Two halves live here (the single home of all DSV4 CP logic):
    gather of kv/score), all wired to the CP mesh by their owners'
    ``parallelize``.  The two plan-driven ops are ``gather`` (a local
    gather without an exchange — the plan's ``gather_indices`` over the
-   local stream; a remote gather + permute with one — the exchange plus
-   the same ``gather_indices`` over ``cat([x_local, recv])``) and
+   local stream; a remote gather with one — the exchange plus the same
+   ``gather_indices`` over ``cat([x_local, recv])``) and
    ``select`` (the container packing).  The exchanges are uneven
    all-to-alls over the CP process group (``spmd_types``); ``_all_to_all``
    is the override seam — the CPU tests subclass and replace it with
@@ -106,8 +106,8 @@ def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
     """Per non-empty segment: ``(doc_start, seg_len, seqlen_k, p0)``.
 
     ``doc_start = kgather[cu_seq_k[s]]`` is the document identity
-    (identical across ranks, permuted coordinates — the key of the
-    document's permuted slice in ``docs``); ``p0 = seqlen_k - seg_len`` is
+    (identical across ranks, global coordinates — the key of the
+    document's slice in ``docs``); ``p0 = seqlen_k - seg_len`` is
     the fragment's doc-relative start.
     """
     cu_q = cp_meta.cu_seq_q.cpu().tolist()
@@ -182,7 +182,7 @@ def _routing_geometry(
 ) -> list[tuple[list[int], list[int], list[int], list[int]]]:
     """The alltoallv routing of one exchange.
 
-    ``foreign_all[r]`` = rank r's foreign positions (permuted-stream
+    ``foreign_all[r]`` = rank r's foreign positions (global stream
     coordinates, in its per-segment receive order).  Returns per rank
     ``(send_indices, send_splits, recv_splits, recv_offsets)``: the send
     payload rows grouped by receiver (receiver order), the per-receiver /
@@ -218,7 +218,7 @@ def _routing_geometry(
 def _row_order(rows: list[int], *, rank: int, shard_len: int) -> tuple[list[int], int]:
     """The row order of one packed stream and its unique-receive count.
 
-    ``rows`` are the stream's rows in packed order (permuted
+    ``rows`` are the stream's rows in packed order (global
     coordinates); local rows map to their local offset, foreign rows to
     ``shard_len + receive slot`` — the first-appearance order matching the
     routing's ``recv_offsets``.
@@ -372,7 +372,6 @@ def _assemble_block_plan(
 
 def build_cp_plan(
     global_varlen,
-    load_balancer,
     *,
     rank: int,
     cp_size: int,
@@ -384,19 +383,14 @@ def build_cp_plan(
     communication): every rank's rank-local varlen is derived in-frame via
     ``CPVarlenMetadata.from_global`` (the shard path's own builder), so the
     rank-local varlen, the per-ratio block plans, and the window plan all
-    fall out of the pre-shard document structure + the load-balancer
-    permutation.  The model's ``build_attention_masks`` calls this; the
-    dispatchers are wired by their owners' ``parallelize``.
+    fall out of the pre-shard document structure.  Each rank owns one
+    contiguous slab of the row; the model refuses any other load balancer.  The model's
+    ``build_attention_masks`` calls this; the dispatchers are wired by their
+    owners' ``parallelize``.
     """
     global_cu = global_varlen.cu_seq_q
     device = global_cu.device
     seq_len = int(global_cu[-1].item())
-    rearrange = (
-        load_balancer._generate_indices(restore=False).reshape(-1)
-        if load_balancer is not None
-        else torch.arange(seq_len, device=device)
-    )
-    restore = torch.argsort(rearrange)
     varlens = [
         CPVarlenMetadata.from_global(
             # The ``_RankMesh`` shim implements the ``DeviceMesh`` contract
@@ -405,20 +399,19 @@ def build_cp_plan(
             _RankMesh(cp_size, r),  # pyrefly: ignore [bad-argument-type]
             1,
             seq_len,
-            load_balancer,
         )
         for r in range(cp_size)
     ]
     segs_all = [segment_structure(v) for v in varlens]
     my_segs = segs_all[rank]
-    # The full permuted document slices, keyed by the segment's doc
-    # identity (the permuted doc start): every row a plan consumes — the
-    # window range or the plan blocks — is a slice of one document's slice.
+    # The document slices, keyed by the segment's doc identity (the doc
+    # start): every row a plan consumes — the window range or the plan
+    # blocks — is a slice of one document's slice.
     docs: dict[int, list[int]] = {}
     for d in range(len(global_cu) - 1):
         d0, d1 = int(global_cu[d].item()), int(global_cu[d + 1].item())
         if d1 > d0:
-            docs[int(restore[d0].item())] = restore[d0:d1].tolist()
+            docs[d0] = list(range(d0, d1))
 
     # ---- the window plan (ratio-independent) ----
     win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
@@ -480,8 +473,8 @@ def build_cp_plan(
 # per ``Compressor`` (the block gather of the projected kv/score rows),
 # wired to the CP mesh by their owners' ``parallelize``.  The two
 # plan-driven ops: ``gather`` (a local gather without an exchange — the
-# plan's ``gather_indices`` over the local stream; a remote gather +
-# permute with one — the exchange plus the same ``gather_indices`` over
+# plan's ``gather_indices`` over the local stream; a remote gather with
+# one — the exchange plus the same ``gather_indices`` over
 # ``cat([x_local, recv])``) and ``select`` (the pooled-key container
 # packing).  The compressed-level gather of the padded containers is
 # declarative (the core's ``ShardingConfig`` ``cp: S(1) -> R``), not a
@@ -621,7 +614,7 @@ class CPTokenDispatcher(Configurable):
         stream (the identity without a plan — the non-CP window path);
         with one, the exchange gathers the foreign rows and the same
         ``gather_indices`` order ``cat([x_local, recv])`` into the pooled
-        stream — a remote gather + permute.  Always returns
+        stream (a remote gather).  Always returns
         ``[1, N, D]``.
         """
         if plan is None or plan.exchange is None:

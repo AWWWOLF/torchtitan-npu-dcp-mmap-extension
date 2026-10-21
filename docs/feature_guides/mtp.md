@@ -66,13 +66,13 @@ DeepSeek-V4 MTP 保留 mHC 多流状态，但其 attention 使用非压缩形式
 
 ### 1.4 DeepSeek-V4 Context Parallel
 
-MTP 的 future-token shift 不能在 CP rank-local 序列上执行：`headtail` 等负载均衡会让一个 rank 持有不连续的前缀和后缀，局部移动会在 rank 边界读取错误token。实现因此在 `cp_shard` 之前对完整序列统一生成：
+MTP 的 future-token shift 不能在 CP rank-local 序列上执行：局部移动会在 rank 边界读到不属于本 rank 的 token。V4 的 CP 只支持连续切片（`--parallelism.context-parallel-load-balancer None`，见[Context Parallel](deepseek_v4_cp.md)），但实现仍保持在 `cp_shard` 之前对完整序列统一生成：
 
 - 每个 MTP 深度的 future token；
 - packed sequence 感知的有效位置 mask；
 - 每个 MTP 深度的监督 label。
 
-这些张量与普通 `inputs`、`labels`、`positions` 一起进入 TorchTitan 原生 `cp_shard`，复用相同的 load balancer 和 sequence 维切分。这样既保留普通 CP 路径，也保证 token、label 和 mask 在每个 rank 上严格同位。
+这些张量与普通 `inputs`、`labels`、`positions` 一起进入 TorchTitan 原生 `cp_shard`，复用相同的 sequence 维切分（V4 的 load balancer 固定为连续切片）。这样既保留普通 CP 路径，也保证 token、label 和 mask 在每个 rank 上严格同位。
 
 该流程只接入 DeepSeek-V4：继续复用已有压缩 metadata 和 CP plan 构造，只把 MTP 张量加入同一次通用 tensor shard。DeepSeek-V3 和 DeepSeek-V3.2 保留社区 MTP 的原有限制，`context_parallel_degree > 1` 时在配置更新阶段报错；两者已有的非 MTP CP 路径不变。
 

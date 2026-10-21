@@ -23,6 +23,8 @@ from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader, ChatDataset
 from torchtitan.tools.logging import logger
 
+from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import pad_segments_to_multiple
+
 from .chat_encoder import DSV4ChatEncoder, DSV4EncoderConfig
 
 
@@ -35,9 +37,14 @@ def _sft_messages(sample: dict[str, Any]) -> list[dict[str, Any]]:
 class DeepSeekV4ChatDataset(ChatDataset):
     """V4 developer/reminder/tool turns with assistant-only supervision."""
 
-    def __init__(self, *args, chat_encoder: DSV4ChatEncoder, **kwargs) -> None:
+    def __init__(self, *args, chat_encoder: DSV4ChatEncoder, per_doc_alignment: int = 1, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if per_doc_alignment < 1:
+            raise ValueError("per_doc_alignment must be positive")
+        if self.seq_len % per_doc_alignment:
+            raise ValueError(f"seq_len ({self.seq_len}) must be a multiple of per_doc_alignment ({per_doc_alignment}).")
         self._chat_encoder = chat_encoder
+        self.per_doc_alignment = per_doc_alignment
 
     @staticmethod
     def _validate_v4_messages(messages: list[dict[str, Any]]) -> None:
@@ -85,7 +92,10 @@ class DeepSeekV4ChatDataset(ChatDataset):
         if all(label == IGNORE_INDEX for label in label_ids):
             logger.warning(f"Dropping sample {self._sample_idx}: all labels are masked")
             return None
-        return input_ids, label_ids
+        # Pad the conversation segment to the compression grid: the compressed block
+        # never straddles a document edge and every ratio sees whole groups.  The pads
+        # are appended with IGNORE labels, so they never become targets.
+        return pad_segments_to_multiple((input_ids, label_ids), multiple=self.per_doc_alignment)
 
 
 class DeepSeekV4ChatDataLoader(ChatDataLoader):
@@ -95,6 +105,8 @@ class DeepSeekV4ChatDataLoader(ChatDataLoader):
     class Config(ChatDataLoader.Config):
         dataset_path: str | None = "json"
         dataset: str = "json"  # accepted from the shared CPT launcher
+        per_doc_alignment: int = 1
+        """The compression grid every conversation segment is padded to (the model's alignment)."""
         data_files: str = ""
         sample_processor: Annotated[Callable[[dict[str, Any]], list[dict[str, Any]]], tyro.conf.Suppress] = (
             _sft_messages
@@ -134,6 +146,7 @@ class DeepSeekV4ChatDataLoader(ChatDataLoader):
             dp_world_size=dp_world_size,
             infinite=config.infinite,
             chat_encoder=chat_encoder,
+            per_doc_alignment=config.per_doc_alignment,
         )
         ParallelAwareDataloader.__init__(
             self,

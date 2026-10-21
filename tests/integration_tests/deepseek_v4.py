@@ -40,6 +40,7 @@ def _build_case(
     use_golden: bool = True,
     check_loss: bool = True,
     extra_override_imports: tuple[str, ...] = (),
+    env_vars: dict[str, str] | None = None,
 ) -> OverrideDefinitions:
     """Build one DeepSeek-V4 integration case.
 
@@ -56,6 +57,7 @@ def _build_case(
         ngpu=ngpu,
         use_golden=use_golden,
         check_loss=check_loss,
+        env_vars=env_vars,
     )
 
 
@@ -161,15 +163,28 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "CONFIG": "deepseek_v4_debugmodel",
                 "TRAIN_FILE": "tests.integration_tests.anticipatory_routing",
             },
-            override_args=[(*GOLDEN_OVERRIDES,
-                "--training.steps=10", "--training.seq-len=256", "--training.global-batch-size=1",
-                "--parallelism.data-parallel-shard-degree=1", "--parallelism.expert-parallel-degree=1",
-                "--hf-assets-path=tests/assets/deepseek_v3", "--debug.seed=42",
-                "--checkpoint.enable", "--checkpoint.no-load-only", "--checkpoint.interval=2",
-                "--checkpoint.keep-latest-k=0", "--checkpoint.no-last-save-model-only",
-                "--anticipatory.enable", "--anticipatory.delay-steps=1", "--anticipatory.active-steps=2",
-                "--anticipatory.max-rollbacks=1", "--anticipatory.detector.warmup-steps=4",
-            )],
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=10",
+                    "--training.seq-len=256",
+                    "--training.global-batch-size=1",
+                    "--parallelism.data-parallel-shard-degree=1",
+                    "--parallelism.expert-parallel-degree=1",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--debug.seed=42",
+                    "--checkpoint.enable",
+                    "--checkpoint.no-load-only",
+                    "--checkpoint.interval=2",
+                    "--checkpoint.keep-latest-k=0",
+                    "--checkpoint.no-last-save-model-only",
+                    "--anticipatory.enable",
+                    "--anticipatory.delay-steps=1",
+                    "--anticipatory.active-steps=2",
+                    "--anticipatory.max-rollbacks=1",
+                    "--anticipatory.detector.warmup-steps=4",
+                )
+            ],
             ngpu=1,
             timeout=600,
             use_golden=True,
@@ -179,12 +194,19 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_lora_ep2_fsdp2",
             test_descr="DeepSeek-V4 LoRA A/B training, frozen base and PEFT export EP2/FSDP2",
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
-            override_args=[(*GOLDEN_OVERRIDES,
-                "--training.steps=2", "--training.global-batch-size=2", "--optimizer.name=Muon",
-                "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
-                "--hf-assets-path=tests/assets/deepseek_v3",
-                "--checkpoint.enable", "--checkpoint.interval=10000",
-            )],
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--optimizer.name=Muon",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=2",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--checkpoint.enable",
+                    "--checkpoint.interval=10000",
+                )
+            ],
             ngpu=2,
             use_golden=True,
             check_loss=False,
@@ -255,6 +277,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
                 "--parallelism.context-parallel-degree=2",
+                "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
                 "--compile.enable",
                 "--compile.backend=aot_eager",
@@ -266,13 +289,17 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             check_loss=False,
         ),
         _build_case(
-            test_name="dsv4_mtp_smla_cp2_headtail",
-            test_descr="DeepSeek-V4 MTP SMLA Muon cp2 headtail",
+            test_name="dsv4_mtp_smla_cp2",
+            test_descr="DeepSeek-V4 MTP SMLA Muon cp2",
             ngpu=2,
+            env_vars={
+                "MODULE": "tests.integration_tests.mtp_config",
+                "CONFIG": "deepseek_v4_debugmodel_mtp",
+            },
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=headtail",
+                "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",

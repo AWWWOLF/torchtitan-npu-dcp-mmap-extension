@@ -38,7 +38,6 @@ description.
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
@@ -59,28 +58,6 @@ if TYPE_CHECKING:
     from .attention import Attention
     from .context_parallel import ExchangeMetadata
     from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
-
-
-def compression_alignment(compress_ratios: tuple[int, ...]) -> int:
-    """The ``A`` a packed document length must be a multiple of, ``1`` when none.
-
-    Every layer with ``compress_ratio > 0`` pools each group of ``R`` consecutive
-    tokens into one main-KV entry, and the indexer addresses that entry axis as the row's
-    boundaries over ``R``.  A document whose token count is not a multiple of ``R``
-    therefore gets a partial trailing group that the *next* document's tokens complete:
-    the pooled value mixes two documents, and the boundaries no longer say which document
-    the group belongs to.  Keeping whole groups inside one document is what the alignment
-    below is for.
-
-    Taking the least common multiple of every ratio the stack pools with gives the
-    alignment that keeps a whole group of each ratio inside one document; that is what
-    the dataloaders pad each document to.
-    """
-    alignment = 1
-    for ratio in compress_ratios:
-        if ratio > 0:
-            alignment = math.lcm(alignment, ratio)
-    return alignment
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)

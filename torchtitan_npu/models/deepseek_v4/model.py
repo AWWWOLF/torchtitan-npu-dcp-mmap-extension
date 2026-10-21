@@ -9,9 +9,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
-    _HeadTailLoadBalancer,
-)
 from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import TransformerBlock
@@ -256,7 +253,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     ):
         """The context-parallel metadata: shard the tensors via the generic
         path and derive the rank-local plan from the global context (the
-        common metadata's varlen + the load-balancer permutation).
+        common metadata's varlen; the stack shards contiguous slabs).
 
         Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
         seq_len = common.seq_len
@@ -264,7 +261,12 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         if seq_len % cp_size != 0:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
         shard_len = seq_len // cp_size
-        lb = _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type) if load_balancer_type == "headtail" else None
+        if load_balancer_type is not None:
+            raise ValueError(
+                f"the DeepSeek-V4 stack shards contiguous slabs, but the context-parallel load "
+                f"balancer is {load_balancer_type!r}: run with "
+                "--parallelism.context-parallel-load-balancer None."
+            )
         tensors = (inputs, labels, positions)
         if mtp_batch is not None:
             tensors += tuple(mtp_batch)
@@ -281,7 +283,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         rank = cp_mesh.get_local_rank()
         cp_meta, plans, window = build_cp_plan(
             common.varlen,
-            lb,
             rank=rank,
             cp_size=cp_size,
             shard_len=shard_len,

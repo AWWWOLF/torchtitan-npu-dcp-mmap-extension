@@ -25,14 +25,13 @@ torch.manual_seed(0)
 import test_cp_compressor as tcc
 from test_cp_compressor import (
     FakeMesh,
-    _ht,
     build_compressor,
     compress_blocks,
+    doc_plan,
 )
 from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.deepseek_v4 import compressor as comp_mod
-from torchtitan_npu.models.deepseek_v4 import metadata as meta_mod
 from torchtitan_npu.models.deepseek_v4.token_dispatcher import (
     CPTokenDispatcher,
     build_cp_plan,
@@ -53,11 +52,8 @@ RATIOS = (4, 128)
 _cu = torch.tensor([0, *torch.tensor(DOCS).cumsum(0).tolist()], dtype=torch.int32)
 _seq_len = sum(DOCS)
 _v = VarlenMetadata(cu_seq_q=_cu, cu_seq_k=_cu, max_q=max(DOCS), max_k=max(DOCS))
-_lb = _ht(_seq_len, CP)
-_perm = _lb._generate_indices(restore=False).reshape(-1)
 _shard_len = _seq_len // CP
 _x_flat = torch.randn(1, _seq_len, DIM).flatten(0, 1)
-_x_perm = _x_flat[_perm]
 
 
 class _PortableTransport:
@@ -155,10 +151,9 @@ def main():
 
 def run(rank: int, group, failures: list[str]) -> None:
     for ratio in RATIOS:
-        cp_meta = CPVarlenMetadata.from_global(_v, FakeMesh(rank, CP), 1, _seq_len, _lb)
+        cp_meta = CPVarlenMetadata.from_global(_v, FakeMesh(rank, CP), 1, _seq_len)
         derived, plans, window = build_cp_plan(
             _v,
-            _lb,
             rank=rank,
             cp_size=CP,
             shard_len=_shard_len,
@@ -209,7 +204,7 @@ def verify_plan(rank, plans, window, cp_meta, ratio, failures):
 def verify_dispatch(rank, context, plans, window, cp_meta, ratio, failures):
     comp = build_compressor(torch.float32, ratio)
     segs = segment_structure(cp_meta)
-    x_local = _x_perm[rank * _shard_len : (rank + 1) * _shard_len]
+    x_local = _x_flat[rank * _shard_len : (rank + 1) * _shard_len]
     x_local = x_local.view(1, _shard_len, DIM)
     rplan = plans[ratio]
 
@@ -217,7 +212,7 @@ def verify_dispatch(rank, context, plans, window, cp_meta, ratio, failures):
     cu_o = window.cu_seqlens_ori_kv.tolist()
     swa = context.gather(x_local, window).flatten(0, 1)
     for s, seg in enumerate(segs):
-        o_start = int(_perm[seg[0]])
+        o_start = seg[0]
         win_start_rel = max(seg[3] - 7, 0)
         got = swa[cu_o[s] : cu_o[s + 1]]
         exp_o = _x_flat[o_start + win_start_rel : o_start + seg[3] + seg[1]]
@@ -263,11 +258,15 @@ _oracle = {}
 
 
 def oracle_blocks(comp, ratio):
-    """The no-CP oracle: per-doc packed blocks from the full stream."""
+    """The no-CP oracle: per-doc packed blocks from the full stream.
+
+    The worker's documents keep arbitrary lengths (the CP plan builder still
+    takes them), so the oracle uses the per-document contract (``doc_plan``)
+    rather than the aligned plain builder.
+    """
     if ratio in _oracle:
         return _oracle[ratio]
-    md = meta_mod.build_compressed_varlen_metadata(_v, (ratio,))
-    plan = md.plans[ratio]
+    plan = doc_plan(DOCS, ratio)
     n_blocks = int(plan.cu_seqlens_cmp_k[-1])
     if n_blocks:
         bt = _x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
@@ -287,8 +286,7 @@ def oracle_blocks(comp, ratio):
     cu_b = plan.cu_seqlens_cmp_k.tolist()
     doc_blocks = {}
     for d in range(len(DOCS)):
-        ps = int((_perm == _cu[d]).nonzero()[0])
-        doc_blocks[ps] = packed[cu_b[d] : cu_b[d + 1]]
+        doc_blocks[int(_cu[d])] = packed[cu_b[d] : cu_b[d + 1]]
     _oracle[ratio] = doc_blocks
     return doc_blocks
 

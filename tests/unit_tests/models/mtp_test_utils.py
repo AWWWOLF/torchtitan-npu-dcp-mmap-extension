@@ -9,7 +9,11 @@ from types import SimpleNamespace
 import torch
 
 BATCH_SIZE = 1
-SEQ_LEN = 128
+# The DSV4 stack aligns every packed document to lcm(compress_ratios) -- 128 for
+# the debug stack's (1, 4, 128) -- so the two packed documents are whole 128-token
+# multiples (they used to be two 64-token documents, which the aligned metadata
+# contract refuses).
+SEQ_LEN = 256
 VOCAB_SIZE = 64
 _DOCUMENT_LEN = SEQ_LEN // 2
 PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMENT_LEN)]).unsqueeze(0)
@@ -19,7 +23,7 @@ PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMEN
 _NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
 _NO_SPMD = SimpleNamespace(
     spmd_backend="partial_dtensor",
-    context_parallel_load_balancer="headtail",
+    context_parallel_load_balancer=None,
     context_parallel_ptrr_mask_key=None,
 )
 

@@ -20,6 +20,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_cp_compressor as tcc
@@ -27,15 +28,14 @@ import torch
 import torch.nn as nn
 from test_cp_compressor import (
     FakeMesh,
-    _ht,
     build_compressor,
     compress_blocks,
+    doc_plan,
     make_linear,
 )
 from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.deepseek_v4 import compressor as comp_mod
-from torchtitan_npu.models.deepseek_v4 import metadata as meta_mod
 from torchtitan_npu.models.deepseek_v4 import token_dispatcher as cp_mod
 from torchtitan_npu.models.deepseek_v4.attention import Attention, CompressedSparseAttention
 from torchtitan_npu.models.deepseek_v4.token_dispatcher import (
@@ -91,10 +91,7 @@ class MockTransport:
         # each sender's group for me sits at its own send-splits cumsum
         starts = [sum(reg.send_splits[s][: self.rank]) for s in range(self.world)]
         return torch.cat(
-            [
-                payloads[s][starts[s] : starts[s] + out_splits[s]]
-                for s in range(self.world)
-            ],
+            [payloads[s][starts[s] : starts[s] + out_splits[s]] for s in range(self.world)],
             dim=0,
         )
 
@@ -120,19 +117,15 @@ class _MockDispatcher(cp_mod.CPTokenDispatcher):
         return self.mock.all_to_all(x, in_splits, out_splits)
 
 
-def _doc_table(v, restore):
-    """Doc lengths from the global context (keyed by the permuted doc
-    starts, like the plan's segment identity)."""
+def _doc_table(v):
+    """Doc lengths from the global context (keyed by the doc starts, the
+    plan's segment identity)."""
     cu = v.cu_seq_q.tolist()
-    return {
-        int(restore[cu[d]].item()): cu[d + 1] - cu[d]
-        for d in range(len(cu) - 1)
-        if cu[d + 1] > cu[d]
-    }
+    return {cu[d]: cu[d + 1] - cu[d] for d in range(len(cu) - 1) if cu[d + 1] > cu[d]}
 
 
 # ---------------------------------------------------------------------------
-def make_cp_metas(docs, cp, lb=None):
+def make_cp_metas(docs, cp):
     seq_len = sum(docs)
     cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=max(docs), max_k=max(docs))
@@ -140,18 +133,15 @@ def make_cp_metas(docs, cp, lb=None):
         CPVarlenMetadata,
     )
 
-    metas = [
-        CPVarlenMetadata.from_global(v, FakeMesh(r, cp), 1, seq_len, lb)
-        for r in range(cp)
-    ]
+    metas = [CPVarlenMetadata.from_global(v, FakeMesh(r, cp), 1, seq_len) for r in range(cp)]
     return v, metas, seq_len // cp
 
 
-def _oracle_blocks(v, x_flat, docs, ratio, comp, perm=None):
+def _oracle_blocks(v, x_flat, docs, ratio, comp):
     """The oracle's per-doc packed blocks (the no-CP compressor on the full
-    stream), keyed by the doc start's permuted position."""
-    md = meta_mod.build_compressed_varlen_metadata(v, (ratio,))
-    plan = md.plans[ratio]
+    stream, under the per-document contract the arbitrary-length CP stream
+    keeps: each document pools its own complete blocks)."""
+    plan = doc_plan(docs, ratio)
     n_blocks = int(plan.cu_seqlens_cmp_k[-1])
     if n_blocks:
         bt = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
@@ -171,31 +161,21 @@ def _oracle_blocks(v, x_flat, docs, ratio, comp, perm=None):
     cu_b = plan.cu_seqlens_cmp_k.tolist()
     doc_blocks = {}
     for d in range(len(docs)):
-        ps = (
-            int((perm == v.cu_seq_q[d]).nonzero()[0])
-            if perm is not None
-            else int(v.cu_seq_q[d])
-        )
-        doc_blocks[ps] = packed[cu_b[d] : cu_b[d + 1]]
+        doc_blocks[int(v.cu_seq_q[d])] = packed[cu_b[d] : cu_b[d + 1]]
     return doc_blocks
 
 
 _CASES = [
-    ("plain2", (10, 17, 20, 17), 2, None),
-    ("plain4", (10, 17, 20, 17), 4, None),
-    ("ht2", (37, 41, 63, 115), 2, _ht(256, 2)),
-    ("ht4", (37, 41, 63, 115), 4, _ht(256, 4)),
-    ("irreg", (133, 122, 744, 281), 2, None),
-    ("irreg-ht", (133, 122, 744, 281), 2, _ht(1280, 2)),
-    ("tiny-ht", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4), 4, _ht(72, 4)),
-    ("docstart", (10, 22, 32), 2, None),
-    ("zero-block", (10, 8, 17, 5, 24), 4, None),
+    ("plain2", (10, 17, 20, 17), 2),
+    ("plain4", (10, 17, 20, 17), 4),
+    ("irreg", (133, 122, 744, 281), 2),
+    ("docstart", (10, 22, 32), 2),
+    ("zero-block", (10, 8, 17, 5, 24), 4),
 ]
 
 
 @pytest.fixture(scope="module")
 def dsv4_globals(dsv4):
-    globals()["meta_mod"] = dsv4.metadata
     globals()["comp_mod"] = dsv4.compressor
     return None
 
@@ -222,7 +202,7 @@ def _register_block_exchange(contexts, plan_dicts, payload_all, ratio):
     return reg
 
 
-def build_plans(v, lb, *, cp_size, shard_len, window_size, ratios):
+def build_plans(v, *, cp_size, shard_len, window_size, ratios):
     """The real plan for every rank, derived purely from the global context
     (no communication, no rounds): returns ``(contexts, plan_dicts,
     windows)`` — the ``_MockDispatcher`` (mock wired by the callers), the
@@ -231,7 +211,6 @@ def build_plans(v, lb, *, cp_size, shard_len, window_size, ratios):
     for r in range(cp_size):
         _cp_meta, plans, window = build_cp_plan(
             v,
-            lb,
             rank=r,
             cp_size=cp_size,
             shard_len=shard_len,
@@ -251,12 +230,11 @@ def build_plans(v, lb, *, cp_size, shard_len, window_size, ratios):
 
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in _CASES])
 def test_plan_matches_experiment(dsv4_globals, case):
-    name, docs, cp, lb = case
+    name, docs, cp = case
     for ratio in (4, 128):
-        _v, cp_metas, shard_len = make_cp_metas(docs, cp, lb)
+        _v, cp_metas, shard_len = make_cp_metas(docs, cp)
         contexts, plan_dicts, windows = build_plans(
             _v,
-            lb,
             cp_size=cp,
             shard_len=shard_len,
             window_size=8,
@@ -264,32 +242,23 @@ def test_plan_matches_experiment(dsv4_globals, case):
         )
         from test_cp_compressor import rank_plan
 
-        perm = (
-            lb._generate_indices(restore=False).reshape(-1)
-            if lb is not None
-            else torch.arange(sum(docs))
-        )
-        doc_len = _doc_table(_v, torch.argsort(perm))
-        for r, (ctx, plans, window) in enumerate(
-            zip(contexts, plan_dicts, windows, strict=True)
-        ):
-            exp_segs = rank_plan(
-                cp_metas[r], shard_len, r, ratio=ratio, doc_table=doc_len
-            )
+        doc_len = _doc_table(_v)
+        for r, (ctx, plans, window) in enumerate(zip(contexts, plan_dicts, windows, strict=True)):
+            exp_segs = rank_plan(cp_metas[r], shard_len, r, ratio=ratio, doc_table=doc_len)
             rplan = plans[ratio]
             bps = rplan.block_positions.tolist()
             # The plan's blocks (borrow sources included) match the
             # experiment's plan blocks.
-            assert [bps[i] // ratio for i in range(len(bps))] == [
-                b for s in exp_segs for b in s["blocks"]
-            ], (name, r, ratio)
+            assert [bps[i] // ratio for i in range(len(bps))] == [b for s in exp_segs for b in s["blocks"]], (
+                name,
+                r,
+                ratio,
+            )
             # ``compressed_rows`` select exactly the experiment's kept blocks
             # (the borrow-source blocks are stripped per segment).
             exp_kept = []
             for s in exp_segs:
-                nb = int(s["prepend_global"].numel() > 0) + int(
-                    bool(s["pred_head_rel"])
-                )
+                nb = int(s["prepend_global"].numel() > 0) + int(bool(s["pred_head_rel"]))
                 exp_kept += s["blocks"][nb:]
             assert [bps[i] // ratio for i in rplan.compressed_rows.tolist()] == exp_kept, (
                 name,
@@ -298,9 +267,7 @@ def test_plan_matches_experiment(dsv4_globals, case):
             )
             segs = segment_structure(cp_metas[r])
             # the kernel tensors match the direct per-segment derivation
-            exp_cu = torch.tensor(
-                [0, *[s[2] // ratio for s in segs]], dtype=torch.int32
-            ).cumsum(0, dtype=torch.int32)
+            exp_cu = torch.tensor([0, *[s[2] // ratio for s in segs]], dtype=torch.int32).cumsum(0, dtype=torch.int32)
             exp_rem = torch.tensor([s[2] % ratio for s in segs], dtype=torch.int32)
             assert torch.equal(rplan.cu_seqlens_cmp_k, exp_cu), (name, r, ratio)
             assert torch.equal(rplan.block_remainder, exp_rem), (name, r, ratio)
@@ -315,9 +282,7 @@ def test_plan_matches_experiment(dsv4_globals, case):
                 dtype=torch.int32,
             ).cumsum(0, dtype=torch.int32)
             assert torch.equal(window.cu_seqlens_ori_kv, exp_ori), (name, r)
-            assert window.gather_indices.numel() == int(
-                window.cu_seqlens_ori_kv[-1]
-            ), (
+            assert window.gather_indices.numel() == int(window.cu_seqlens_ori_kv[-1]), (
                 name,
                 r,
             )
@@ -330,19 +295,16 @@ def test_plan_matches_experiment(dsv4_globals, case):
 
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in _CASES])
 def test_dispatcher_vs_oracle(dsv4_globals, case):
-    name, docs, cp, lb = case
+    name, docs, cp = case
     for ratio in (4, 128):
-        v, cp_metas, shard_len = make_cp_metas(docs, cp, lb)
+        v, cp_metas, shard_len = make_cp_metas(docs, cp)
         seq_len = sum(docs)
-        perm = lb._generate_indices(restore=False).reshape(-1) if lb else None
         x = torch.randn(1, seq_len, DIM)
         x_flat = x.flatten(0, 1)
-        x_perm = x_flat[perm] if perm is not None else x_flat
         comp = build_compressor(torch.float32, ratio)
-        doc_blocks = _oracle_blocks(v, x_flat, docs, ratio, comp, perm)
+        doc_blocks = _oracle_blocks(v, x_flat, docs, ratio, comp)
         contexts, plan_dicts, windows = build_plans(
             v,
-            lb,
             cp_size=cp,
             shard_len=shard_len,
             window_size=8,
@@ -356,12 +318,12 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
         # ---- and the plan-driven container packing (select)
         local_kept = []
         for r in range(cp):
-            x_local = x_perm[r * shard_len : (r + 1) * shard_len]
+            x_local = x_flat[r * shard_len : (r + 1) * shard_len]
             # the window exchange (payload-agnostic in the semantics test)
             win_reg = _register_window_exchange(
                 contexts,
                 windows,
-                [x_perm[rr * shard_len : (rr + 1) * shard_len] for rr in range(cp)],
+                [x_flat[rr * shard_len : (rr + 1) * shard_len] for rr in range(cp)],
             )
             contexts[r].mock = MockTransport(r, cp, [win_reg])
             swa = contexts[r].gather(x_local.view(1, shard_len, DIM), windows[r])
@@ -373,14 +335,8 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
             # the compressor's own dispatcher: the two block packs (kv,
             # score — the projected rows the exchange carries)
             comp_disp = _MockDispatcher(cp_mod.CPTokenDispatcher.Config())
-            kv_all = [
-                comp.wkv(x_perm[rr * shard_len : (rr + 1) * shard_len])
-                for rr in range(cp)
-            ]
-            sc_all = [
-                comp.wgate(x_perm[rr * shard_len : (rr + 1) * shard_len])
-                for rr in range(cp)
-            ]
+            kv_all = [comp.wkv(x_flat[rr * shard_len : (rr + 1) * shard_len]) for rr in range(cp)]
+            sc_all = [comp.wgate(x_flat[rr * shard_len : (rr + 1) * shard_len]) for rr in range(cp)]
             comp_disp.mock = MockTransport(
                 r,
                 cp,
@@ -410,9 +366,7 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
                 torch.cat(
                     [
                         local_kept[rr],
-                        local_kept[rr].new_zeros(
-                            (out_width - local_kept[rr].shape[0], HD)
-                        ),
+                        local_kept[rr].new_zeros((out_width - local_kept[rr].shape[0], HD)),
                     ]
                 )
                 for rr in range(cp)
@@ -433,21 +387,17 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
 
         # ---- the window slice: per-segment end-aligned ori ranges ----
         for r in range(cp):
-            x_local = x_perm[r * shard_len : (r + 1) * shard_len]
+            x_local = x_flat[r * shard_len : (r + 1) * shard_len]
             win_reg = _register_window_exchange(
                 contexts,
                 windows,
-                [x_perm[rr * shard_len : (rr + 1) * shard_len] for rr in range(cp)],
+                [x_flat[rr * shard_len : (rr + 1) * shard_len] for rr in range(cp)],
             )
             contexts[r].mock = MockTransport(r, cp, [win_reg])
-            swa = (
-                contexts[r]
-                .gather(x_local.view(1, shard_len, DIM), windows[r])
-                .flatten(0, 1)
-            )
+            swa = contexts[r].gather(x_local.view(1, shard_len, DIM), windows[r]).flatten(0, 1)
             cu_o = windows[r].cu_seqlens_ori_kv.tolist()
             for s, seg in enumerate(segs_all[r]):
-                o_start = int(perm[seg[0]]) if perm is not None else seg[0]
+                o_start = seg[0]
                 win_start_rel = max(seg[3] - 7, 0)
                 got = swa[cu_o[s] : cu_o[s + 1]]
                 exp_o = x_flat[o_start + win_start_rel : o_start + seg[3] + seg[1]]
@@ -476,19 +426,16 @@ def _slim_cp_metadata(plans, window=None):
 
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in _CASES])
 def test_compressor_cp_branch(dsv4_globals, case):
-    name, docs, cp, lb = case
+    name, docs, cp = case
     for ratio in (4, 128):
-        v, cp_metas, shard_len = make_cp_metas(docs, cp, lb)
+        v, cp_metas, shard_len = make_cp_metas(docs, cp)
         seq_len = sum(docs)
-        perm = lb._generate_indices(restore=False).reshape(-1) if lb else None
         x = torch.randn(1, seq_len, DIM)
         x_flat = x.flatten(0, 1)
-        x_perm = x_flat[perm] if perm is not None else x_flat
         comp = build_compressor(torch.float32, ratio)
-        doc_blocks = _oracle_blocks(v, x_flat, docs, ratio, comp, perm)
+        doc_blocks = _oracle_blocks(v, x_flat, docs, ratio, comp)
         contexts, plan_dicts, _windows = build_plans(
             v,
-            lb,
             cp_size=cp,
             shard_len=shard_len,
             window_size=8,
@@ -496,23 +443,15 @@ def test_compressor_cp_branch(dsv4_globals, case):
         )
         from test_cp_compressor import rank_plan
 
-        perm = lb._generate_indices(restore=False).reshape(-1) if lb else None
-        restore = torch.argsort(perm) if perm is not None else torch.arange(seq_len)
-        doc_len = _doc_table(v, restore)
+        doc_len = _doc_table(v)
 
         for r in range(cp):
-            x_local = x_perm[r * shard_len : (r + 1) * shard_len]
+            x_local = x_flat[r * shard_len : (r + 1) * shard_len]
             # the compressor's own dispatcher: the two block packs (kv,
             # score — the projected rows the exchange carries)
             comp_disp = _MockDispatcher(cp_mod.CPTokenDispatcher.Config())
-            kv_all = [
-                comp.wkv(x_perm[rr * shard_len : (rr + 1) * shard_len])
-                for rr in range(cp)
-            ]
-            sc_all = [
-                comp.wgate(x_perm[rr * shard_len : (rr + 1) * shard_len])
-                for rr in range(cp)
-            ]
+            kv_all = [comp.wkv(x_flat[rr * shard_len : (rr + 1) * shard_len]) for rr in range(cp)]
+            sc_all = [comp.wgate(x_flat[rr * shard_len : (rr + 1) * shard_len]) for rr in range(cp)]
             comp_disp.mock = MockTransport(
                 r,
                 cp,
@@ -531,21 +470,13 @@ def test_compressor_cp_branch(dsv4_globals, case):
             # the oracle; the stripped borrow-source blocks' keys are masked
             # (by design) and never enter the gather.
             kept = pooled[rplan.compressed_rows]
-            exp_segs = rank_plan(
-                cp_metas[r], shard_len, r, ratio=ratio, doc_table=doc_len
-            )
+            exp_segs = rank_plan(cp_metas[r], shard_len, r, ratio=ratio, doc_table=doc_len)
             exp_parts = []
             for s in exp_segs:
-                nb = int(s["prepend_global"].numel() > 0) + int(
-                    bool(s["pred_head_rel"])
-                )
+                nb = int(s["prepend_global"].numel() > 0) + int(bool(s["pred_head_rel"]))
                 if len(s["blocks"]) > nb:
                     exp_parts.append(doc_blocks[s["doc"]][s["blocks"][nb:]])
-            exp = (
-                torch.cat(exp_parts)
-                if exp_parts
-                else torch.empty((0, HD), dtype=torch.float32)
-            )
+            exp = torch.cat(exp_parts) if exp_parts else torch.empty((0, HD), dtype=torch.float32)
             assert torch.allclose(kept, exp, atol=1e-6, rtol=1e-6), (name, r, ratio)
             assert rplan.compressed_rows.numel() == kept.shape[0]
 
@@ -560,18 +491,16 @@ def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
     pure global-context plan derivation — no rounds, no transport)."""
     ratio = 4
     docs = (1000, 1000, 1000, 1000)
-    lb = _ht(4000, 2)
-    _v, cp_metas, shard_len = make_cp_metas(docs, 2, lb)
+    _v, cp_metas, shard_len = make_cp_metas(docs, 2)
     from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-        AscMetadataExtension,
         AscLightningIndexerMetadata,
+        AscMetadataExtension,
     )
 
     for r in range(2):
         dsv4.cann_ops.calls.clear()
         cp_meta, plans, window = cp_mod.build_cp_plan(
             _v,
-            lb,
             rank=r,
             cp_size=2,
             shard_len=shard_len,
@@ -579,12 +508,8 @@ def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
             ratios=[1, ratio, 128],
         )
         md = AscLightningIndexerMetadata(
-            AscLightningIndexerMetadata.Config(
-                window_size=128, index_n_heads=8, index_head_dim=128, index_topk=512
-            )
-        )(
-            dsv4.metadata.CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window)
-        )
+            AscLightningIndexerMetadata.Config(window_size=128, index_n_heads=8, index_head_dim=128, index_topk=512)
+        )(dsv4.metadata.CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window))
         md = AscMetadataExtension(
             AscMetadataExtension.Config(
                 window_size=128,
@@ -604,9 +529,7 @@ def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
             assert torch.equal(c[2]["cu_seqlens_ori_kv"], md.window.cu_seqlens_ori_kv), k
         segs = segment_structure(cp_metas[r])
         for k in (4, 128):
-            exp_cu = torch.tensor(
-                [0, *[s[2] // k for s in segs]], dtype=torch.int32
-            ).cumsum(0, dtype=torch.int32)
+            exp_cu = torch.tensor([0, *[s[2] // k for s in segs]], dtype=torch.int32).cumsum(0, dtype=torch.int32)
             exp_rem = torch.tensor([s[2] % k for s in segs], dtype=torch.int32)
             assert torch.equal(md.plans[k].cu_seqlens_cmp_k, exp_cu)
             assert torch.equal(md.plans[k].block_remainder, exp_rem)
@@ -642,8 +565,12 @@ class _RecorderLI(nn.Module):
     def forward(self, idx_q, idx_k, idx_w, *, attention_masks):
         self.last = (idx_q, idx_k, idx_w)
         return torch.zeros(
-            idx_q.shape[0], idx_q.shape[1], 1, 2,
-            dtype=torch.long, device=idx_q.device,
+            idx_q.shape[0],
+            idx_q.shape[1],
+            1,
+            2,
+            dtype=torch.long,
+            device=idx_q.device,
         )
 
 
@@ -729,17 +656,13 @@ def make_indexer_cfg(dim, n_heads, hd, rd, ratio):
                     rd = self.rope_head_dim
                     idx_q = self.wq_b(qr)
                     idx_q = idx_q.view(bsz, seqlen, self.num_index_heads, self.head_dim)
-                    q_nope, q_rope = torch.split(
-                        idx_q, [self.head_dim - rd, rd], dim=-1
-                    )
+                    q_nope, q_rope = torch.split(idx_q, [self.head_dim - rd, rd], dim=-1)
                     q_rope = self.rope(q_rope, positions=positions)
                     idx_q = torch.cat([q_nope, q_rope], dim=-1)
                     idx_q = self._rotate_activation(idx_q)
                     idx_k = self.compressor(x, attention_masks)
                     idx_k = self._rotate_activation(idx_k)
-                    idx_w = self.weights_proj(x) * (
-                        self.softmax_scale * self.num_index_heads**-0.5
-                    )
+                    idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
                     return idx_q, idx_k, idx_w
 
             return _Idx()
@@ -750,10 +673,9 @@ def make_indexer_cfg(dim, n_heads, hd, rd, ratio):
 def test_cp_attention_flow(dsv4_globals, dsv4):
     ratio = 4
     docs = (10, 17, 20, 17)
-    _v, _cp_metas, shard_len = make_cp_metas(docs, 2, None)
+    _v, _cp_metas, shard_len = make_cp_metas(docs, 2)
     contexts, plan_dicts, windows = build_plans(
         _v,
-        None,
         cp_size=2,
         shard_len=shard_len,
         window_size=8,
@@ -803,12 +725,8 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
     for rr in range(2):
         xl = x_flat[rr * shard_len : (rr + 1) * shard_len]
         for comp in (attn.compressor, attn.indexer.compressor):
-            kv_all = [
-                comp.wkv(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)
-            ]
-            sc_all = [
-                comp.wgate(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)
-            ]
+            kv_all = [comp.wkv(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)]
+            sc_all = [comp.wgate(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)]
             disp = _MockDispatcher(cp_mod.CPTokenDispatcher.Config())
             disp.mock = MockTransport(
                 rr,
@@ -820,9 +738,7 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
             )
             comp.token_dispatcher = disp
         md = _slim_cp_metadata(plan_dicts[rr], windows[rr])
-        cmp_k = contexts[rr].select(
-            attn.compressor(xl.view(1, shard_len, DIM), md), plan_dicts[rr][ratio]
-        )
+        cmp_k = contexts[rr].select(attn.compressor(xl.view(1, shard_len, DIM), md), plan_dicts[rr][ratio])
         idx_k = contexts[rr].select(
             attn.indexer.compressor(xl.detach().view(1, shard_len, DIM), md),
             plan_dicts[rr][ratio],
@@ -835,18 +751,11 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
         # window exchange (the local post-RoPE swa_k rows), then the
         # indexer compressor's kv/score packs, then the attention
         # compressor's kv/score packs
-        swa_all = [
-            attn.kv_norm(attn.wkv(x_flat[i * shard_len : (i + 1) * shard_len]))
-            for i in range(2)
-        ]
+        swa_all = [attn.kv_norm(attn.wkv(x_flat[i * shard_len : (i + 1) * shard_len])) for i in range(2)]
         regs = [_register_window_exchange(contexts, windows, swa_all)]
         for comp in (attn.indexer.compressor, attn.compressor):
-            kv_all = [
-                comp.wkv(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)
-            ]
-            sc_all = [
-                comp.wgate(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)
-            ]
+            kv_all = [comp.wkv(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)]
+            sc_all = [comp.wgate(x_flat[i * shard_len : (i + 1) * shard_len]) for i in range(2)]
             regs.append(_register_block_exchange(contexts, plan_dicts, kv_all, ratio))
             regs.append(_register_block_exchange(contexts, plan_dicts, sc_all, ratio))
         # each dispatcher gets its own mock whose registry list covers
@@ -883,9 +792,7 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
         assert li_idx_k.shape == cmp_k.shape
         # the containers' leading slots = the oracle's kept blocks
         kept_flat = kept[r][0]
-        assert torch.allclose(
-            cmp_k.flatten(0, 1)[: kept_flat.shape[0]], kept_flat, atol=1e-6, rtol=1e-6
-        )
+        assert torch.allclose(cmp_k.flatten(0, 1)[: kept_flat.shape[0]], kept_flat, atol=1e-6, rtol=1e-6)
         assert torch.all(cmp_k.flatten(0, 1)[kept_flat.shape[0] :] == 0)
 
 
@@ -964,18 +871,39 @@ def test_cp_gather_compile_reuses_graph_across_dynamic_splits_gloo():
 
     def use_split_sizes(x, plan):
         send_splits, recv_splits = plan.splits_for_collective()
-        return x.new_zeros(
-            (send_splits[0] + recv_splits[0], send_splits[1] + recv_splits[1])
-        )
+        return x.new_zeros((send_splits[0] + recv_splits[0], send_splits[1] + recv_splits[1]))
 
     compiled = torch.compile(use_split_sizes, backend=counting_backend, fullgraph=True)
-    first = compiled(torch.ones(1), cp_mod._build_exchange_plan(
-        (list(range(5)), [2, 3], [4, 5], list(range(9))), torch.device("cpu")
-    ))
-    second = compiled(torch.ones(1), cp_mod._build_exchange_plan(
-        (list(range(13)), [6, 7], [8, 9], list(range(17))), torch.device("cpu")
-    ))
+    first = compiled(
+        torch.ones(1),
+        cp_mod._build_exchange_plan((list(range(5)), [2, 3], [4, 5], list(range(9))), torch.device("cpu")),
+    )
+    second = compiled(
+        torch.ones(1),
+        cp_mod._build_exchange_plan((list(range(13)), [6, 7], [8, 9], list(range(17))), torch.device("cpu")),
+    )
 
     assert first.shape == (6, 8)
     assert second.shape == (14, 16)
     assert len(compiled_graphs) == 1
+
+
+def test_cp_metadata_rejects_a_head_tail_load_balancer():
+    """The contiguous-slab stack refuses the upstream default instead of silently permuting."""
+    from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
+
+    class _Mesh:
+        def size(self, dim: int = 0) -> int:
+            return 2
+
+    with pytest.raises(ValueError, match="context-parallel-load-balancer None"):
+        DeepSeekV4Model._build_cp_metadata(
+            None,
+            None,
+            None,
+            None,
+            SimpleNamespace(seq_len=2048),
+            _Mesh(),
+            "headtail",
+            None,
+        )

@@ -28,7 +28,6 @@ from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config as _to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
@@ -41,9 +40,11 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+from torchtitan_npu.models.common.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
+from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import AlignedHuggingfaceDataloader
 
 from . import (
     memory_policy,  # noqa: F401
@@ -261,6 +262,11 @@ def _dsv4_optimizer_config(
     )
 
 
+def _per_doc_alignment(model_spec: ModelSpec) -> int:
+    """The pooling granularity the loader pads every packed document to (V4: 128)."""
+    return compression_alignment(model_spec.model.compress_ratios)  # pyrefly: ignore [missing-attribute]
+
+
 def _make_trainer_config(
     flavor: str,
     *,
@@ -293,7 +299,10 @@ def _make_trainer_config(
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        dataloader=AlignedHuggingfaceDataloader.Config(
+            dataset="c4_test",
+            per_doc_alignment=_per_doc_alignment(model_spec),
+        ),
         optimizer=_dsv4_optimizer_config(model_spec, lr=1e-5),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=20,
@@ -317,6 +326,10 @@ def _make_trainer_config(
             interval=100,
         ),
     )
+    # V4 shards contiguous slabs; the upstream default (headtail) is refused at the CP
+    # entry, so every V4 config starts from a runnable value and an explicit headtail
+    # still surfaces as the guard's error.
+    config.parallelism.context_parallel_load_balancer = None
     if getattr(model_spec.model, "lora", None) is not None:
         from .peft import DeepSeekV4PEFTCheckpointManager
 

@@ -27,15 +27,15 @@ outside this module; the LI metadata provider fills ``plans[4].li_metadata``:
 
 The kernel-layout derivation is the **plain-stream** contract:
 
-- ``build_kernel_layout`` derives the per-document plans from the document
-  boundaries alone (each document contributes its complete leading blocks,
-  gathered contiguously; the ``len % ratio`` tail produces no entry).  It
-  refuses context-parallel-shaped streams — those plans come from
-  ``build_cp_plan`` (``token_dispatcher.py``).
-
-Documents never span rows, and complete blocks never cross documents: a row's
-compressed region is the concatenation of its documents' complete blocks,
-padded to ``S // ratio`` slots.
+- documents are aligned to the compression grid (the loader pads each document
+  to ``lcm(compress_ratios)``, ``dataloader.per_doc_alignment``), so a document
+  is always a whole number of blocks and a block never straddles a document
+  edge.  ``build_kernel_layout`` therefore derives each plan as the row divided
+  by its ratio — no per-document scan, no partial trailing block, no empty
+  non-context-parallel pool — and refuses a stream that breaks the contract;
+- it refuses context-parallel-shaped streams: those plans come from
+  ``build_cp_plan`` (``token_dispatcher.py``), where a rank's slab may still cut
+  a block and the borrow machinery applies.
 """
 
 from dataclasses import dataclass, field
@@ -45,6 +45,7 @@ import torch
 from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.common.metadata_extension import register_pytree_node_for_dataclass
+from torchtitan_npu.models.common.packing import compression_alignment
 
 if TYPE_CHECKING:
     from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
@@ -85,7 +86,7 @@ class CompressedBlockLayout:
     # ---- part 1: the unified contract (CP and non-CP) ----
     cu_seqlens_cmp_k: torch.Tensor | None = None
     """Cumulative compressed-block lengths over the packed stream (int32),
-    ``[n_seqs + 1]``.  Entry ``i`` is the global start index of sequence
+    ``[num_seqs + 1]``.  Entry ``i`` is the global start index of sequence
     ``i``'s compressed blocks.  ``None`` for ratio-1 plans."""
 
     n_cmp_blocks_host: int | None = None
@@ -98,7 +99,7 @@ class CompressedBlockLayout:
     A Python branch cannot inspect the unbacked ``gather_indices`` length."""
 
     block_remainder: torch.Tensor | None
-    """Per-sequence block remainder (int32), ``[n_seqs]``: ``len[i] % ratio``
+    """Per-sequence block remainder (int32), ``[num_seqs]``: ``len[i] % ratio``
     trailing tokens of sequence ``i`` fall short of one full block and
     produce no compressed KV entry.  ``None`` for ratio-1 plans."""
 
@@ -108,11 +109,11 @@ class CompressedBlockLayout:
     block-token indices into the local stream (``x.flatten(0, 1)``) —
     the plain local gather; under context parallel they are the assembly
     into ``cat([x_local, exchange_recv_rows])`` in pooled order — the
-    remote gather + permute.  Reshape to ``[n_blocks, ratio, D]`` after
+    remote gather.  Reshape to ``[num_blocks, ratio, D]`` after
     the gather.  ``None`` for ratio-1 plans."""
 
     block_positions: torch.Tensor | None = None
-    """Document-relative block starts (int32) ``[n_blocks]`` — the RoPE
+    """Document-relative block starts (int32) ``[num_blocks]`` — the RoPE
     positions of the pooled keys (block ``b`` of a document sits at
     ``b * ratio``).  The compressor contract: precomputed once per batch so
     no per-layer derivation is needed.  ``None`` for ratio-1 plans."""
@@ -240,6 +241,15 @@ def build_kernel_layout(
     total token count, so the layout is derived purely from the document
     boundaries and the ratios.  Context-parallel streams must use
     ``build_cp_plan`` instead (guarded below).
+
+    **Documents are aligned to the compression grid** (the loader pads every
+    document to ``lcm(compress_ratios)``, ``dataloader.per_doc_alignment``), so
+    every document is a whole number of blocks at every ratio and a block never
+    straddles a document edge.  That is what makes each plan the row itself
+    divided by its ratio: the gather is the identity, the block positions restart at
+    every document (the compressor's RoPE is document-relative), and the
+    trailing-block remainder is zero.  A stream that breaks the contract is
+    refused here rather than silently producing a partial block.
     """
     if not hasattr(varlen, "cu_seq_q"):
         raise TypeError(f"build_kernel_layout expects a varlen stream, got {type(varlen)}.")
@@ -258,16 +268,24 @@ def build_kernel_layout(
     # The packed scenario runs with local_batch_size == 1; raise seq_len
     # instead of local_batch_size.
     seq_len = cu[-1]
-
-    # The plain per-document derivation: each document contributes its
-    # complete leading blocks (the ``len % ratio`` tail produces no
-    # compressed entry), gathered contiguously document by document.  The
-    # plans carry no dispatcher fields — the dispatcher's gather degrades
-    # to the plain local gather, so the forward path never special-cases
-    # context parallel.
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
+    if not lengths:
+        raise ValueError(
+            "build_kernel_layout expects at least one document: cu_seq_q carries only the start "
+            "boundary, so the row is empty."
+        )
+    alignment = compression_alignment(compress_ratios)
+    if any(length <= 0 or length % alignment for length in lengths):
+        raise ValueError(
+            f"documents must be non-empty and aligned to the compression grid (multiples of "
+            f"{alignment}): got lengths {lengths}. The dataloader pads every document to "
+            "lcm(compress_ratios) (``dataloader.per_doc_alignment``); an unaligned stream is an "
+            "input bug, not a partial block the kernels can take."
+        )
+
     distinct_ratios = sorted({int(r) for r in compress_ratios})
     device = cu_seq_q.device
+    num_seqs = len(lengths)
     plans: dict[int, CompressedBlockLayout] = {}
     for ratio in distinct_ratios:
         if ratio == 1:
@@ -279,42 +297,23 @@ def build_kernel_layout(
             continue
         if ratio not in (4, 128):
             raise NotImplementedError(f"CompressedBlockLayout does not support ratio={ratio}; expected 1, 4, or 128.")
-        c_lens = [length // ratio for length in lengths]
-        cu_seqs = torch.cat(
-            [
-                torch.zeros((1,), dtype=torch.int32, device=device),
-                torch.tensor(c_lens, dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32),
-            ]
-        )
-        pieces = [
-            torch.arange(k_start, k_start + ratio * cnt, dtype=torch.int64, device=device)
-            for k_start, cnt in zip(cu[:-1], c_lens, strict=True)
-            if cnt
-        ]
-        positions = [torch.arange(0, ratio * cnt, ratio, dtype=torch.int32, device=device) for cnt in c_lens if cnt]
-        gather = torch.cat(pieces, dim=0) if pieces else torch.empty((0,), dtype=torch.int64, device=device)
-        block_positions = (
-            torch.cat(positions, dim=0) if positions else torch.empty((0,), dtype=torch.int32, device=device)
-        )
-        # Doc-start block ids of the docs that actually have blocks
-        # (``cu[i] < cu[i+1]``); zero-block docs contribute no blocks to
-        # mask, and a trailing zero-block doc's boundary would be an
-        # out-of-range index.
-        first_indices = cu_seqs[:-1][torch.diff(cu_seqs) > 0].to(torch.int64)
+        # Every document is a whole number of blocks, so the compressed pool is the row itself:
+        # the boundaries are the row's divided by the ratio, the gather keeps every token (in
+        # order), and the remainder is zero.  The block positions stay document-relative (the
+        # compressor's RoPE restarts at every document), which is the one field that still needs
+        # one entry per document.
+        num_blocks = seq_len // ratio
         plans[ratio] = CompressedBlockLayout(
-            cu_seqlens_cmp_k=cu_seqs,
-            n_cmp_blocks_host=sum(length // ratio for length in lengths),
-            is_empty_host=not pieces,
-            block_remainder=torch.tensor(
-                [length % ratio for length in lengths],
-                dtype=torch.int32,
-                device=device,
+            cu_seqlens_cmp_k=(cu_seq_q // ratio).to(torch.int32),
+            n_cmp_blocks_host=num_blocks,
+            block_remainder=torch.zeros(num_seqs, dtype=torch.int32, device=device),
+            gather_indices=torch.arange(seq_len, dtype=torch.int64, device=device),
+            block_positions=torch.cat(
+                [torch.arange(0, length, ratio, dtype=torch.int32, device=device) for length in lengths]
             ),
-            gather_indices=gather,
-            block_positions=block_positions,
-            first_indices=first_indices,
+            first_indices=(cu_seq_q[:-1] // ratio).to(torch.int64),
             compressed_rows=None,
-            out_width=seq_len // ratio,
+            out_width=num_blocks,
         )
     return plans
 

@@ -10,12 +10,14 @@ DeepSeek-V4（DSV4）在文档打包序列上训练时，压缩注意力（CSA/H
 NGPU=2 \
   bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
   --parallelism.context-parallel-degree 2 \
+  --parallelism.context-parallel-load-balancer None \
   --parallelism.spmd-backend spmd_types \
   --training.steps 2
 ```
 
 - `--parallelism.context-parallel-degree > 1` 时即启用 CP；必须配合 `--parallelism.spmd-backend spmd_types`（`spmd_types` 后端是压缩容器 `S(1) -> R` 声明式 all-gather 的前提）。
-- `--parallelism.context-parallel-load-balancer` 支持 `headtail`（默认）与 `None`（plain 顺序切分）。headtail 要求 `seq_len` 整除 `2 * context_parallel_degree`，plain 要求整除 `context_parallel_degree`，不满足时 `_build_cp_metadata` 直接报错。
+- V4 只支持连续切片：`--parallelism.context-parallel-load-balancer` 必须为 `None`。上游默认值是 `headtail`，启用 CP 时必须显式传入 `--parallelism.context-parallel-load-balancer None`；传入其他值时 `_build_cp_metadata` 抛出 `ValueError`，报错信息为「the DeepSeek-V4 stack shards contiguous slabs, but the context-parallel load balancer is 'headtail': run with --parallelism.context-parallel-load-balancer None」。
+- `seq_len` 必须能被 `context_parallel_degree` 整除，不满足时 `_build_cp_metadata` 直接报错。
 - 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效：分片帧由融合 metadata 承载，模型目录自带的默认内核读不了这些帧，因而只支持无 CP。
 - `local_batch_size == 1` 是当前文档打包约定（增大批数据应提高 `seq_len`）；DSA 路径 TP 固定为 1。
 
@@ -29,10 +31,10 @@ NGPU=2 \
 
 方案的整体原则是「**计划吸收全部不规则性，数据路径保持单一**」：
 
-- **纯本地推导**：[`build_cp_plan`](../../torchtitan_npu/models/deepseek_v4/token_dispatcher.py) 从切分前的全局文档结构（`get_attention_masks` 的 varlen）加负载均衡置换，在 frame 内推导每个 rank 的 rank-local varlen（复用 `CPVarlenMetadata.from_global`）与全部计划，计划阶段零通信。
-- **文档切片**：全部计划行都是 `docs[doc]` 的切片（文档按置换后坐标存储，键为置换后的文档起点）。负载均衡的置换被切片完全吸收，无需访问置换本身。
+- **纯本地推导**：[`build_cp_plan`](../../torchtitan_npu/models/deepseek_v4/token_dispatcher.py) 从切分前的全局文档结构（`get_attention_masks` 的 varlen）在 frame 内推导每个 rank 的 rank-local varlen（复用 `CPVarlenMetadata.from_global`）与全部计划，计划阶段零通信。
+- **文档切片**：全部计划行都是 `docs[doc]` 的切片（文档按全局坐标存储，键为文档起点）。每个 rank 持有全局序列的一段连续 slab，计划行就是文档在这段 slab 内的切片。
 - **双计划**：ratio 无关的 `WindowPlan`（窗口交换路由、ori 流 `gather_indices`、`cu_seqlens_ori_kv`）与每 ratio 一份的块计划 `CompressedBlockLayout`（内核与压缩器契约 + 块交换路由 + 容器打包 + `cmp_k_global_gather_indices`），分别挂于 `CompressedVarlenMetadata` 的 `window` 与 `plans[ratio]`。非 CP 时块计划的 `gather_indices` 即文档序本地 gather，其余 dispatcher 字段为空，前向路径不区分 CP。
-- **块区间**：每段的计划块区间 `[A, B)` 覆盖本段完整块加借入源（段首前驱块、段尾跨块、case-C 前驱头），`strip` 记借入源块数；段尾不足一块的文档余数不产生压缩条目。
+- **块区间**：每段的计划块区间 `[A, B)` 覆盖本段完整块加借入源（段首前驱块、段尾跨块、case-C 前驱头），`strip` 记借入源块数；段尾不足一块的余数不产生压缩条目（全局流对齐后文档余数恒 0，CP 段内只来自 slab 截断）。
 
 ## 关键设计决策
 
@@ -40,9 +42,9 @@ NGPU=2 \
 
 1. **单一 metadata 接缝**。模型以 `build_attention_masks(inputs, labels, extra_kwargs, *, cp_mesh, load_balancer_type)` 统一构建每 batch 的 metadata：CP 时在其中完成输入切分与计划推导，vendor 内核张量由配置解析的 `metadata_extension`（`AscMetadataExtension`）在最后一步填充。接缝只有一处。DeepSeek-V3.2 已迁到上游 backend-owned 接缝（attention backend 自己的 `Config.build_attention_metadata` 与 `prepare_cp_metadata`，见[多后端算子接入](fused_ops.md)）；V4.1 也已迁入该接缝（entry 由 `AscV41SparseAttention.Config.build_attention_metadata` 构建：参考后端在这一步给出整行的 document 边界，并按自己的 `compress_ratio` 一次折成 `cu_seq_k`（池化轴），端口在这两个 grid 上加自己的 kernel frame 与 `aicpu_metadata` 里的四条记录；CP 由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建；V4.1 的 map key 是 `(端口类, compress_ratio)`，一层一个几何、每个几何一份 entry，参考核直接读 `cu_seq_q` / `cu_seq_k`，不再自己除 ratio，本文描述的 V4 路径仍待迁移）。
 
-2. **纯本地计划**。`build_cp_plan` 输入 `(global_varlen, load_balancer, rank, cp_size, shard_len, window_size, ratios)`，用 `_RankMesh` 垫片逐 rank 调用 `CPVarlenMetadata.from_global`，返回 `(rank-local varlen, plans, window)`。全局上下文（切分前的文档结构 + 置换）在 `build_attention_masks` 帧内即可获得，因此计划阶段零通信，且推导出的 rank-local varlen 与 shard 路径的产物一致。
+2. **纯本地计划**。`build_cp_plan` 输入 `(global_varlen, *, rank, cp_size, shard_len, window_size, ratios)`，用 `_RankMesh` 垫片逐 rank 调用 `CPVarlenMetadata.from_global`，返回 `(rank-local varlen, plans, window)`。全局上下文（切分前的文档结构）在 `build_attention_masks` 帧内即可获得，因此计划阶段零通信，且推导出的 rank-local varlen 与 shard 路径的产物一致。
 
-3. **文档切片表达**。`build_cp_plan` 构建一个 `docs: dict[doc, list[pos]]`（键为置换后的文档起点，值为该文档全部 token 的置换后坐标）。基于恒等式 `kg[k_start + p] == docs[doc][p]`，所有计划行都是文档切片：窗口行 `docs[doc][win_start : win_start + win_len]`，块行 `docs[doc][A : block_end]`。压缩器契约由块区间直接推导：`block_positions` = 每段 `arange(A, block_end, ratio)`，`first_indices` = 每段池化起点。
+3. **文档切片表达**。`build_cp_plan` 构建一个 `docs: dict[doc, list[pos]]`（键为文档起点，值为该文档全部 token 的全局坐标）。基于恒等式 `kg[k_start + p] == docs[doc][p]`，所有计划行都是文档切片：窗口行 `docs[doc][win_start : win_start + win_len]`，块行 `docs[doc][A : block_end]`。压缩器契约由块区间直接推导：`block_positions` = 每段 `arange(A, block_end, ratio)`，`first_indices` = 每段池化起点。
 
 4. **统一 gather 接口**。窗口与块共用 `dispatcher.gather(x, plan)`：无交换时为本地 gather（`plan.gather_indices` 直接索引本地流），有交换时为远端 gather + 重排（同一 `gather_indices` 索引 `cat([x_local, recv])`），始终返回 `[1, N, D]`。重排结果本身就是池化流，数据路径上无多余拷贝。
 
@@ -54,9 +56,9 @@ NGPU=2 \
 
 8. **每 Compressor 自带 dispatcher**。`Compressor.Config` 自带 `token_dispatcher` 字段，`Compressor.parallelize` 经框架的 `Module.parallelize` 递归自行接线；`Attention` 另有自己的 dispatcher（窗口）。每个压缩器（注意力与索引器各自的）独立执行块交换，组件自包含；ratio-4 层因此有 5 次 alltoallv。
 
-9. **内核契约是方案的前提**。窗口打包依赖内核「窗口范围由属性决定而非区间长度」（端对齐坐标），CP 与参考的可见范围一致依赖内核的 p0 通道（`limit(pos) = floor((p0 + pos + 1) / r)`）。计划据此构造 `cu_seqlens_cmp_k` / `block_remainder`（文档相对块数与余数）与 `cu_seqlens_ori_kv`（窗口长度前缀和），修改计划必须保持这两个内核语义不变。
+9. **内核契约是方案的前提**。窗口打包依赖内核「窗口范围由属性决定而非区间长度」（端对齐坐标），CP 与参考的可见范围一致依赖内核的 p0 通道（`limit(pos) = floor((p0 + pos + 1) / r)`）。计划据此构造 `cu_seqlens_cmp_k` / `block_remainder`（文档相对块数与余数）与 `cu_seqlens_ori_kv`（窗口长度前缀和），修改计划必须保持这两个内核语义不变。全局流本身已按 `lcm(compress_ratios)` 逐文档对齐（`dataloader.per_doc_alignment`），所以全局计划里每个文档的余数恒为 0；CP 计划里非零的 `block_remainder` 只来自本 rank 段在文档内被 slab 截断的前缀。
 
-10. **参考实现不启用 CP**。模型目录的默认内核按连续文档（`cu_seq_q == cu_seq_k`）构建，对 CP 形状流显式报错；数值验收以融合路径自身的三配置一致性为准。
+10. **参考实现不启用 CP**。模型目录的默认内核按连续文档（`cu_seq_q == cu_seq_k`）构建，对 CP 形状流显式报错；数值验收以融合路径自身的 CP=1 / CP=2 两配置一致性为准。
 
 ## 每层数据流
 
@@ -165,11 +167,11 @@ CP 与参考实现之间已知的数值差异有三个来源，全部位于 Asce
 
 1. **SMLA 的批次布局敏感（几何来源）**。flash-softmax 的行求和按 fp32 部分和分组执行；packed 调用与参考调用的批次布局不同，同一查询窗口的值落入不同的部分和分组，fp32 非结合性带来 bf16 ulp 级的输出差异。该差异与值相关，与 CP 无关——任何改变调用几何的方式（批量大小、段结构）都会触发同类差异。
 
-2. **LightningIndexer-V2 的并列 tie（选择来源）**。indexer 分数经 ReLU 后大量块得分为精确 0，top-k 边界常落在 0 分池内，此时入选块由调用的核切分几何决定。后果是结构不同的两次调用（CP 与参考、plain 与 headtail）可能为同一查询选中**完全不同的块集合**。需要注意：indexer 的相关性分数相近（甚至同为 0）并不意味着这些块在 SMLA 的 query/key 相关性也相近——在初始权重（随机初始化）阶段尤其如此，被 tie 换掉的块在 SMLA 中的权重可能差异明显，单块的替换会放大到整行输出与损失。这是 r4 层 CP 与参考发散的主导来源，修复依赖 AscendC 提供值无关的规范 tie-break；修复前，发散量级随 r4 层数与权重触发情况增长。
+2. **LightningIndexer-V2 的并列 tie（选择来源）**。indexer 分数经 ReLU 后大量块得分为精确 0，top-k 边界常落在 0 分池内，此时入选块由调用的核切分几何决定。后果是结构不同的两次调用（CP 与参考）可能为同一查询选中**完全不同的块集合**。需要注意：indexer 的相关性分数相近（甚至同为 0）并不意味着这些块在 SMLA 的 query/key 相关性也相近——在初始权重（随机初始化）阶段尤其如此，被 tie 换掉的块在 SMLA 中的权重可能差异明显，单块的替换会放大到整行输出与损失。这是 r4 层 CP 与参考发散的主导来源，修复依赖 AscendC 提供值无关的规范 tie-break；修复前，发散量级随 r4 层数与权重触发情况增长。
 
 3. **SMLAG 的 kv 侧求和（梯度来源）**。一个 kv token 同时出现在多个段的 kv 流中，各内核调用各自产生 bf16 舍入的梯度部分，CP 梯度为这些部分的 fp32 求和，与参考的逐位结果存在部分舍入量级的差异；查询侧梯度（dq、l1、SLIG）逐位一致。
 
-验收口径：以上差异在「三配置一致性」验收中表现为打印精度内的逐 step 损失差。出现超出预期量级的发散时，先按上述三条归类（几何、选择、梯度），再按「精度定位相关单测」的定位路径检查 CP 数据路径——其逐位性已由 CPU 单测固定。
+验收口径：以上差异在「两配置一致性」验收中表现为打印精度内的逐 step 损失差。出现超出预期量级的发散时，先按上述三条归类（几何、选择、梯度），再按「精度定位相关单测」的定位路径检查 CP 数据路径——其逐位性已由 CPU 单测固定。
 
 ## 验证方式与接手流程
 
@@ -193,17 +195,17 @@ pytest tests/unit_tests
 | `test_cp_dispatch.py::test_asc_extension_cp_metadata` | AscendC metadata 内核的填充参数（窗口打包的 `cu_seqlens_ori_kv`） |
 | `test_cp_dispatch.py::test_cp_attention_flow` | 前向全流程的形状契约与容器内容（保留块 vs oracle） |
 | `test_cp_dispatch.py::test_multiprocess_gloo` | 真实双进程集合通信（不均衡 alltoallv、压缩级 all-gather）的分组与偏移语义 |
-| `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py`（矩阵） | 压缩数学本身：plain/headtail、cp 1~8、ratio 4/128，f32/f64 双精度矩阵；f64 预算在浮点噪声底（逐位量级），f32 在单精度舍入量级 |
+| `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py`（矩阵） | 压缩数学本身：连续切片、cp 1~8、ratio 4/128，f32/f64 双精度矩阵；f64 预算在浮点噪声底（逐位量级），f32 在单精度舍入量级 |
 | `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py::test_degeneracy` | 计划推导的无漂移护栏：cp=1 的 `build_cp_plan` 与非 CP `build_kernel_layout` 五个契约字段逐位一致 |
 | `tests/unit_tests/models/deepseek_v4/test_dsv4.py`（数值系列） | 非 CP 基线：压缩器对独立逐文档参考、重叠掩码逐位、索引器选择、参考内核以形状/有限值与 pool 梯度可复现性守护 |
 
 定位路径与「已知数值边界」对应：上述用例全部通过时，组装的数据与键对 oracle 一致，发散必然位于内核层（几何 / 选择 / 梯度三类来源）；任一失败则说明 CP 数据路径本身被改坏，按失败用例定位。
 
-NPU 一致性验收（改动数据路径后建议执行）：加载同一固定初始权重 checkpoint，CP=1 / CP=2 plain / CP=2 headtail 各跑相同步数，期望三种配置的逐 step 损失与 grad_norm 在打印精度内一致；发散量级见「已知数值边界」。每次运行必须使用全新 `--checkpoint.folder`。
+NPU 一致性验收（改动数据路径后建议执行）：加载同一固定初始权重 checkpoint，CP=1 / CP=2 连续切片各跑相同步数，期望两种配置的逐 step 损失与 grad_norm 在打印精度内一致；发散量级见「已知数值边界」。每次运行必须使用全新 `--checkpoint.folder`。
 
 接手开发的默认路径：
 
 1. 只改计划推导（`token_dispatcher.py`）时，`build_cp_plan` 必须保持纯函数与零通信，传入的 ratios 需去重（`sorted(set(ratios))`）；以 CPU 单测的 plan-vs-oracle 比对为逐张量护栏。
-2. 改动数据路径（`attention.py` / `compressor.py` / `ascendc.py`）时，非计算性改动必须保持逐位一致（CPU 单测 + 三配置验收）；计算性改动需在验收之外记录数值证据。
+2. 改动数据路径（`attention.py` / `compressor.py` / `ascendc.py`）时，非计算性改动必须保持逐位一致（CPU 单测 + 两配置验收）；计算性改动需在验收之外记录数值证据。
 3. 新增或调整配置（`config_registry.py` / `run_train.sh`）时，同步检查本指南的启用方式与相邻的 [TND 指南](deepseek_v4_tnd.md)。
 4. 修改实现后，同步更新本指南中受影响的「设计要点」「关键设计决策」条目，避免文档与代码漂移。

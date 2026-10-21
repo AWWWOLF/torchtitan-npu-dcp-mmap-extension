@@ -58,7 +58,7 @@ class Compressor(Module):
     the local stream, and the compressor's own token dispatcher gathers
     the plan-block rows — without context parallel a plain local gather
     (the doc-major ``gather_indices`` over the local stream), under
-    context parallel the remote gather + permute (the exchange plus the
+    context parallel the remote gather (the exchange plus the
     pooled-order ``gather_indices``).  The container packing and the CP
     strip are the call sites' concern.
     """

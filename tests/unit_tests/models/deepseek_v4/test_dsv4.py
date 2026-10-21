@@ -32,9 +32,9 @@ from torchtitan.models.common.attention import VarlenMetadata
 pytestmark = pytest.mark.usefixtures("dsv4")
 
 DIM, HD, RD = 8, 16, 4
-# Two documents longer than one compression block, with different tails (at
-# ratio 128 neither is a whole number of blocks).
-_GRADIENT_DOCS = (200, 133)
+# Two aligned documents longer than one compression block (multiples of the
+# 128-token alignment the (4, 128) plan is built with).
+_GRADIENT_DOCS = (256, 384)
 _EPS32 = 1.1920929e-7  # fp32 machine epsilon
 
 
@@ -126,13 +126,19 @@ def make_linear(n, m):
     return lin
 
 
-# B=1, S=64; docs A(10) B(17) C(20) D(17)
-_CU = torch.tensor([0, 10, 27, 47, 64], dtype=torch.int32)
+# B=1, S=1024; docs A(128) B(256) C(384) D(256).  The plan is built with the
+# model's ratios (1, 4, 128), so every document is a multiple of
+# lcm(1, 4, 128) = 128 -- the loader's per-document alignment.
+_ALIGNED_DOCS = (128, 256, 384, 256)
+_SEQ_LEN = sum(_ALIGNED_DOCS)
+_CU = torch.tensor(
+    [0, *torch.tensor(_ALIGNED_DOCS).cumsum(0).tolist()], dtype=torch.int32
+)
 
 
 def _build_metadata(dsv4):
-    """The 64-token four-document layout (ratios 1/4/128) as the model builds it."""
-    v = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=17, max_k=17)
+    """The 1024-token four-document aligned layout (ratios 1/4/128) as the model builds it."""
+    v = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=max(_ALIGNED_DOCS), max_k=max(_ALIGNED_DOCS))
     return dsv4.metadata.build_compressed_varlen_metadata(v, (1, 4, 128))
 
 
@@ -162,7 +168,13 @@ def build_compressor(dsv4, ratio):
 
 
 def manual_compress(x, md, comp, ratio):
-    """Independent per-document pooling reference (no rope)."""
+    """Independent per-document pooling reference (no rope).
+
+    Reads each document's start from the plan's ``cu_seqlens_cmp_k`` and pools
+    its complete blocks.  The plan is built with aligned documents only, so a
+    document is a whole number of blocks and has no partial trailing tail to
+    drop; the assertion keeps this oracle honest if a fixture drifts off grid.
+    """
     plan = md.plans[ratio]
     flat_x = x.flatten(0, 1).float()
     out = torch.zeros(md.batch_size * (md.seq_len // ratio), HD)
@@ -174,9 +186,10 @@ def manual_compress(x, md, comp, ratio):
         )
     ):
         length = qe - qs
+        assert length > 0 and length % ratio == 0, (
+            "the aligned contract has no empty document and no partial trailing block"
+        )
         c_len = length // ratio
-        if c_len == 0:
-            continue
         tokens = flat_x[qs : qs + c_len * ratio].view(c_len, ratio, DIM)
         kv = F.linear(tokens, comp.wkv.weight.float())
         score = F.linear(tokens, comp.wgate.weight.float()) + comp.ape
@@ -244,7 +257,8 @@ def _build_varlen(doc_lens):
     cu = torch.tensor(
         [0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32
     )
-    return VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=17, max_k=17)
+    longest = max(doc_lens)
+    return VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=longest, max_k=longest)
 
 
 def _run_extension(dsv4, doc_lens, ratios, **shape):
@@ -281,8 +295,8 @@ def _run_extension(dsv4, doc_lens, ratios, **shape):
 def inputs(dsv4):
     torch.manual_seed(0)
     md = _build_metadata(dsv4)
-    x = torch.randn(1, 64, DIM)
-    pos = torch.arange(64).unsqueeze(0)
+    x = torch.randn(1, _SEQ_LEN, DIM)
+    pos = torch.arange(_SEQ_LEN).unsqueeze(0)
     return dsv4, md, x, pos
 
 
@@ -291,10 +305,16 @@ def inputs(dsv4):
 # ---------------------------------------------------------------------------
 
 
-def test_asc_metadata_zero_block_batch_rejected_before_any_asc_call(dsv4):
+def test_asc_metadata_unaligned_batch_rejected_before_any_asc_call(dsv4):
+    """An off-grid stream is refused before any AscendC metadata is computed.
+
+    The plain path takes aligned documents only (the loader pads every document
+    to ``lcm(compress_ratios)``); a batch the plan builder rejects must never
+    reach the AscendC metadata kernels.
+    """
     dsv4.cann_ops.calls.clear()
-    with pytest.raises(ValueError, match="no complete compression block"):
-        _run_extension(dsv4, (60, 60, 60, 76), (1, 4, 128))  # ratio-128: no blocks
+    with pytest.raises(ValueError, match="aligned to the compression grid"):
+        _run_extension(dsv4, (60, 60, 60, 76), (1, 4, 128))
     assert not dsv4.cann_ops.calls, (
         "AscendC metadata must not be computed for an invalid batch"
     )
@@ -375,17 +395,26 @@ def test_asc_metadata_ratio128_only_model(dsv4):
 
 def test_layout_container_shape(dsv4):
     md = _build_metadata(dsv4)
-    assert (md.batch_size, md.seq_len) == (1, 64)
+    assert (md.batch_size, md.seq_len) == (1, _SEQ_LEN)
 
 
 def test_layout_cu_seqs_and_remainders(dsv4):
-    p4 = _build_metadata(dsv4).plans[4]
-    assert torch.equal(
-        p4.cu_seqlens_cmp_k, torch.tensor([0, 2, 6, 11, 15], dtype=torch.int32)
-    )
-    assert torch.equal(
-        p4.block_remainder, torch.tensor([2, 1, 0, 1], dtype=torch.int32)
-    )
+    """An aligned document is a whole number of blocks at every ratio.
+
+    The plan is the row divided by its ratio: the document boundaries are
+    ``cu_seq_q // ratio`` and there is no remainder anywhere.
+    """
+    md = _build_metadata(dsv4)
+    for ratio in (4, 128):
+        plan = md.plans[ratio]
+        assert not plan.is_empty_host
+        assert torch.equal(plan.cu_seqlens_cmp_k, _CU // ratio)
+        assert torch.equal(
+            plan.block_remainder,
+            torch.zeros(len(_ALIGNED_DOCS), dtype=torch.int32),
+        )
+        assert plan.n_cmp_blocks_host == _SEQ_LEN // ratio
+        assert plan.out_width == _SEQ_LEN // ratio
 
 
 def test_layout_host_cached_lengths(dsv4):
@@ -393,88 +422,72 @@ def test_layout_host_cached_lengths(dsv4):
 
     The cached values must agree with the device-side cumulative-sequence
     tensors: ``seq_len`` is the total token count and each compressed plan
-    records its document-wise complete-block count.  This guards the host
-    cache introduced to remove repeated ``.item()`` synchronizations.
+    records its total block count (the row divided by its ratio).  This guards
+    the host cache introduced to remove repeated ``.item()`` synchronizations.
     """
-    varlen = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=17, max_k=17)
+    varlen = VarlenMetadata(
+        cu_seq_q=_CU,
+        cu_seq_k=_CU.clone(),
+        max_q=max(_ALIGNED_DOCS),
+        max_k=max(_ALIGNED_DOCS),
+    )
     md = dsv4.metadata.build_compressed_varlen_metadata(varlen, (1, 4, 128))
-    assert md.seq_len_host == 64
-    assert md.seq_len == 64
+    assert md.seq_len_host == _SEQ_LEN
+    assert md.seq_len == _SEQ_LEN
     assert md.plans[1].n_cmp_blocks_host is None
-    assert md.plans[4].n_cmp_blocks_host == 15
-    assert md.plans[128].n_cmp_blocks_host == 0
+    assert md.plans[4].n_cmp_blocks_host == _SEQ_LEN // 4
+    assert md.plans[128].n_cmp_blocks_host == _SEQ_LEN // 128
 
 
 def test_layout_gather_indices(dsv4):
-    p4 = _build_metadata(dsv4).plans[4]
-    assert torch.equal(
-        p4.gather_indices,
-        torch.tensor(
-            [
-                0,
-                1,
-                2,
-                3,
-                4,
-                5,
-                6,
-                7,
-                10,
-                11,
-                12,
-                13,
-                14,
-                15,
-                16,
-                17,
-                18,
-                19,
-                20,
-                21,
-                22,
-                23,
-                24,
-                25,
-                27,
-                28,
-                29,
-                30,
-                31,
-                32,
-                33,
-                34,
-                35,
-                36,
-                37,
-                38,
-                39,
-                40,
-                41,
-                42,
-                43,
-                44,
-                45,
-                46,
-                47,
-                48,
-                49,
-                50,
-                51,
-                52,
-                53,
-                54,
-                55,
-                56,
-                57,
-                58,
-                59,
-                60,
-                61,
-                62,
-            ],
-            dtype=torch.int64,
-        ),
-    )
+    """The aligned pool is the row itself; block positions restart per document.
+
+    Every token of an aligned document belongs to exactly one compression
+    block, so the gather keeps every token in order and the segment-first
+    blocks are the document boundaries divided by the ratio.  The block
+    positions stay document-relative — the compressor's RoPE restarts at
+    every document — so each document contributes its own progression.
+    """
+    md = _build_metadata(dsv4)
+    for ratio in (4, 128):
+        plan = md.plans[ratio]
+        assert torch.equal(
+            plan.gather_indices, torch.arange(_SEQ_LEN, dtype=torch.int64)
+        )
+        assert torch.equal(
+            plan.block_positions,
+            torch.cat(
+                [
+                    torch.arange(0, length, ratio, dtype=torch.int32)
+                    for length in _ALIGNED_DOCS
+                ]
+            ),
+        )
+        assert torch.equal(
+            plan.first_indices, (_CU[:-1] // ratio).to(torch.int64)
+        )
+
+
+@pytest.mark.parametrize(
+    "docs",
+    [
+        pytest.param((200, 133), id="partial-tails"),
+        pytest.param((10, 17, 20, 17), id="small-docs"),
+        pytest.param((0, 128, 128), id="empty-doc"),
+    ],
+)
+@pytest.mark.parametrize("ratios", [(4,), (1, 4, 128)], ids=["r4", "full-stack"])
+def test_layout_rejects_streams_off_the_compression_grid(dsv4, docs, ratios):
+    """The plain builder validates the loader's per-document alignment.
+
+    A partial trailing block or an empty document cannot be expressed any
+    more: the loader pads every document to ``lcm(compress_ratios)``, so an
+    off-grid stream is an input bug and the plan build refuses it instead of
+    silently dropping a tail.
+    """
+    varlen = _build_varlen(docs)
+    with pytest.raises(ValueError, match="aligned to the compression grid"):
+        dsv4.metadata.build_compressed_varlen_metadata(varlen, ratios)
 
 
 def test_compressor_numerics_ratio4(inputs):
@@ -493,41 +506,51 @@ def test_compressor_numerics_ratio4(inputs):
     comp4 = build_compressor(dsv4, 4)
     pooled = comp4(x, md)
     cmp4 = _pack_container(dsv4, pooled, md.plans[4])
-    assert cmp4.shape == (1, 16, 16)
+    assert cmp4.shape == (1, _SEQ_LEN // 4, HD)
     ref = manual_compress(x, md, comp4, 4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
 
 
 def test_compressor_numerics_ratio128(inputs):
-    """C128A with zero complete blocks — shape/emptiness only (no numerics)."""
+    """C128A pooling vs the independent manual reference.
+
+    The ratio-128 contract has no overlap window: an aligned document is a
+    whole number of 128-token blocks and the pool is doc-major.
+    """
     dsv4, md, x, _pos = inputs
     comp128 = build_compressor(dsv4, 128)
-    cmp128 = comp128(x, md)
-    assert cmp128.shape == (0, 16)
-    assert cmp128.numel() == 0
+    cmp128 = _pack_container(dsv4, comp128(x, md), md.plans[128])
+    assert cmp128.shape == (1, _SEQ_LEN // 128, HD)
+    ref = manual_compress(x, md, comp128, 128)
+    _assert_rounding_floor((cmp128 - ref).abs(), ref.abs().max().item())
+
+
+# Per-ratio document lengths: every document is a whole number of blocks at
+# the ratio the plan is built with (the aligned contract).  The cases keep the
+# original intents -- tiny one-to-three-block documents, a single multi-block
+# document, exact ratio multiples, the generic layout -- each with multi-block
+# documents so the document-start borrow boundary is exercised.
+_OVERLAP_CASES = [
+    ("tiny", (4, 8, 12, 8, 4, 12, 8, 4), (128, 256, 384, 256, 128, 384, 256, 128)),
+    ("single", (4, 4), (128, 128)),
+    ("single-full", (8,), (256,)),
+    ("r-multiples", (8, 12, 16, 4), (256, 384, 512, 128)),
+    ("plain", (12, 16, 20, 16), (128, 256, 384, 256)),
+]
 
 
 @pytest.mark.parametrize(
-    "case,ratio",
+    "name,docs,ratio",
     [
-        pytest.param(c, r, id=f"{c[0]}-r{r}")
-        for c in [
-            ("tiny", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4)),
-            ("single", (7, 1)),
-            ("single-full", (8,)),
-            ("r-multiples", (8, 12, 16, 4)),
-            ("r-boundary", (9, 13, 17, 1)),
-            ("zero-block", (3, 5, 9, 7)),
-            ("plain", (10, 17, 20, 17)),
-        ]
-        for r in (4, 128)
+        pytest.param(name, docs, ratio, id=f"{name}-r{ratio}")
+        for name, docs4, docs128 in _OVERLAP_CASES
+        for ratio, docs in ((4, docs4), (128, docs128))
     ],
 )
-def test_compressor_overlap_scatter_bitwise(dsv4, case, ratio):
+def test_compressor_overlap_scatter_bitwise(dsv4, name, docs, ratio):
     """The scatter-masked overlap (``first_indices``) is bitwise-identical
     to the old two-``where`` form: the masked borrowed rows have exactly
     zero softmax weight, so their kv content never contributes."""
-    name, docs = case
     v = _build_varlen(docs)
     md = dsv4.metadata.build_compressed_varlen_metadata(v, (ratio,))
     plan = md.plans[ratio]
@@ -535,8 +558,7 @@ def test_compressor_overlap_scatter_bitwise(dsv4, case, ratio):
     torch.manual_seed(0)
     x = torch.randn(1, sum(docs), DIM)
     pooled = comp(x, md)
-    if pooled.shape[0] == 0:
-        return
+    assert pooled.shape[0] == sum(docs) // ratio, name
     bt = x.flatten(0, 1)[plan.gather_indices].reshape(pooled.shape[0], ratio, -1)
     bids = torch.arange(pooled.shape[0])
     seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
@@ -574,37 +596,119 @@ def _build_core(dsv4, ratio, topk):
     )
 
 
-def test_attention_numerics_ratio4_zero_blocks(dsv4):
-    """The ratio-4 reference path with zero complete blocks — shape/finite."""
-    cu = torch.tensor([0, 3, 8], dtype=torch.int32)
-    v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=5, max_k=5)
+def test_attention_numerics_ratio4_aligned_streams(dsv4):
+    """The ratio-4 reference path over aligned documents — shape/finite.
+
+    A document's leading tokens have no causally complete compression group,
+    so their selection picks are padding (-1); the rest of the document's
+    picks are real.
+    """
+    docs = (128, 256)
+    seq_len = sum(docs)
+    v = _build_varlen(docs)
     md_s = dsv4.metadata.build_compressed_varlen_metadata(v, (4,))
     comp_s = build_compressor(dsv4, 4)
-    cmp_s = _pack_container(dsv4, comp_s(torch.randn(1, 8, DIM), md_s), md_s.plans[4])
-    assert cmp_s.shape == (1, 2, 16)
+    cmp_s = _pack_container(
+        dsv4, comp_s(torch.randn(1, seq_len, DIM), md_s), md_s.plans[4]
+    )
+    assert cmp_s.shape == (1, seq_len // 4, 16)
     core_s = _build_core(dsv4, 4, 4)
     with torch.no_grad():
         sparse_s = dsv4.compressor.select_compressed_slots(
-            torch.randn(1, 8, 4, 8),
-            torch.randn(1, 2, 8),
-            torch.randn(1, 8, 4),
+            torch.randn(1, seq_len, 4, 8),
+            torch.randn(1, seq_len // 4, 8),
+            torch.randn(1, seq_len, 4),
             md_s.varlen.cu_seq_q,
             md_s.plans[4].cu_seqlens_cmp_k,
             4,
         )
         out_s = core_s(
-            torch.randn(1, 8, 3, HD),
-            torch.randn(1, 8, HD),
+            torch.randn(1, seq_len, 3, HD),
+            torch.randn(1, seq_len, HD),
             cmp_s,
             attn_sink=torch.randn(3),
             sparse_indices=sparse_s,
             attention_masks=md_s,
         )
-    # The first document has no complete group, so all of its picks are padding; the second
-    # has one, and the rest of its width is padding.
+    # The first document's opening tokens have no complete group, so their picks are
+    # padding; every later row (the rest of the document and the second one) has real picks.
     assert (sparse_s[0, :3] == -1).all()
     assert (sparse_s[0, 3:] >= 0).any()
-    assert out_s.shape == (1, 8, 3, HD) and torch.isfinite(out_s).all()
+    assert out_s.shape == (1, seq_len, 3, HD) and torch.isfinite(out_s).all()
+
+
+@pytest.mark.parametrize("ratio", (4, 128))
+def test_padding_a_document_tail_is_invisible_to_its_real_tokens(dsv4, ratio):
+    """A padded tail block never reaches the document's real tokens.
+
+    The loader pads a document's segment to the compression alignment, so the
+    document's last pooled block mixes real tokens with pads.  The kernel's
+    visibility rule exposes a compressed slot only at that block's *last* token,
+    and a padded block's last token is always a pad: no real token can see a
+    pad-contaminated key.  The pads themselves can (that is why their outputs
+    move when the pad value changes), and their labels are ``IGNORE_INDEX``, so
+    they contribute nothing to the loss.
+
+    Checked by changing nothing but the pad content: the real blocks of the
+    compressed pool, every real query's output and an ``IGNORE_INDEX`` cross
+    entropy stay bitwise identical, while every padded query's output changes.
+    """
+    from torchtitan.components.loss import IGNORE_INDEX
+
+    real_len, total = 70, 128
+    v = _build_varlen((total,))
+    md = dsv4.metadata.build_compressed_varlen_metadata(v, (4, 128))
+    comp = build_compressor(dsv4, ratio)
+    x_real = torch.randn(1, real_len, DIM)
+
+    def pool(pad_value):
+        x = torch.cat([x_real, torch.full((1, total - real_len, DIM), pad_value)], dim=1)
+        return _pack_container(dsv4, comp(x, md), md.plans[ratio])
+
+    pool_a, pool_b = pool(0.0), pool(3.0)
+    # Blocks that hold only real tokens are untouched by the pad content; the
+    # block the pads land in (and every block after it) moves.
+    n_real_blocks = real_len // ratio
+    assert torch.equal(pool_a[:, :n_real_blocks], pool_b[:, :n_real_blocks])
+    assert not torch.equal(pool_a[:, n_real_blocks:], pool_b[:, n_real_blocks:])
+
+    q = torch.randn(1, total, 3, HD)
+    swa = torch.randn(1, total, HD)
+    sink = torch.randn(3)
+    core = _build_core(dsv4, ratio, 4)
+    sparse = None
+    if ratio == 4:
+        with torch.no_grad():
+            sparse = dsv4.compressor.select_compressed_slots(
+                torch.randn(1, total, 4, 8),
+                torch.randn(1, total // ratio, 8),
+                torch.randn(1, total, 4),
+                md.varlen.cu_seq_q,
+                md.plans[ratio].cu_seqlens_cmp_k,
+                ratio,
+            )
+        # The selector only ever reaches the blocks that end before the query,
+        # so no real query can pick the block the pads complete.
+        picked = sparse[0, :real_len]
+        assert (picked[picked >= 0] < n_real_blocks).all()
+
+    with torch.no_grad():
+        out_a = core(q, swa, pool_a, attn_sink=sink, sparse_indices=sparse, attention_masks=md)
+        out_b = core(q, swa, pool_b, attn_sink=sink, sparse_indices=sparse, attention_masks=md)
+
+    assert torch.equal(out_a[:, :real_len], out_b[:, :real_len])
+    assert not torch.equal(out_a[:, real_len:], out_b[:, real_len:])
+
+    logits_a = out_a.reshape(total, -1).float()
+    logits_b = out_b.reshape(total, -1).float()
+    labels = torch.randint(0, logits_a.shape[-1], (total,))
+    labels[real_len:] = IGNORE_INDEX
+    loss_a = F.cross_entropy(logits_a, labels, reduction="sum", ignore_index=IGNORE_INDEX)
+    loss_b = F.cross_entropy(logits_b, labels, reduction="sum", ignore_index=IGNORE_INDEX)
+    assert torch.equal(loss_a, loss_b)
+    per_token = F.cross_entropy(logits_a, labels, reduction="none", ignore_index=IGNORE_INDEX)
+    assert torch.count_nonzero(per_token[real_len:]) == 0
+    assert torch.count_nonzero(per_token[:real_len]) == real_len
 
 
 def _gradient_case(dsv4, ratio=4):
@@ -690,7 +794,7 @@ def test_reference_core_rejects_context_parallel_frames(dsv4):
     # the shard path's builder wants the global contract, i.e. both offsets as one object
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=8, max_k=8)
     cp_meta, plans, window = build_cp_plan(
-        v, None, rank=1, cp_size=2, shard_len=4, window_size=4, ratios=[4]
+        v, rank=1, cp_size=2, shard_len=4, window_size=4, ratios=[4]
     )
     assert not torch.equal(cp_meta.cu_seq_q, cp_meta.cu_seq_k)
     md = dsv4.metadata.CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window)

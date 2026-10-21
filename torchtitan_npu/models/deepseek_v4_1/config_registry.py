@@ -29,10 +29,11 @@ from torchtitan_npu.extensions.components.gradient_clipping import GradientClipp
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.muon import make_owned_layout
+from torchtitan_npu.models.common.packing import compression_alignment
 
 from . import model_registry
 from .indexer import Selector
-from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel, compression_alignment
+from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel
 
 
 def _per_doc_alignment(model_spec: ModelSpec) -> int:
