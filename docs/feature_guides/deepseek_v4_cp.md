@@ -42,9 +42,9 @@ NGPU=2 \
 
 1. **单一 metadata 接缝**。模型以 `build_attention_masks(inputs, labels, extra_kwargs, *, cp_mesh, load_balancer_type)` 统一构建每 batch 的 metadata：CP 时在其中完成输入切分与计划推导，vendor 内核张量由配置解析的 `metadata_extension`（`AscMetadataExtension`）在最后一步填充。接缝只有一处。DeepSeek-V3.2 已迁到上游 backend-owned 接缝（attention backend 自己的 `Config.build_attention_metadata` 与 `prepare_cp_metadata`，见[多后端算子接入](fused_ops.md)）；V4.1 也已迁入该接缝（entry 由 `AscV41SparseAttention.Config.build_attention_metadata` 构建：参考后端在这一步给出整行的 document 边界，并按自己的 `compress_ratio` 一次折成 `cu_seq_k`（池化轴），端口在这两个 grid 上加自己的 kernel frame 与 `aicpu_metadata` 里的四条记录；CP 由 `AscV41Metadata.prepare_cp_metadata` 用 rank-local frames 重建；V4.1 的 map key 是 `(端口类, compress_ratio)`，一层一个几何、每个几何一份 entry，参考核直接读 `cu_seq_q` / `cu_seq_k`，不再自己除 ratio，本文描述的 V4 路径仍待迁移）。
 
-2. **纯本地计划**。`build_cp_plan` 输入 `(global_varlen, *, rank, cp_size, shard_len, window_size, ratios)`，用 `_RankMesh` 垫片逐 rank 调用 `CPVarlenMetadata.from_global`，返回 `(rank-local varlen, plans, window)`。全局上下文（切分前的文档结构）在 `build_attention_masks` 帧内即可获得，因此计划阶段零通信，且推导出的 rank-local varlen 与 shard 路径的产物一致。
+2. **纯本地计划**。`build_cp_plan` 输入 `(global_varlen, *, rank, cp_size, shard_len, window_size, ratios)`，把每个 rank 的 slab 与全局文档边界求交得到段结构（`_slab_segments`：每文档一个区间，连续切片下不需要通用 shard 元数据推导），本地 varlen 由同一套算术直接构造（`_local_varlen`，与 `CPVarlenMetadata.from_global` 在连续切片下逐位一致，由 gloo worker 断言），返回 `(rank-local varlen, plans, window)`。全局上下文在 `build_attention_masks` 帧内即可获得，因此计划阶段零通信。
 
-3. **文档切片表达**。`build_cp_plan` 构建一个 `docs: dict[doc, list[pos]]`（键为文档起点，值为该文档全部 token 的全局坐标）。基于恒等式 `kg[k_start + p] == docs[doc][p]`，所有计划行都是文档切片：窗口行 `docs[doc][win_start : win_start + win_len]`，块行 `docs[doc][A : block_end]`。压缩器契约由块区间直接推导：`block_positions` = 每段 `arange(A, block_end, ratio)`，`first_indices` = 每段池化起点。
+3. **文档切片表达**。文档在全局流里是连续区间，连续切片下它与 rank slab 的交仍是一个区间，所以所有计划行都是文档全局坐标上的 `range` 偏移：窗口行 `range(doc + win_start, doc + win_start + win_len)`，块行 `range(doc + A, doc + block_end)`（`doc` 为文档起点）。压缩器契约由块区间直接推导：`block_positions` = 每段 `arange(A, block_end, ratio)`，`first_indices` = 每段池化起点。
 
 4. **统一 gather 接口**。窗口与块共用 `dispatcher.gather(x, plan)`：无交换时为本地 gather（`plan.gather_indices` 直接索引本地流），有交换时为远端 gather + 重排（同一 `gather_indices` 索引 `cat([x_local, recv])`），始终返回 `[1, N, D]`。重排结果本身就是池化流，数据路径上无多余拷贝。
 

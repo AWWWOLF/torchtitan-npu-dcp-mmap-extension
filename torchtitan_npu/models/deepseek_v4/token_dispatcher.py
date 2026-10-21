@@ -9,14 +9,14 @@ Two halves live here (the single home of all DSV4 CP logic):
 
 1. **The plan builder** — a pure derivation from the global context: the
    pre-shard document structure (the model's ``get_attention_masks``
-   result; the stack shards contiguous slabs, so no load-balancer
-   permutation exists).  Every rank derives every rank's rank-local shard
-   metadata in-frame via ``CPVarlenMetadata.from_global`` (the shard
-   path's own builder), so there is **no plan-time communication** at all.
-   The whole derivation is expressed in the documents' slices (``docs``,
-   keyed by the segment's doc identity): every row a plan consumes —
-   window ``[win_start, q0)`` or plan blocks ``[A, B)`` — is a plain slice
-   of one document's slice.
+   result).  The stack shards contiguous slabs, so a rank's segments are
+   the intersection of its slab with the global document boundaries
+   (``_slab_segments``): one interval per document, no permutation and no
+   generic shard-metadata derivation.  Every row a plan consumes — window
+   ``[win_start, q0)`` or plan blocks ``[A, B)`` — is a plain ``range``
+   offset of the document's global positions, the rank-local varlen is
+   built by the same arithmetic (``_local_varlen``), and there is **no
+   plan-time communication** at all.
 
    The plan has two independent parts:
 
@@ -76,51 +76,49 @@ __all__ = [
     "ExchangePlan",
     "WindowPlan",
     "build_cp_plan",
-    "segment_structure",
 ]
 
 
-class _RankMesh:
-    """``CPVarlenMetadata.from_global``'s ``DeviceMesh`` contract for a fixed
-    rank (the pure plan derives every rank's shard metadata in-frame)."""
+def _slab_segments(global_cu: list[int], lo: int, hi: int) -> list[tuple[int, int, int, int]]:
+    """The slab's segments: ``(doc_start, seg_len, seqlen_k, p0)`` per document.
 
-    ndim = 1
-
-    def __init__(self, size: int, rank: int):
-        self._size = size
-        self._rank = rank
-
-    def size(self) -> int:
-        return self._size
-
-    def get_local_rank(self) -> int:
-        return self._rank
-
-
-# ---------------------------------------------------------------------------
-# The plan builder (pure host math, per batch, no communication)
-# ---------------------------------------------------------------------------
-
-
-def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
-    """Per non-empty segment: ``(doc_start, seg_len, seqlen_k, p0)``.
-
-    ``doc_start = kgather[cu_seq_k[s]]`` is the document identity
-    (identical across ranks, global coordinates — the key of the
-    document's slice in ``docs``); ``p0 = seqlen_k - seg_len`` is
-    the fragment's doc-relative start.
+    A contiguous slab intersects each document in one interval, so the segment
+    structure is a direct intersection with the global document boundaries — no
+    generic shard-metadata derivation (``CPVarlenMetadata.from_global`` handles
+    permuted shards, which this stack refuses).  ``seqlen_k`` is the segment's
+    document-relative end: the K side always starts at the document start.
     """
-    cu_q = cp_meta.cu_seq_q.cpu().tolist()
-    cu_k = cp_meta.cu_seq_k.cpu().tolist()
-    kg = cp_meta.k_global_gather_indices.cpu().tolist()
     segs: list[tuple[int, int, int, int]] = []
-    for s in range(len(cu_q) - 1):
-        seg_len = cu_q[s + 1] - cu_q[s]
-        if seg_len == 0:
+    for d in range(len(global_cu) - 1):
+        d0, d1 = global_cu[d], global_cu[d + 1]
+        start, end = max(d0, lo), min(d1, hi)
+        if end <= start:
             continue
-        seqlen_k = cu_k[s + 1] - cu_k[s]
-        segs.append((kg[cu_k[s]], seg_len, seqlen_k, seqlen_k - seg_len))
+        segs.append((d0, end - start, end - d0, start - d0))
     return segs
+
+
+def _local_varlen(segs: list[tuple[int, int, int, int]], *, dtype: torch.dtype, device) -> CPVarlenMetadata:
+    """The rank-local varlen of a contiguous slab.
+
+    Identical to what ``CPVarlenMetadata.from_global`` returns for this shard
+    (the gloo worker asserts the equality): the Q slots are the slab's tokens,
+    the K ranges are the segment's document prefixes, and — because both the
+    documents and the slab are contiguous — the K gather is one ``arange``.
+    """
+    if not segs:
+        raise ValueError("a contiguous slab of a non-empty row always covers at least one token")
+    cu_q, cu_k = [0], [0]
+    for _doc_start, seg_len, seqlen_k, _p0 in segs:
+        cu_q.append(cu_q[-1] + seg_len)
+        cu_k.append(cu_k[-1] + seqlen_k)
+    return CPVarlenMetadata(
+        cu_seq_q=torch.tensor(cu_q, dtype=dtype, device=device),
+        cu_seq_k=torch.tensor(cu_k, dtype=dtype, device=device),
+        max_q=max(seg[1] for seg in segs),
+        max_k=max(seg[2] for seg in segs),
+        k_global_gather_indices=torch.arange(segs[0][0], segs[0][0] + cu_k[-1], dtype=torch.long, device=device),
+    )
 
 
 def _window_range(seg: tuple[int, int, int, int], window_size: int) -> tuple[int, int]:
@@ -277,7 +275,6 @@ def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
 
 def _assemble_window_plan(
     segs: list[tuple[int, int, int, int]],
-    docs: dict[int, list[int]],
     routing_row,
     *,
     rank: int,
@@ -293,7 +290,7 @@ def _assemble_window_plan(
     for seg in segs:
         win_start, win_len = _window_range(seg, window_size)
         ori_lens.append(win_len)
-        win_rows += docs[seg[0]][win_start : win_start + win_len]
+        win_rows += range(seg[0] + win_start, seg[0] + win_start + win_len)
     # The receive slots number the stream-wide foreign order (matching the
     # routing's recv_offsets), so the gather indices run once over all rows.
     win_order, _ = _row_order(win_rows, rank=rank, shard_len=shard_len)
@@ -308,7 +305,6 @@ def _assemble_window_plan(
 def _assemble_block_plan(
     segs: list[tuple[int, int, int, int]],
     segs_all: list[list[tuple[int, int, int, int]]],
-    docs: dict[int, list[int]],
     seg_blocks_all: list[list[tuple[int, int, int]]],
     routing_row,
     *,
@@ -326,7 +322,7 @@ def _assemble_block_plan(
     my_blocks = seg_blocks_all[rank]
     rows: list[int] = []
     for seg, (A, block_end, _strip) in zip(segs, my_blocks, strict=True):
-        rows += docs[seg[0]][A:block_end]
+        rows += range(seg[0] + A, seg[0] + block_end)
     block_total = len(rows)
     order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
     # The plan blocks of one rank never overlap, so every foreign row is
@@ -379,51 +375,35 @@ def build_cp_plan(
     window_size: int,
     ratios: list[int],
 ) -> tuple[CPVarlenMetadata, dict[int, CompressedBlockLayout], WindowPlan]:
-    """The pure per-rank plan derivation from the global context (no
-    communication): every rank's rank-local varlen is derived in-frame via
-    ``CPVarlenMetadata.from_global`` (the shard path's own builder), so the
-    rank-local varlen, the per-ratio block plans, and the window plan all
-    fall out of the pre-shard document structure.  Each rank owns one
-    contiguous slab of the row; the model refuses any other load balancer.  The model's
-    ``build_attention_masks`` calls this; the dispatchers are wired by their
-    owners' ``parallelize``.
+    """The pure per-rank plan derivation from the global context (no communication).
+
+    The stack shards contiguous slabs (the model refuses any other load
+    balancer), so a rank's segment structure is the intersection of its slab
+    with the global document boundaries and the rows a plan consumes are plain
+    ``range`` offsets of those boundaries.  The rank-local varlen, the
+    per-ratio block plans and the window plan all fall out of the pre-shard
+    document structure; no shard-metadata derivation and no permutation is
+    involved.  The model's ``build_attention_masks`` calls this; the
+    dispatchers are wired by their owners' ``parallelize``.
     """
     global_cu = global_varlen.cu_seq_q
+    cu = global_cu.cpu().tolist()
     device = global_cu.device
-    seq_len = int(global_cu[-1].item())
-    varlens = [
-        CPVarlenMetadata.from_global(
-            # The ``_RankMesh`` shim implements the ``DeviceMesh`` contract
-            # (``size`` / ``get_local_rank``) the pure derivation needs.
-            global_varlen,
-            _RankMesh(cp_size, r),  # pyrefly: ignore [bad-argument-type]
-            1,
-            seq_len,
-        )
-        for r in range(cp_size)
-    ]
-    segs_all = [segment_structure(v) for v in varlens]
+    segs_all = [_slab_segments(cu, r * shard_len, (r + 1) * shard_len) for r in range(cp_size)]
     my_segs = segs_all[rank]
-    # The document slices, keyed by the segment's doc identity (the doc
-    # start): every row a plan consumes — the window range or the plan
-    # blocks — is a slice of one document's slice.
-    docs: dict[int, list[int]] = {}
-    for d in range(len(global_cu) - 1):
-        d0, d1 = int(global_cu[d].item()), int(global_cu[d + 1].item())
-        if d1 > d0:
-            docs[d0] = list(range(d0, d1))
+    doc_len = {cu[d]: cu[d + 1] - cu[d] for d in range(len(cu) - 1) if cu[d + 1] > cu[d]}
 
     # ---- the window plan (ratio-independent) ----
     win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
     for r in range(cp_size):
         for seg in segs_all[r]:
             win_start, win_len = _window_range(seg, window_size)
-            doc = docs[seg[0]]
-            win_foreign[r] += [p for p in doc[win_start : win_start + win_len] if p // shard_len != r]
+            win_foreign[r] += [
+                p for p in range(seg[0] + win_start, seg[0] + win_start + win_len) if p // shard_len != r
+            ]
     routing = _routing_geometry(win_foreign, shard_len=shard_len, cp_size=cp_size)
     window = _assemble_window_plan(
         my_segs,
-        docs,
         routing[rank],
         rank=rank,
         shard_len=shard_len,
@@ -445,15 +425,14 @@ def build_cp_plan(
         seg_blocks_all: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
         for r in range(cp_size):
             for seg in segs_all[r]:
-                A, B, strip = _block_range(seg, len(docs[seg[0]]), ratio=ratio)
+                A, B, strip = _block_range(seg, doc_len[seg[0]], ratio=ratio)
                 block_end = (B // ratio) * ratio
                 seg_blocks_all[r].append((A, block_end, strip))
-                block_foreign[r] += [p for p in docs[seg[0]][A:block_end] if p // shard_len != r]
+                block_foreign[r] += [p for p in range(seg[0] + A, seg[0] + block_end) if p // shard_len != r]
         routing = _routing_geometry(block_foreign, shard_len=shard_len, cp_size=cp_size)
         plans[ratio] = _assemble_block_plan(
             my_segs,
             segs_all,
-            docs,
             seg_blocks_all,
             routing[rank],
             ratio=ratio,
@@ -461,7 +440,7 @@ def build_cp_plan(
             shard_len=shard_len,
             device=device,
         )
-    return varlens[rank], plans, window
+    return _local_varlen(my_segs, dtype=global_cu.dtype, device=device), plans, window
 
 
 # ---------------------------------------------------------------------------

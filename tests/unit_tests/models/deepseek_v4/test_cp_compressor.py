@@ -146,6 +146,26 @@ def compress_blocks(
     return torch.cat([kv_nope, kv_rope], dim=-1)
 
 
+def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
+    """The test-side ``(doc_start, seg_len, seqlen_k, p0)`` of a CP varlen.
+
+    The production builder derives this directly from the slab intersection;
+    this oracle goes through the varlen the shard path produced, so the two
+    derivations stay independently checked.
+    """
+    cu_q = cp_meta.cu_seq_q.cpu().tolist()
+    cu_k = cp_meta.cu_seq_k.cpu().tolist()
+    kg = cp_meta.k_global_gather_indices.cpu().tolist()
+    segs: list[tuple[int, int, int, int]] = []
+    for seg in range(len(cu_q) - 1):
+        seg_len = cu_q[seg + 1] - cu_q[seg]
+        if seg_len == 0:
+            continue
+        seqlen_k = cu_k[seg + 1] - cu_k[seg]
+        segs.append((kg[cu_k[seg]], seg_len, seqlen_k, seqlen_k - seg_len))
+    return segs
+
+
 def doc_plan(docs, ratio):
     """The per-document oracle plan (the plain contract before alignment).
 

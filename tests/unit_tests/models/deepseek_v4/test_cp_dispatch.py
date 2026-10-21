@@ -32,16 +32,14 @@ from test_cp_compressor import (
     compress_blocks,
     doc_plan,
     make_linear,
+    segment_structure,
 )
 from torchtitan.models.common.attention import VarlenMetadata
 
 from torchtitan_npu.models.deepseek_v4 import compressor as comp_mod
 from torchtitan_npu.models.deepseek_v4 import token_dispatcher as cp_mod
 from torchtitan_npu.models.deepseek_v4.attention import Attention, CompressedSparseAttention
-from torchtitan_npu.models.deepseek_v4.token_dispatcher import (
-    build_cp_plan,
-    segment_structure,
-)
+from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
 tcc.comp_mod = comp_mod
 
