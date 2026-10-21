@@ -73,16 +73,16 @@ TorchTitan 提供：
 
 ```text
 qwen3_5_debugmodel_1p_cpt_512.sh
-  ÚÄ 组装 tokenizer、cc12m-test、override.imports 和用户参数
-  ÚÄ scripts/run_train.sh -> torchrun -m torchtitan_npu.train
-       ÚÄ torchtitan_npu.models.qwen3_5 导入时安装视觉/MRoPE/FLA patch
-       ÚÄ 上游 config_registry 构造 qwen35_debugmodel(_moe)
-       ÚÄ GDN override 替换 delta kernel；可选 dispatcher 替换 MoE dispatch
-       ÚÄ parallelize_qwen3_5_npu 建立 TP/EP/FSDP；CP 使用序列元数据与 mesh resolver
-       ÚÄ upstream multimodal collator 读取文本、图像/视频并生成 MRoPE
-       ÚÄ vision encoder + language decoder 前向，执行 GDN/MoE/CP 数据交换
-       ÚÄ backward、优化器更新与 TensorBoard/JSONL 日志
-       ä 进程组销毁
+  ├─ 组装 tokenizer、cc12m-test、override.imports 和用户参数
+  └─ scripts/run_train.sh -> torchrun -m torchtitan_npu.train
+       ├─ torchtitan_npu.models.qwen3_5 导入时安装视觉/MRoPE/FLA patch
+       ├─ 上游 config_registry 构造 qwen35_debugmodel(_moe)
+       ├─ GDN override 替换 delta kernel；可选 dispatcher 替换 MoE dispatch
+       ├─ parallelize_qwen3_5_npu 建立 TP/EP/FSDP；CP 使用序列元数据与 mesh resolver
+       ├─ upstream multimodal collator 读取文本、图像/视频并生成 MRoPE
+       ├─ vision encoder + language decoder 前向，执行 GDN/MoE/CP 数据交换
+       ├─ backward、优化器更新与 TensorBoard/JSONL 日志
+       └─ 进程组销毁
 ```
 
 `spmd_types` 使用 TorchTitan v0.3 的 `resolve_fsdp_mesh`/
