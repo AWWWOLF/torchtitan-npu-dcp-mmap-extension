@@ -12,6 +12,7 @@ scripts/numerical_alignment/
 ├── README.md
 ├── compare_module_example.py          # RMSNorm 前向输出和梯度对比
 ├── loss_compare.py                    # 两个 Git 版本的 loss、grad_norm 对比
+├── create_seed_checkpoint.py          # 按 baseline 并行布局保存 step-0
 ├── requirements.txt                   # 推理基线的额外依赖
 ├── configs/
 │   └── dsv4_4l.json                    # DSV4 四层、四专家推理配置
@@ -187,6 +188,22 @@ python scripts/numerical_alignment/loss_compare.py HEAD~1 HEAD \
 
 两侧卡数不同时使用 `--baseline-ngpus` / `--test-ngpus`，并通过各自 options 设置对应并行拓扑。
 比较并行策略时，还需保证全局 batch、输入数据和训练配置一致。
+
+#### Seed checkpoint 与运行环境
+
+默认通过同一份 seed checkpoint 初始化两侧模型，创建方式由 `--seed-mode` 指定：
+
+- `unsharded`：默认模式，使用单进程 CPU 初始化完整权重。
+- `distributed`：使用 baseline 的卡数、runner、配置和 `--baseline-options` 构建并行模型，需要预留与 baseline 相同的卡数和显存资源。Engram 等原生 checkpoint 依赖并行布局的模型可使用该模式。
+
+`--baseline-env` / `--test-env` 分别注入 `KEY=VALUE[,...]` 环境变量，可重复指定；seed 使用 baseline 环境，进程数由 `--seed-mode` 决定。
+`distributed` 不能与 `--baseline-env TRAIN_FILE=...` 同用，以免 seed 与训练使用不同的模型构建入口。
+
+分布式模式通过 `TRAIN_FILE=create_seed_checkpoint` 选择辅助入口，runner 必须读取并传递 `TRAIN_FILE`，不能写死训练入口。
+辅助入口只保存 model-only 的 step-0，不执行 forward、backward 或优化器更新；仍会构建 baseline 配置的优化器。
+seed 命令额外设置 `--training.steps=1`，限制 runner 忽略 `TRAIN_FILE` 时的误训练步数。
+两侧加载同一份 seed 权重；跨并行布局加载是否受支持取决于模型的 checkpoint 实现。
+当前不支持恢复完整训练状态的续训比较。
 
 #### 输出与清理
 

@@ -37,6 +37,7 @@ def runner_repo(tmp_path):
     git("config", "core.hooksPath", "/dev/null")
     (repo / "emit_metrics.py").write_text(
         """import argparse
+import os
 from pathlib import Path
 from tensorboard.compat.proto.event_pb2 import Event
 from tensorboard.compat.proto.summary_pb2 import Summary
@@ -46,7 +47,15 @@ p.add_argument('--dump_folder', type=Path)
 p.add_argument('--training.steps', type=int, dest='steps')
 p.add_argument('--value', type=float)
 p.add_argument('--recorded-steps')
+p.add_argument('--checkpoint.folder', type=Path, dest='checkpoint_folder')
 args, _ = p.parse_known_args()
+if os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
+    entrypoint = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])
+    print('seed-imports=' + ','.join(sorted(path.name for path in entrypoint.iterdir())))
+    (args.checkpoint_folder / 'step-0').mkdir(parents=True)
+    print('seed-processes=' + os.environ['NGPU'])
+    print('seed-value=' + str(args.value))
+    raise SystemExit(0)
 steps = range(1, args.steps + 1) if args.recorded_steps is None else map(int, args.recorded_steps.split(','))
 w = EventFileWriter(str(args.dump_folder / 'tensorboard' / 'rank_0'))
 try:
@@ -90,6 +99,109 @@ def _compare(repo, refs, output, runner, *options):
         capture_output=True,
         timeout=40,
     )
+
+
+def test_loss_compare_distributed_seed_uses_baseline_layout_and_options(tmp_path, runner_repo):
+    repo, refs = runner_repo
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI),
+            refs[0],
+            refs[0],
+            "--runner=runner.sh",
+            "--seed-mode=distributed",
+            "--baseline-ngpus=2",
+            "--test-ngpus=2",
+            "--steps=2",
+            "--baseline-options=--value=3",
+            "--test-options=--value=3",
+            "--output-dir",
+            str(output),
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=40,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "seed-processes=2" in result.stdout
+    assert "seed-value=3.0" in result.stdout
+    assert "seed-imports=create_seed_checkpoint.py" in result.stdout
+    report = json.loads((output / "comparison.json").read_text())
+    assert report["seed_mode"] == "distributed"
+    assert report["passed"]
+    assert "runner-value=3.0" in (output / "baseline" / "training.log").read_text()
+    assert "runner-value=3.0" in (output / "test" / "training.log").read_text()
+
+
+def test_loss_compare_rejects_distributed_seed_with_custom_baseline_entrypoint(tmp_path):
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI),
+            "HEAD",
+            "HEAD",
+            "--seed-mode=distributed",
+            "--baseline-env=EXAMPLE=1,TRAIN_FILE=custom.train",
+            "--baseline-env=EXAMPLE=2",
+            "--output-dir",
+            str(output),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--seed-mode distributed cannot be combined with --baseline-env TRAIN_FILE" in result.stderr
+    assert not output.exists()
+
+
+def test_loss_compare_bounds_training_when_runner_ignores_seed_entrypoint(tmp_path, runner_repo):
+    repo, refs = runner_repo
+    observed_steps = tmp_path / "observed_steps"
+    training = (
+        "import argparse; from pathlib import Path; "
+        "parser = argparse.ArgumentParser(); "
+        "parser.add_argument('--training.steps', dest='steps', type=int); "
+        "args, _ = parser.parse_known_args(); "
+        f"Path({str(observed_steps)!r}).write_text(','.join(map(str, range(1, args.steps + 1))))"
+    )
+    runner = repo / "ignore_entrypoint.sh"
+    runner.write_text(f'#!/bin/bash\nexec {shlex.quote(sys.executable)} -c {shlex.quote(training)} "$@"\n')
+    runner.chmod(0o755)
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI),
+            refs[0],
+            refs[0],
+            f"--runner={runner}",
+            "--seed-mode=distributed",
+            "--steps=5",
+            "--output-dir",
+            str(output),
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=40,
+    )
+
+    assert result.returncode != 0
+    assert "check that the runner supports TRAIN_FILE=create_seed_checkpoint" in result.stderr
+    assert observed_steps.read_text() == "1"
+    assert not (output / "baseline").exists()
+    assert not (output / "comparison.json").exists()
 
 
 @pytest.mark.parametrize("side", ["baseline", "test"])
